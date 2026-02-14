@@ -18,25 +18,30 @@ PyStar 是一个用于空间转录组学（Spatial Transcriptomics）图像处�
 - Python >= 3.9
 - CUDA 12.x（可选，用于 GPU 加速）
 
-### 使用 pip 安装
+### 从源码安装（当前推荐）
+
+由于项目尚未发布到 PyPI，请从 GitHub 直接安装：
 
 ```bash
-pip install pystar
+git clone https://github.com/1508324011/pystar.git
+cd pystar
+pip install -e .
 ```
 
-### 使用 pixi 安装（推荐）
+### 使用 pixi 安装
+
+如果你使用 pixi 包管理器：
 
 ```bash
 pixi install
 ```
 
-### 从源码安装
+<!-- ### 使用 pip 安装（即将推出）
 
 ```bash
-git clone https://github.com/yourusername/pystar.git
-cd pystar
-pip install -e .
+pip install pystar
 ```
+-->
 
 ## 快速开始
 
