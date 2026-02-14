@@ -1,0 +1,302 @@
+# ==========================================
+# 1. Dataset Specs
+# ==========================================
+dataset:
+  # 原始数据根目录
+  raw_data_path: "/gpfs/share/home/2201112433/labShare/2501111695/data/202512_mouse_testis_r1_leica/01_data"
+  
+  # 图像格式: 告诉程序怎么解析文件名
+  # 示例: "Position{fov}/...Round{round}_Channel{ch}.tif"
+  filename_pattern: "round{round:03d}/Position{fov}/*_ch{ch}.tif"
+  
+  pixel_size_xy_nm: 141.97  # XY分辨率
+  pixel_size_z_nm: 361.47   # Z轴层厚
+  # 图像结构
+  dimensions:
+    z: 42
+    width: 2048
+    height: 2048
+
+  # 强制控制 Dask 的切块策略
+  # 最好是 registration block_size (512) 的倍数
+  io_chunk_size: 
+    z: 42   # Z轴通常一次读完
+    y: 1024 # 2 * 512
+    x: 1024 # 2 * 512
+    
+  # --- 显式结构定义 (Explicit Structure) ---
+  
+  # 定义所有要处理的 FOV ID
+  # 可以是列表 [1, 2, 5, 8] 或者范围 "1-56" (我们代码里解析这个字符串)
+  fov_list: "1-324"
+  
+  # 定义每一轮包含哪些通道 (Round Map)
+  round_structure:
+    1: [0, 1, 2, 3]
+    2: [0, 1, 2, 3]
+    3: [0, 1, 2, 3]
+    4: [0, 1, 2, 3]
+    5: [0, 1, 2, 3]
+    6: [0, 1, 2, 3]
+    7: [0, 1, 2, 3]
+    8: [0, 1, 2, 3]
+    9: [0, 1, 2, 3]
+    10: [0, 1, 2, 3]
+    11: [0, 1, 2, 3]
+
+    
+  # 通道语义定义 (Role Definition)
+  # 仅用于标记 DAPI 在哪里，以及解码时的顺序
+  channel_roles:
+    0: "seq"  # 测序通道
+    1: "seq"
+    2: "seq"
+    3: "anchor" 
+# ==========================================
+# 2. Decoding Logic
+# ==========================================
+codebook:
+  # 对应 genes.csv 路径
+  gene_list: "/gpfs/share/home/2201112433/labShare/2501111695/data/202512_mouse_testis_r1_leica/01_data/genes.csv"
+  
+  # --- 编码规则 (The Laws of Physics) ---
+  # 这里的 Value 对应 mapping 里的颜色值。
+  # 如果你的 mapping 写的是 1,2,3,4，这里就要写 1。Python读取后会自动处理。
+  channel_base_index: 1  
+  
+  # 映射表: 两个碱基 (Two-base probe) -> 对应的颜色通道 ID
+  encoding_tables:
+    standard_3color:
+      "AT": 3
+      "GT": 1
+      "TT": 2
+      "AG": 1
+      "GG": 2
+      "TG": 3
+      "AA": 2
+      "GA": 3
+      "TA": 1
+
+    standard_4color:
+      "AA": 1
+      "CA": 2
+      "GA": 3
+      "TA": 4
+      "AC": 2
+      "CC": 1
+      "GC": 4
+      "TC": 3
+      "AG": 3
+      "CG": 4
+      "GG": 1
+      "TG": 2
+      "AT": 4
+      "CT": 3
+      "GT": 2
+      "TT": 1
+    
+    omics_special:
+      "GC": 1
+      "GT": 2
+
+
+  # --- 拓扑结构定义 (Tri Mode) ---
+  topology:
+    func: "reverse_string" #后续倒序进行解码匹配
+
+    # 原始基因序列: 14nt (例 CG A AAATG A AAATA)
+    structure:
+      - id: 'seqF'
+        length: 6
+        rounds: [6, 7, 8, 9, 10]
+        csv_slice: [1, 6] #反转后对应位置
+        anchor_base: [A,A] #起始和质检碱基
+        encoding_table: 'standard_3color'
+        
+      - id: 'seqD'
+        length: 6
+        rounds: [1, 2, 3, 4, 5]
+        csv_slice: [7, 12] 
+        anchor_base: [G,A]
+        encoding_table: 'standard_3color'
+
+      - id: 'seqE'
+        length: 2
+        rounds: [11]
+        csv_slice: [13, 14] 
+        anchor_base: [G] #没有质检碱基，不参与后续pattern check
+        encoding_table: 'omics_special'
+
+    physical_order: ['seqD', 'seqF', 'seqE']
+  
+
+# ==========================================
+# 3. Pipeline Parameters
+# ==========================================
+pipeline:
+  # 预处理参数
+  preprocessing:
+    enable: true
+    
+    # 定义处理流水线
+    # 这是一个有序列表，预处理会严格按照此处顺序执行。下面各步顺序及次数并不固定，完全自定义。
+    sequence:
+      
+      # Step 0: 基础去噪
+      # 目的: 去除噪声。
+      # 可选方法 (method):
+      #   - "median_filter": 中值滤波，最适合去椒盐噪声。参数: kernel_size (奇数, e.g., 3)
+      #   - "gaussian_blur": 高斯模糊，适合柔化图像但会模糊边缘。参数: sigma (float, e.g., 1.0)
+      #   - "none": 已经去噪的图像，不做处理
+      - method: "none"
+        params: {}
+
+      # Step 1: 初始归一化
+      # 目的: 统一不同轮次/通道的亮度范围，防止溢出或过暗。
+      # 可选方法:
+      #   - "clip_percentile": 忽略极值点。防止坏点把所有信号压缩到 0。 参数: min_percentile (0.1), max_percentile (99.9)。
+      #   - "gamma_correction": 非线性拉伸。Gamma < 1.0 提升暗部细节。参数: gamma (e.g., 0.5)。
+      #   - "min_max_normalize": 线性拉伸到 0-255。无参数。
+      #   - "none": 不做处理
+      - method: "min_max_normalize"
+        params: {}
+
+      # Step 2: 轮次间亮度校正
+      # 目的: 修正光漂白导致的亮度衰减。让 R2, R3... 的亮度分布向 R1 看齐。
+      # 可选方法:
+      #   - "histogram_match": 直方图匹配。参数: scope: "inter_round"
+      #   - "none": 不做处理
+      - method: "histogram_match"
+        params:
+          scope: "inter_round"
+
+      # Step 3: 通道间亮度校正
+      # 目的: 修正不同激光器/滤光片的效率差异。让 Ch1, Ch2... 的亮度分布向 Ch0 看齐。
+      # 可选方法:
+      #   - "histogram_match": 直方图匹配。参数: scope: "intra_round"
+      #   - "clahe": 局部自适应直方图均衡化 (更强烈的对比度增强，不需要参考图)。参数: clip_limit (0.01), nbins (256)
+      #   - "none": 不做处理
+      - method: "histogram_match"
+        params:
+          scope: "intra_round"
+
+      # Step 4: 背景扣除
+      # 目的: 去除组织自发荧光和非特异性结合。这是最关键的一步。
+      # 可选方法:
+      #   - "morpho_reconstruction_contrast": 形态学重构去背景。参数: radius (像素)。半径必须大于最大的 RNA 斑点，但必须远小于背景纹理。
+      #   - "difference_of_gaussians":  2D逐层高斯差分(DoG)。同时去除高频噪声和低频背景。 参数: spot_sigma (斑点大小, e.g., 1.0), bg_sigma (背景大小, e.g., 4.0)。
+      #   - "none": 不做处理
+      - method: "morpho_reconstruction_contrast"
+        params:
+          radius: 5
+          downsample_factor: 0.25 # 在下采样空间计算背景
+
+      
+    
+  # Stage 1: Registration (对齐)
+  registration:
+    reference_round: 1
+    # 我们定义两种模式:
+    # Mode 1: "single_channel" -> 指定某个固定通道 (如 DAPI)
+    # Mode 2: "mip_all_channels" -> 把所有通道压扁成一张图 (RIBOmap 方案)
+    
+    method: "mip_all_channels" 
+    
+    # 只有当 method 是 "single_channel" 时才需要填这个，RIBOmap模式下忽略
+    # single_channel_id: 4 
+
+    # 如果是 mip_all_channels，指定用哪些通道来合成 (比如 [0,1,2,3])
+    mip_channels: [0, 1, 2]
+
+    
+
+    # 粗对齐 (Global)
+    # 下采样因子。算全局位移不需要完整读3072x3072，缩小4倍算得一样准
+    downsample_factor: 1 
+    
+    # GPU开关
+    use_gpu: false
+
+    # 全局对齐搜索范围 (Gross shift limit)
+    global_max_shift: 200 
+
+    # 精细对齐 (Local/Warping)
+    enable_local: true
+    local_method: "demons_3d"  #optical_flow | bspline | demons_3d
+    
+    #bspline参数
+    #请在notebook中进行试验获取合适参数
+    bspline:
+      grid_spacing: 17   # 稍微调大一点，保证水凝胶形变的平滑性
+      num_iter: 70 # 迭代次数
+
+    # 光流法参数 (Optical Flow Parameters)
+    #请在notebook中进行试验获取合适参数
+    optical_flow:
+      coarse_scale: 0.12 # 核心参数：缩小图像计算
+      blur_sigma: 1.9    # 在小图上的模糊半径
+      attachment: 2.0      # 附件项权重
+      tightness: 0.45       # 平滑项权重
+      num_warp: 5          # 变形迭代次数
+      num_iter: 10         # 每层迭代次数
+      tol: 0.0001          # 收敛容差
+    
+    demons_3d:
+      num_iter: 50  # 迭代次数
+      smoothing_sigma: 1.0  # 平滑半径
+    # 输出控制
+    save_displacement_fields: true  # 是否保存.npy位移场
+    save_registered_images: false   # 是否保存对齐后的图（慎用！）
+    
+  # Stage 2: Spot Finding (找点)
+  spot_finding:
+    # 核心开关：决定了下方哪个参数块被激活
+    algorithm: "peak_local_max"  # 选项: "spotiflow" | "blob_dog" | "peak_local_max"
+    
+    reference_round: 1
+    method: "max_intensity" # "max_intensity" | "rms"
+
+    #请在notebook中进行试验获取合适参数
+    # Spotiflow
+    spotiflow:
+      model_name: "smfish_3d"
+      prob_thresh: 0.5   # 概率阈值，通常 0.5 是中信，0.8 比较严苛
+      use_gpu: true
+
+    # Difference of Gaussians
+    blob_dog:
+      min_sigma: [0.5, 1.0, 1.0] # Z,Y,X
+      max_sigma: [2.0, 5.0, 5.0] # Z 方向不要太大，否则把相邻层抹平
+      threshold: 0.01    # 这里的阈值对应的是高斯差分强度，不等于相对全图亮度的百分比
+      overlap: 0.5       # 是否允许点位重叠
+
+    # Max3D
+    peak_local_max:
+      min_distance: 2
+      threshold_rel: 0.05 # 相对全图亮度的百分比
+      exclude_border: true
+    
+  # Stage 3: Extraction (提取)
+  extraction:
+    method: "box_sum"  # 预留未来扩展，比如 "gaussian_weight"
+    integration_box: [3, 3, 3] # Z, Y, X
+    handle_out_of_bounds: "pad_zero" # 如果位移后出界了怎么办
+    
+  # Stage 4: Output
+  output:
+    directory: "/gpfs/share/home/2201112433/labShare/2501111695/data/202512_mouse_testis_r1_leica/02_pystar_output"
+    save_qc_images: false
+
+  #Stage 5: QC
+  qc:
+    enable: true
+    
+    # Registration QC
+    alignment_check:
+      roi_size: 512
+      num_samples: 3  # 每轮随机采样几个区域检查
+      blend_colors: ["green", "magenta"]  # 叠加显示的颜色
+    
+    correlation_plot:
+      dpi: 150
+      show_threshold: true
