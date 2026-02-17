@@ -640,11 +640,21 @@ class Decoder:
             print(f"\n [Top 10 Detected Genes]")
             for gene, count in top_genes.items():
                 print(f"   {gene}: {count}")
-        # 8. 保存
-        out_path = paths["decoded"] / f"decoded_fov_{fov_id}.csv"
-        df_res_true.to_csv(out_path, index=False)
-        print(f" [Decoder] Saved decoded list to {out_path.name}")
+        # 8. 保存 - 分离 decoded 和 background
+        # decoded_fov_{fov_id}.csv: 只包含成功解码的 spots (非 background)
+        decoded_path = paths["decoded"] / f"decoded_fov_{fov_id}.csv"
+        df_decoded = df_res_true[df_res_true['gene'] != 'background'].copy()
+        df_decoded.to_csv(decoded_path, index=False)
+        n_decoded = len(df_decoded)
+        n_background = len(df_res_true) - n_decoded
+        print(f" [Decoder] Saved {n_decoded} decoded spots to {decoded_path.name}")
         
+        # all_reads_fov_{fov_id}.csv: 包含所有 spots (包括 background)
+        all_reads_path = paths["decoded"] / f"all_reads_fov_{fov_id}.csv"
+        df_res_true.to_csv(all_reads_path, index=False)
+        print(f" [Decoder] Saved {len(df_res_true)} total spots ({n_background} background) to {all_reads_path.name}")
+        
+        # 保留 pre_pattern_check 用于调试
         df_res.to_csv(
             paths["decoded"] / f"decoded_fov_{fov_id}_pre_pattern_check.csv", 
             index=False
