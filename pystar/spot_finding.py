@@ -47,6 +47,8 @@ class SpotFinder:
         print(f" [SpotFinding] Mining FOV {fov_id} using Clean Data (Ref Round {ref_round})...")
         print(f" [SpotFinding] Target Channels: {channels}")
 
+        algo = self.spot_cfg.algorithm
+
         all_spots_dfs = []
         
         # 用于 QC 可视化的容器 (Channel -> Image)
@@ -76,8 +78,6 @@ class SpotFinder:
             qc_images[c] = vol[z_mid].copy()
 
             # 4. 选择算法
-            algo = self.spot_cfg.algorithm
-            
             # 运行具体算法
             if algo == "spotiflow":
                 df_c = self._run_spotiflow(vol)

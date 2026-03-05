@@ -1,6 +1,6 @@
 import yaml
 from pathlib import Path
-from typing import List, Dict, Union, Any, Optional
+from typing import List, Dict, Union, Any, Optional, Literal
 from pydantic import BaseModel, model_validator, Field, ValidationError, ConfigDict
 
 # --- 辅助函数 ---
@@ -87,11 +87,15 @@ class CodebookConfig(BaseModel):
     model_config = ConfigDict(frozen=True) 
 
     @property
-    def normalized_encoding_map(self) -> Dict[str, int]:
+    def normalized_encoding_map(self) -> Dict[str, Dict[str, int]]:
         """Runtime 转换，不污染 Config 状态"""
         base = self.channel_base_index
-        if base == 0: return self.encoding_tables
-        return {k: v - base for k, v in self.encoding_tables.items()}
+        if base == 0:
+            return self.encoding_tables
+        return {
+            table_name: {pair: color - base for pair, color in mapping.items()}
+            for table_name, mapping in self.encoding_tables.items()
+        }
 
 class PreprocessingStep(BaseModel):
     """
@@ -214,18 +218,20 @@ class BlobDogConfig(BaseModel):
         无论用户输入 0.5 还是 [0.5, 0.5, 0.5]，
         在模型初始化后，它们全部变成 [0.5, 0.5, 0.5]。
         """
-        def to_list(val):
+        def to_list(val: Union[List[float], float]) -> List[float]:
             if isinstance(val, (int, float)):
                 return [float(val)] * 3
-            return val
+            return [float(item) for item in val]
 
-        # 使用 __dict__ 直接修改，避免引发额外的验证循环
-        self.__dict__['min_sigma'] = to_list(self.min_sigma)
-        self.__dict__['max_sigma'] = to_list(self.max_sigma)
-        
+        min_sigma = to_list(self.min_sigma)
+        max_sigma = to_list(self.max_sigma)
+
         # 简单的校验：确保列表长度是 3
-        if len(self.min_sigma) != 3 or len(self.max_sigma) != 3:
+        if len(min_sigma) != 3 or len(max_sigma) != 3:
             raise ValueError("Sigma must be a single float or a list of 3 floats (Z, Y, X)")
+
+        object.__setattr__(self, "min_sigma", min_sigma)
+        object.__setattr__(self, "max_sigma", max_sigma)
             
         return self
 
@@ -259,6 +265,28 @@ class ExtractionConfig(BaseModel):
     integration_box: List[int] = [1, 3, 3]
     handle_out_of_bounds: str = "pad_zero"
 
+class DecodingRuleConfig(BaseModel):
+    name: str
+    stage: Literal["spot", "barcode"]
+    enabled: bool = True
+    hard: bool = True
+    weight: float = 1.0
+    params: Dict[str, Any] = Field(default_factory=dict)
+
+class WeightedRescueConfig(BaseModel):
+    enable: bool = False
+    target: Literal["background", "all"] = "background"
+    max_weighted_distance: float = 1.5
+    min_second_gap: float = 0.0
+    round_weights: Optional[List[float]] = None
+
+class DecodingConfig(BaseModel):
+    quality_threshold: float = 0.5
+    max_soft_penalty: Optional[float] = None
+    rules: List[DecodingRuleConfig] = Field(default_factory=list)
+    round_channel_bias: Dict[int, List[float]] = Field(default_factory=dict)
+    weighted_rescue: WeightedRescueConfig = Field(default_factory=WeightedRescueConfig)
+
 class OutputConfig(BaseModel):
     directory: str
     save_qc_images: bool = True
@@ -272,6 +300,7 @@ class PipelineConfig(BaseModel):
     registration: RegistrationConfig  # 使用具体的类
     spot_finding: SpotFindingConfig
     extraction: ExtractionConfig
+    decoding: DecodingConfig = Field(default_factory=DecodingConfig)
     output: OutputConfig 
     qc: QCConfig
 class ExperimentConfig(BaseModel):

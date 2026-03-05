@@ -6,7 +6,7 @@ from scipy.ndimage import map_coordinates
 from pathlib import Path
 from .infrastructure import ExperimentConfig
 from .io import ImageLoader
-from .io import get_fov_output_structure
+from.io import get_fov_output_structure
 # visualization 模块保留引用，按需导入即可
 from .visualization import plot_spot_traces, plot_spot_extraction_check
 
@@ -160,7 +160,10 @@ class SignalMiner:
         with tqdm(total=total_steps, desc="Extracting Signals") as pbar:
             for r_idx, r_id in enumerate(rounds):
                 # Pre-calculate coordinates for this round ONCE
-                trans_data = transforms.get(r_id, {'global_shift_3d': np.zeros(3), 'flow_2d': None})
+                trans_data = transforms.get(
+                    r_id,
+                    {'global_shift_3d': np.zeros(3), 'flow_2d': None, 'flow_3d': None},
+                )
                 
                 # 这一步计算浮点坐标
                 target_coords = map_spot_coordinates(ref_coords, trans_data)

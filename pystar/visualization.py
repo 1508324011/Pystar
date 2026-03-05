@@ -7,11 +7,9 @@ from tqdm import tqdm
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional,List, Optional, Tuple
 import seaborn as sns
 from scipy.stats import pearsonr, spearmanr
-
-from .io import ImageLoader
 
 def compare_preprocessing_5regions(
     raw_vol: np.ndarray, 
@@ -792,6 +790,12 @@ def plot_spot_extraction_check(
         plt.close()
     else:
         plt.show()
+        
+
+from .io import ImageLoader
+import pandas as pd
+import numpy as np
+from pathlib import Path
 
 class SpotInspector:
     def __init__(self, config, fov_id: int):
@@ -831,8 +835,6 @@ class SpotInspector:
         index : int
             你想看第几个？比如 0 (光强最高的/列表第一个)，或者 10 (随机一个)
         """
-        from .mining import map_spot_coordinates
-        
         # 1. 筛选基因
         # 忽略大小写
         subset = self.df[self.df['gene'].str.upper() == gene_name.upper()]
@@ -861,6 +863,8 @@ class SpotInspector:
         # 这是最关键的一步：我们需要把 R1 的坐标映射到所有轮次
         base_coord = np.array([target_row['z'], target_row['y'], target_row['x']], dtype=np.float32)
         
+        from .mining import map_spot_coordinates
+
         coords_per_round = {}
         rounds = sorted(list(self.cfg.dataset.round_structure.keys()))
         

@@ -8,9 +8,12 @@ from typing import Tuple, Optional, Dict, Any, List
 from pathlib import Path
 from scipy.ndimage import shift as scipy_shift
 from scipy.ndimage import map_coordinates
+from skimage.morphology import white_tophat, disk
+from skimage.exposure import equalize_adapthist
+from skimage.util import img_as_float32
 from skimage.registration import phase_cross_correlation, optical_flow_tvl1
 from skimage.transform import warp, resize
-from skimage.filters import gaussian
+from skimage.filters import threshold_otsu, gaussian
 import warnings
 
 from .infrastructure import ExperimentConfig
@@ -667,7 +670,10 @@ class RegistrationEngine:
             if r_id == ref_round:
                 transforms[r_id] = {
                     'global_shift_3d': np.array([0., 0., 0.]),
-                    'global_corr': 1.0, 'flow_2d': None, 'final_corr': 1.0
+                    'global_corr': 1.0,
+                    'flow_2d': None,
+                    'flow_3d': None,
+                    'final_corr': 1.0,
                 }
                 continue
 
@@ -697,6 +703,7 @@ class RegistrationEngine:
 
             # ========== Step C: Local Flow (MIP vs MIP) ==========
             flow_2d = None
+            flow_3d = None
             final_corr = corr_after_global
             final_img_qc = mov_mip_shifted
 
@@ -762,6 +769,7 @@ class RegistrationEngine:
                 'global_shift_3d': global_shift_3d,
                 'global_corr': global_corr,
                 'flow_2d': flow_2d,
+                'flow_3d': flow_3d,
                 'final_corr': final_corr
             }
 

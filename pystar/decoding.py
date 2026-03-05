@@ -1,12 +1,25 @@
 # pystar/decoding.py
+import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict, Tuple, Callable
+from typing import Dict, Tuple, Callable, List, Any
 from tqdm import tqdm
 
 from .io import get_fov_output_structure
 from .infrastructure import ExperimentConfig
+from .decoding_rules import apply_rule_pipeline, default_rules
+
+def softmax(x, axis=2, temperature=1.0):
+    """
+    计算 Softmax，带温度参数。
+    Temperature 越小，分布越尖锐（Highlights winner）。
+    Temperature 越大，分布越平坦。
+    通常 T=1.0 即可，如果是 Z-score 输入，分布已经很标准了。
+    """
+    # 减去最大值防止 exp 溢出 (Numerical Stability)
+    e_x = np.exp((x - np.max(x, axis=axis, keepdims=True)) / temperature)
+    return e_x / e_x.sum(axis=axis, keepdims=True)
 
 def compatible_base_calling(norm_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -61,7 +74,7 @@ def compatible_base_calling(norm_matrix: np.ndarray) -> Tuple[np.ndarray, np.nda
     
     # 5. 全局有效性检查
     #  if ~any(isinf(baseScores(i, :)))
-    is_valid = ~np.any(np.isinf(base_scores), axis=1)  # (N,)
+    is_valid = np.asarray(~np.any(np.isinf(base_scores), axis=1), dtype=bool)  # (N,)
     
     return read_indices, base_scores, is_valid
 
@@ -103,10 +116,143 @@ def compatible_quality_filter(
 class Decoder:
     def __init__(self, config: ExperimentConfig):
         self.cfg = config
+        self.output_dir = Path(self.cfg.pipeline.output.directory)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # 加载并编译码本
         self.gene_map, self.barcode_map = self._compile_codebook()
         self.reverse_lookups = self._build_reverse_lookups()
+        self.codebook_matrix, self.codebook_genes, self.code_length = self._prepare_codebook_matrix()
+
+    def _prepare_codebook_matrix(self) -> Tuple[np.ndarray, np.ndarray, int]:
+        barcodes = self.barcode_map["barcode"].astype(str).tolist()
+        genes = self.barcode_map["gene"].astype(str).to_numpy()
+        if not barcodes:
+            raise ValueError("Compiled codebook is empty")
+
+        code_length = len(barcodes[0])
+        matrix_rows = []
+        valid_indices = []
+        for index, barcode in enumerate(barcodes):
+            if len(barcode) != code_length or (not barcode.isdigit()):
+                continue
+            matrix_rows.append([int(char) for char in barcode])
+            valid_indices.append(index)
+
+        if not matrix_rows:
+            raise ValueError("No valid digit-only barcodes found in compiled codebook")
+
+        matrix = np.asarray(matrix_rows, dtype=np.int8)
+        gene_subset = np.asarray([genes[index] for index in valid_indices], dtype=object)
+        return matrix, gene_subset, code_length
+
+    def _apply_round_channel_bias(self, norm_matrix: np.ndarray) -> np.ndarray:
+        bias_map = self.cfg.pipeline.decoding.round_channel_bias
+        if not bias_map:
+            return norm_matrix
+
+        rounds = sorted(self.cfg.dataset.round_structure.keys())
+        adjusted = norm_matrix.copy()
+        n_channels = adjusted.shape[2]
+
+        for round_id, bias_values in bias_map.items():
+            rid = int(round_id)
+            if rid not in rounds:
+                continue
+            round_index = rounds.index(rid)
+            bias_vector = np.asarray(bias_values, dtype=np.float32)
+            if bias_vector.shape[0] != n_channels:
+                raise ValueError(
+                    f"round_channel_bias for round {rid} has length {bias_vector.shape[0]}, expected {n_channels}"
+                )
+            adjusted[:, round_index, :] = adjusted[:, round_index, :] + bias_vector[np.newaxis, :]
+
+        adjusted = np.clip(adjusted, a_min=0.0, a_max=None)
+        norms = np.linalg.norm(adjusted, axis=2, keepdims=True)
+        norms[norms <= 1e-6] = 1.0
+        return adjusted / norms
+
+    def _apply_weighted_barcode_rescue(self, df_res: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        rescue_cfg = self.cfg.pipeline.decoding.weighted_rescue
+        report = {
+            "enabled": bool(rescue_cfg.enable),
+            "target": str(rescue_cfg.target),
+            "n_candidates": 0,
+            "n_unique_barcodes": 0,
+            "n_rescue_rules": 0,
+            "n_rescued_spots": 0,
+            "max_weighted_distance": float(rescue_cfg.max_weighted_distance),
+            "min_second_gap": float(rescue_cfg.min_second_gap),
+        }
+
+        if (not rescue_cfg.enable) or len(df_res) == 0:
+            return df_res, report
+
+        if rescue_cfg.target == "background":
+            target_mask = df_res["gene"].astype(str) == "background"
+        else:
+            target_mask = np.ones(len(df_res), dtype=bool)
+
+        report["n_candidates"] = int(target_mask.sum())
+        if report["n_candidates"] == 0:
+            return df_res, report
+
+        round_weights = rescue_cfg.round_weights
+        if round_weights is None:
+            weights = np.ones(self.code_length, dtype=np.float32)
+        else:
+            if len(round_weights) != self.code_length:
+                raise ValueError(
+                    f"weighted_rescue.round_weights length {len(round_weights)} != code length {self.code_length}"
+                )
+            weights = np.asarray(round_weights, dtype=np.float32)
+
+        subset = df_res.loc[target_mask, ["barcode", "gene"]].copy()
+        subset["barcode"] = subset["barcode"].astype(str)
+        unique_barcodes = subset["barcode"].unique().tolist()
+        report["n_unique_barcodes"] = int(len(unique_barcodes))
+
+        rescue_cache: Dict[str, Tuple[str, float, float]] = {}
+        max_distance = float(rescue_cfg.max_weighted_distance)
+        min_gap = float(rescue_cfg.min_second_gap)
+
+        for barcode in unique_barcodes:
+            if len(barcode) != self.code_length or (not barcode.isdigit()):
+                continue
+            observed = np.fromiter((ord(char) - 48 for char in barcode), dtype=np.int8, count=self.code_length)
+            distances = np.sum((self.codebook_matrix != observed) * weights, axis=1)
+            best_index = int(np.argmin(distances))
+            best_distance = float(distances[best_index])
+            if len(distances) > 1:
+                second_distance = float(np.partition(distances, 1)[1])
+            else:
+                second_distance = best_distance
+            gap = second_distance - best_distance
+
+            if best_distance <= max_distance and gap >= min_gap:
+                rescue_cache[barcode] = (str(self.codebook_genes[best_index]), best_distance, gap)
+
+        report["n_rescue_rules"] = int(len(rescue_cache))
+        if len(rescue_cache) == 0:
+            return df_res, report
+
+        gene_map = subset["barcode"].map(lambda code: rescue_cache.get(code, (None, None, None))[0])
+        dist_map = subset["barcode"].map(lambda code: rescue_cache.get(code, (None, None, None))[1])
+        gap_map = subset["barcode"].map(lambda code: rescue_cache.get(code, (None, None, None))[2])
+
+        apply_mask = gene_map.notna() & (subset["gene"].astype(str) != gene_map.astype(str))
+        if not apply_mask.any():
+            return df_res, report
+
+        indices = subset.index[apply_mask]
+        df_res.loc[indices, "rescue_prev_gene"] = df_res.loc[indices, "gene"].astype(str)
+        df_res.loc[indices, "gene"] = gene_map.loc[indices].to_numpy()
+        df_res.loc[indices, "rescue_applied"] = True
+        df_res.loc[indices, "rescue_distance"] = dist_map.loc[indices].to_numpy()
+        df_res.loc[indices, "rescue_gap"] = gap_map.loc[indices].to_numpy()
+
+        report["n_rescued_spots"] = int(len(indices))
+        return df_res, report
         
     def _compile_codebook(self) -> Tuple[Dict[str, str], pd.DataFrame]:
         """
@@ -216,8 +362,7 @@ class Decoder:
         # Save Debug CSV (这是给你检查切片对不对的关键文件)
         # 我们把切分后的每一段也保存下来方便肉眼Debug，这需要稍微改一下上面的逻辑，但作为Debug
         # 我们可以直接保存最终结果
-        base_dir = Path(self.cfg.pipeline.output.directory)
-        debug_path = base_dir / "compiled_codebook_debug.csv"
+        debug_path = self.output_dir / "compiled_codebook_debug.csv"
         valid_df.to_csv(debug_path, index=False)
         print(f"   -> Compiled {len(valid_df)} barcodes. Debug info saved to {debug_path.name}")
         
@@ -478,6 +623,38 @@ class Decoder:
         box = self.cfg.pipeline.extraction.integration_box # [z, y, x]
         return box[0] * box[1] * box[2]
 
+    def _collect_rules_for_stage(self, stage: str) -> List[Any]:
+        cfg_rules = self.cfg.pipeline.decoding.rules
+        if cfg_rules:
+            return [rule for rule in cfg_rules if rule.stage == stage and rule.enabled]
+
+        fallback_rules = default_rules(self.cfg.pipeline.decoding.quality_threshold)
+        return [rule for rule in fallback_rules if rule["stage"] == stage and rule["enabled"]]
+
+    def _save_rule_report(
+        self,
+        paths,
+        fov_id: int,
+        spot_reports: List[Dict[str, Any]],
+        barcode_reports: List[Dict[str, Any]],
+        n_total: int,
+        n_after_spot: int,
+        n_after_barcode: int,
+        weighted_rescue_report: Dict[str, Any] | None = None,
+    ) -> None:
+        report = {
+            "fov_id": int(fov_id),
+            "n_total_spots": int(n_total),
+            "n_after_spot_rules": int(n_after_spot),
+            "n_after_barcode_rules": int(n_after_barcode),
+            "spot_rules": spot_reports,
+            "barcode_rules": barcode_reports,
+        }
+        if weighted_rescue_report is not None:
+            report["weighted_rescue"] = weighted_rescue_report
+        report_path = paths["decoded"] / f"decoded_fov_{fov_id}_rule_report.json"
+        report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+
     def decode_fov(self, fov_id: int):
         print(f"[{'='*20} Decoding FOV {fov_id} {'='*20}]")
         
@@ -510,6 +687,7 @@ class Decoder:
         print(" -> Normalizing intensities...")
         norms = np.linalg.norm(raw_matrix, axis=2, keepdims=True) + 1e-6
         norm_matrix = raw_matrix / norms
+        norm_matrix = self._apply_round_channel_bias(norm_matrix)
         
         #print(" -> Applying Normalization (Z-Score)...")
         # 形状: (1, 1, C)
@@ -532,27 +710,42 @@ class Decoder:
         n_ties = np.sum(~is_valid)
         print(f"   Tie/Invalid detection: {n_ties} spots flagged ({n_ties/n_spots:.2%})")
         
-        print(" -> Filtering by quality score...")
-        
-        # Matlab的阈值是0.5，只对有效的spot计算
-        # 注意：有Inf的spot已经在is_valid中被标记为False了
-        quality_pass = compatible_quality_filter(
-            base_scores[is_valid], 
-            threshold=0.5
-        )
-        
-        # 创建一个全局的质量过滤mask
-        quality_pass_global = np.zeros(n_spots, dtype=bool)
-        quality_pass_global[is_valid] = quality_pass
+        print(" -> Applying spot-rule pipeline...")
 
-        final_pass = is_valid & quality_pass_global
-        
-        print(f"\n [Filtration Statistics]")
+        quality_threshold = self.cfg.pipeline.decoding.quality_threshold
+        max_soft_penalty = self.cfg.pipeline.decoding.max_soft_penalty
+        spot_rules = self._collect_rules_for_stage("spot")
+        spot_context = {
+            "norm_matrix": norm_matrix,
+            "base_scores": base_scores,
+            "is_valid": is_valid,
+            "quality_threshold": quality_threshold,
+        }
+        spot_keep, spot_soft_penalty, spot_reports = apply_rule_pipeline(
+            stage="spot",
+            n_items=n_spots,
+            rules=spot_rules,
+            context=spot_context,
+            max_soft_penalty=max_soft_penalty,
+        )
+        final_pass = is_valid & spot_keep
+
+        print(f"\n [Spot Filtration Statistics]")
         print(f"   Total spots:        {n_spots}")
         print(f"   Valid (no ties):    {is_valid.sum()} ({is_valid.sum()/n_spots:.2%})")
-        print(f"   Quality pass:       {quality_pass_global.sum()} ({quality_pass_global.sum()/n_spots:.2%})")
-        print(f"   Final kept:         {final_pass.sum()} ({final_pass.sum()/n_spots:.2%})")
-        print(f"   Removed by quality filter:  {n_spots - final_pass.sum()}")
+        print(f"   After spot rules:   {final_pass.sum()} ({final_pass.sum()/n_spots:.2%})")
+        print(f"   Removed by spot rules: {n_spots - final_pass.sum()}")
+
+        if spot_reports:
+            print("   Rule details:")
+            for rpt in spot_reports:
+                print(
+                    f"    - {rpt['name']}: {rpt['before']} -> {rpt['after']} "
+                    f"(fail={rpt['failed_by_rule']})"
+                )
+        if max_soft_penalty is not None:
+            soft_keep = int((spot_soft_penalty <= max_soft_penalty).sum())
+            print(f"   Soft penalty <= {max_soft_penalty}: {soft_keep}")
 
         # 5. Fast String Construction (Vectorized)
         print(" -> Constructing barcodes...")
@@ -585,25 +778,64 @@ class Decoder:
         valid_raw_matrix = raw_matrix[valid_indices]
         df_res['intensity'] = np.max(np.max(valid_raw_matrix, axis=2), axis=1)
         
-        print(" -> Validating end bases pattern...")
-        
-        # 应用验证函数到每个barcode
-        pattern_valid = df_res['barcode'].apply(self._validate_end_bases)
-        
-        n_pattern_fail = (~pattern_valid).sum()
-        pattern_fail_rate = n_pattern_fail / len(df_res) if len(df_res) > 0 else 0
-        
-        print(f"   Pattern validation removed: {n_pattern_fail} spots ({pattern_fail_rate:.2%})")
-        
+        print(" -> Applying barcode-rule pipeline...")
+
+        barcode_rules = self._collect_rules_for_stage("barcode")
+        barcode_context = {
+            "df": df_res,
+            "validator": self._validate_end_bases,
+        }
+        barcode_keep, _, barcode_reports = apply_rule_pipeline(
+            stage="barcode",
+            n_items=len(df_res),
+            rules=barcode_rules,
+            context=barcode_context,
+            max_soft_penalty=None,
+        )
+
+        n_barcode_fail = int((~barcode_keep).sum())
+        barcode_fail_rate = n_barcode_fail / len(df_res) if len(df_res) > 0 else 0
+        print(f"   Barcode rules removed: {n_barcode_fail} spots ({barcode_fail_rate:.2%})")
+
+        if barcode_reports:
+            print("   Rule details:")
+            for rpt in barcode_reports:
+                print(
+                    f"    - {rpt['name']}: {rpt['before']} -> {rpt['after']} "
+                    f"(fail={rpt['failed_by_rule']})"
+                )
+
         # Gene mapping
         df_res['gene'] = df_res['barcode'].map(self.gene_map).fillna('background')
-        
-        # 过滤掉不符合pattern的spots
-        df_res_true = df_res[pattern_valid].copy()
+
+        # 过滤掉不符合规则的spots
+        df_res_true = df_res[barcode_keep].copy()
+        df_res_true["rescue_applied"] = False
+        df_res_true["rescue_prev_gene"] = ""
+        df_res_true["rescue_distance"] = np.nan
+        df_res_true["rescue_gap"] = np.nan
+        df_res_true, weighted_rescue_report = self._apply_weighted_barcode_rescue(df_res_true)
+        if weighted_rescue_report.get("enabled"):
+            print(
+                "   Weighted rescue: "
+                f"rules={weighted_rescue_report['n_rescue_rules']} "
+                f"rescued={weighted_rescue_report['n_rescued_spots']} "
+                f"candidates={weighted_rescue_report['n_candidates']}"
+            )
         
         if len(df_res_true) == 0:
-            print(" [ERROR] No spots left after pattern validation!")
-            print(" [HINT] Check your anchor_base configuration in experiment_config.yaml")
+            print(" [ERROR] No spots left after barcode-rule pipeline!")
+            print(" [HINT] Check decoding rules and topology anchor settings")
+            self._save_rule_report(
+                paths=paths,
+                fov_id=fov_id,
+                spot_reports=spot_reports,
+                barcode_reports=barcode_reports,
+                n_total=n_spots,
+                n_after_spot=int(final_pass.sum()),
+                n_after_barcode=0,
+                weighted_rescue_report=weighted_rescue_report,
+            )
             return pd.DataFrame()
         
         # 计算每轮的平均质量分数（用于诊断）
@@ -615,7 +847,7 @@ class Decoder:
         
         print("\n [Quality Diagnostics] Average -log(max) per Round:")
         for r_idx, q in enumerate(avg_quality_per_round):
-            status = "✓" if q < 0.5 else "✗"
+            status = "✓" if q < quality_threshold else "✗"
             print(f"   Round {r_idx+1}: {q:.4f} {status}")
         
         if np.nanmin(avg_quality_per_round) > 0.7:
@@ -629,9 +861,9 @@ class Decoder:
         
         print(f"\n [Mapping Results]")
         print(f"   Spots after quality filter: {len(df_res)}")
-        print(f"   Spots after pattern check:  {len(df_res_true)}")
+        print(f"   Spots after barcode rules:  {len(df_res_true)}")
         print(f"   Spots after quality filter matched to genes:   {n_mapped} ({mapping_rate_quality:.2%})")
-        print(f"   Spots after pattern check matched to genes:    {n_mapped} ({mapping_rate_pattern:.2%})")
+        print(f"   Spots after barcode rules matched to genes:    {n_mapped} ({mapping_rate_pattern:.2%})")
         print(f"   Background/Unknown: {len(df_res) - n_mapped}")
         
         # Top genes
@@ -640,24 +872,25 @@ class Decoder:
             print(f"\n [Top 10 Detected Genes]")
             for gene, count in top_genes.items():
                 print(f"   {gene}: {count}")
-        # 8. 保存 - 分离 decoded 和 background
-        # decoded_fov_{fov_id}.csv: 只包含成功解码的 spots (非 background)
-        decoded_path = paths["decoded"] / f"decoded_fov_{fov_id}.csv"
-        df_decoded = df_res_true[df_res_true['gene'] != 'background'].copy()
-        df_decoded.to_csv(decoded_path, index=False)
-        n_decoded = len(df_decoded)
-        n_background = len(df_res_true) - n_decoded
-        print(f" [Decoder] Saved {n_decoded} decoded spots to {decoded_path.name}")
+        # 8. 保存
+        out_path = paths["decoded"] / f"decoded_fov_{fov_id}.csv"
+        df_res_true.to_csv(out_path, index=False)
+        print(f" [Decoder] Saved decoded list to {out_path.name}")
         
-        # all_reads_fov_{fov_id}.csv: 包含所有 spots (包括 background)
-        all_reads_path = paths["decoded"] / f"all_reads_fov_{fov_id}.csv"
-        df_res_true.to_csv(all_reads_path, index=False)
-        print(f" [Decoder] Saved {len(df_res_true)} total spots ({n_background} background) to {all_reads_path.name}")
-        
-        # 保留 pre_pattern_check 用于调试
         df_res.to_csv(
             paths["decoded"] / f"decoded_fov_{fov_id}_pre_pattern_check.csv", 
             index=False
+        )
+
+        self._save_rule_report(
+            paths=paths,
+            fov_id=fov_id,
+            spot_reports=spot_reports,
+            barcode_reports=barcode_reports,
+            n_total=n_spots,
+            n_after_spot=int(final_pass.sum()),
+            n_after_barcode=len(df_res_true),
+            weighted_rescue_report=weighted_rescue_report,
         )
         
         return df_res_true
