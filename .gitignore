@@ -56,6 +56,9 @@ venv.bak/
 ehthumbs.db
 Thumbs.db
 
+# Local helper scripts
+push_to_github.sh
+
 # Data and results (adjust based on your needs)
 *.h5
 *.h5ad
