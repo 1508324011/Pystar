@@ -30,8 +30,10 @@ dependencies = [
     "tifffile",
     "dask",
     "distributed",
+    "xarray",
     "scipy",
     "scikit-image",
+    "SimpleITK",
     "matplotlib",
     "seaborn",
     "tqdm",
@@ -52,9 +54,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/pystar"
-Repository = "https://github.com/yourusername/pystar"
-Documentation = "https://github.com/yourusername/pystar#readme"
+Homepage = "https://github.com/1508324011/pystar"
+Repository = "https://github.com/1508324011/pystar"
+Documentation = "https://github.com/1508324011/pystar#readme"
 
 [tool.hatch.build.targets.wheel]
 packages = ["pystar"]
