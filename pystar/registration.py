@@ -1,31 +1,56 @@
 # pystar/registration.py
 
+import hashlib
+import os
+import sys
 import numpy as np
 import xarray as xr
-import tifffile
 import SimpleITK as sitk
-from typing import Tuple, Optional, Dict, Any, List
+from datetime import datetime, timezone
+from typing import Tuple, Optional, Dict, Any, cast
 from pathlib import Path
+from numpy.typing import NDArray
 from scipy.ndimage import shift as scipy_shift
 from scipy.ndimage import map_coordinates
-from skimage.morphology import white_tophat, disk
-from skimage.exposure import equalize_adapthist
-from skimage.util import img_as_float32
 from skimage.registration import phase_cross_correlation, optical_flow_tvl1
-from skimage.transform import warp, resize
-from skimage.filters import threshold_otsu, gaussian
+from skimage.transform import resize
+from skimage.filters import gaussian
 import warnings
 
 from .infrastructure import ExperimentConfig
 from .io import ImageLoader
 from .io import get_fov_output_structure
+from .io import PROVENANCE_VERSION, build_execution_envelope, build_release_contract, save_transform_manifest
+from .matlab_registration import MATLABGlobalRegistrationBackend
+from .tiling import (
+    TileLayout,
+    TileSpec,
+    build_matlab_subtile_layout,
+    build_yx_tile_layout,
+    extract_tile,
+    extract_tile_write_window,
+    resolve_grid_shape_yx,
+    stitch_tiles,
+)
 from .visualization import save_registration_qc
+
+
+FloatArray = NDArray[np.float32]
+BoolArray = NDArray[np.bool_]
+
+
+def _ensure_supported_matlab_local_method(local_method: str) -> None:
+    if local_method != 'demons_3d':
+        raise ValueError(
+            "registration.local.provider='matlab' currently supports only local_method='demons_3d'; "
+            f"refusing to skip local registration silently for local_method={local_method!r}"
+        )
 
 # ==============================================================================
 # SECTION A: Data Extraction Layer
 # ==============================================================================
 
-def compute_overlap_roi(shape: Tuple[int, int], shift_2d: np.ndarray) -> np.ndarray:
+def compute_overlap_roi(shape: Tuple[int, int], shift_2d: FloatArray) -> BoolArray:
     """
     [Helper] 计算全局移动后的有效重叠区域掩码。
     shift_2d = [dy, dx]
@@ -55,11 +80,11 @@ def compute_overlap_roi(shape: Tuple[int, int], shift_2d: np.ndarray) -> np.ndar
 # ==============================================================================
 
 def compute_global_shift_3d(
-    ref_3d_clean: np.ndarray,
-    mov_3d_clean: np.ndarray,
+    ref_3d_clean: FloatArray,
+    mov_3d_clean: FloatArray,
     downsample_factor: int = 1,
     max_shift: int = 200
-) -> Tuple[np.ndarray, float]:
+) -> Tuple[FloatArray, float]:
     """
     [Core] 计算 3D 全局刚性位移。
     
@@ -107,7 +132,7 @@ def compute_global_shift_3d(
     shift_s, error, _ = phase_cross_correlation(
         ref_s, mov_s,
         upsample_factor=10,
-        normalization=None 
+        normalization=cast(Any, None)
     )
     
     # 4. 恢复真实尺度
@@ -132,9 +157,9 @@ def compute_global_shift_3d(
             f"Registration may be unreliable!"
         )
         
-    return real_shift, correlation
+    return real_shift.astype(np.float32), float(correlation)
 
-def apply_rigid_shift_3d(img_3d: np.ndarray, shift_3d: np.ndarray) -> np.ndarray:
+def apply_rigid_shift_3d(img_3d: FloatArray, shift_3d: FloatArray) -> FloatArray:
     """
     [Transform] 应用 3D 刚性位移。
     
@@ -150,18 +175,21 @@ def apply_rigid_shift_3d(img_3d: np.ndarray, shift_3d: np.ndarray) -> np.ndarray
     shifted : np.ndarray
         (Z, Y, X)
     """
-    return scipy_shift(img_3d, shift_3d, order=1, mode='constant', cval=0.0)
+    return np.asarray(
+        scipy_shift(img_3d, shift_3d, order=1, mode='constant', cval=0.0),
+        dtype=np.float32,
+    )
 
 # ==============================================================================
 # SECTION C: Local Registration (2D Optical Flow with Quality Masking)
 # ==============================================================================
 
 def create_quality_mask(
-    img_2d: np.ndarray,
-    valid_roi_mask: Optional[np.ndarray] = None,
+    img_2d: FloatArray,
+    valid_roi_mask: Optional[BoolArray] = None,
     edge_margin: int = 50,
     threshold: float = 1e-5 
-) -> np.ndarray:
+) -> BoolArray:
     """
     [Helper] 基于 Clean MIP 创建掩码。
     """
@@ -184,11 +212,11 @@ def create_quality_mask(
     return mask
 
 def compute_optical_flow_masked(
-    ref_2d: np.ndarray,
-    mov_2d: np.ndarray,
-    mask: Optional[np.ndarray],
+    ref_2d: FloatArray,
+    mov_2d: FloatArray,
+    mask: Optional[BoolArray],
     config_obj: Any
-) -> Optional[np.ndarray]:
+) -> Optional[FloatArray]:
     """
     [Core] 计算带掩码的 2D 光流。
     使用降采样策略强制算法只关注宏观形变，忽略稀疏斑点的微小错位。
@@ -217,7 +245,7 @@ def compute_optical_flow_masked(
     # 不要在大图上算！把图缩小。
     # 默认缩放到 0.25 (即 1/4 尺寸)，相当于金字塔的某一层。
     # 这比单纯的 blur 更有效，因为它物理上消除了高频噪声。
-    scale_factor = getattr(config_obj, 'coarse_scale', 0.25)
+    scale_factor = float(getattr(config_obj, 'coarse_scale', 0.25))
     
     h, w = ref_2d.shape
     
@@ -246,7 +274,7 @@ def compute_optical_flow_masked(
         # ---  Compute Flow on Small Image ---
         flow_small = optical_flow_tvl1(
             ref_small, mov_small,
-            attachment=getattr(config_obj, 'attachment', 15.0), # 强力贴合
+            attachment=cast(Any, getattr(config_obj, 'attachment', 15.0)), # 强力贴合
             tightness=getattr(config_obj, 'tightness', 0.2),    # 允许形变
             num_warp=getattr(config_obj, 'num_warp', 5),
             num_iter=getattr(config_obj, 'num_iter', 20),
@@ -262,12 +290,12 @@ def compute_optical_flow_masked(
         
         # 关键数学细节：
         # 如果图像放大了 N 倍，位移量(像素数)也要放大 N 倍！
-        correction_factor = 1.0 / scale_factor
+        correction_factor = float(1.0 / scale_factor)
         
         # Resize Y component
-        flow_large[0] = resize(flow_small[0], (h, w), order=1) * correction_factor
+        flow_large[0] = np.asarray(resize(flow_small[0], (h, w), order=1), dtype=np.float32) * correction_factor
         # Resize X component
-        flow_large[1] = resize(flow_small[1], (h, w), order=1) * correction_factor
+        flow_large[1] = np.asarray(resize(flow_small[1], (h, w), order=1), dtype=np.float32) * correction_factor
         
         # ---  Final Polish ---
         # 放大插值可能会带来网格效应，最后做一次平滑
@@ -281,11 +309,11 @@ def compute_optical_flow_masked(
         return None
 
 def register_local_bspline(
-    ref_2d: np.ndarray, 
-    mov_2d: np.ndarray, 
-    mask: Optional[np.ndarray],
+    ref_2d: FloatArray, 
+    mov_2d: FloatArray, 
+    mask: Optional[BoolArray],
     config_obj: Any
-) -> Optional[np.ndarray]:
+) -> Optional[FloatArray]:
     """
     [Core] 使用 SimpleITK B-Spline 进行局部非刚性配准。
     
@@ -391,10 +419,10 @@ def register_local_bspline(
         return None
 
 def register_local_demons_3d(
-    ref_3d: np.ndarray,
-    mov_3d: np.ndarray,
+    ref_3d: FloatArray,
+    mov_3d: FloatArray,
     config_obj: Any
-) -> Optional[np.ndarray]:
+) -> Optional[FloatArray]:
     """
     3D Demons 非刚性配准
     
@@ -452,7 +480,7 @@ def register_local_demons_3d(
         warnings.warn(f"Demons 3D registration failed: {e}")
         return None
 
-def apply_warp_field_2d(img_2d: np.ndarray, flow: np.ndarray) -> np.ndarray:
+def apply_warp_field_2d(img_2d: FloatArray, flow: FloatArray) -> FloatArray:
     """
     [Transform] 应用 2D 变形。
     
@@ -489,10 +517,10 @@ def apply_warp_field_2d(img_2d: np.ndarray, flow: np.ndarray) -> np.ndarray:
     return warped.astype(img_2d.dtype)
 
 def composite_transform_2d(
-    img_2d: np.ndarray,
-    shift_2d: np.ndarray,
-    flow: Optional[np.ndarray]
-) -> np.ndarray:
+    img_2d: FloatArray,
+    shift_2d: FloatArray,
+    flow: Optional[FloatArray]
+) -> FloatArray:
     """
     [Helper] 一键应用 2D 位移场。
     
@@ -511,15 +539,18 @@ def composite_transform_2d(
         (Y, X)
     """
     # Step 1: 刚性平移
-    shifted = scipy_shift(img_2d, shift_2d, order=1, mode='constant', cval=0.0)
+    shifted = np.asarray(
+        scipy_shift(img_2d, shift_2d, order=1, mode='constant', cval=0.0),
+        dtype=np.float32,
+    )
 
     # Step 2: 光流变形
     if flow is not None:
         return apply_warp_field_2d(shifted, flow)
 
-    return shifted
+    return shifted.astype(np.float32)
 
-def apply_warp_field_3d(img_3d: np.ndarray, flow_3d: np.ndarray) -> np.ndarray:
+def apply_warp_field_3d(img_3d: FloatArray, flow_3d: FloatArray) -> FloatArray:
     """
     应用 3D 变形场
     
@@ -560,7 +591,7 @@ def apply_warp_field_3d(img_3d: np.ndarray, flow_3d: np.ndarray) -> np.ndarray:
 # SECTION D: Quality Metrics
 # ==============================================================================
 
-def simple_correlation(img1: np.ndarray, img2: np.ndarray) -> float:
+def simple_correlation(img1: FloatArray, img2: FloatArray) -> float:
     """
     计算两张图像的皮尔逊相关系数（中心裁剪加速）。
     
@@ -591,6 +622,273 @@ def simple_correlation(img1: np.ndarray, img2: np.ndarray) -> float:
 
     return np.corrcoef(i1, i2)[0, 1]
 
+
+def _iso_utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _get_available_memory_bytes() -> Optional[int]:
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+    except (AttributeError, OSError, ValueError):
+        return None
+    return page_size * available_pages
+
+
+def _compute_environment_hash(config_hash: str, execution_envelope: Dict[str, str], software_versions: Dict[str, str]) -> str:
+    payload = {
+        "config_hash": config_hash,
+        "execution_envelope": execution_envelope,
+        "software_versions": software_versions,
+    }
+    digest = hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _resolve_demons_tiling_layout(volume_shape_zyx: Tuple[int, int, int], config_obj: Any) -> Optional[TileLayout]:
+    if not bool(config_obj.use_tiling):
+        return None
+
+    grid_shape_yx, grid_source = resolve_grid_shape_yx(
+        volume_shape_zyx,
+        tile_size=int(config_obj.tile_size),
+        sqrt_pieces=(None if config_obj.sqrt_pieces is None else int(config_obj.sqrt_pieces)),
+        tile_grid_shape_yx=config_obj.tile_grid_shape_yx,
+    )
+    if grid_shape_yx == (1, 1):
+        raise ValueError("registration.local.params.demons_3d.use_tiling=true requires at least a 2D multi-tile layout")
+
+    overlap_yx = None
+    if config_obj.tile_overlap is not None:
+        overlap_value = int(config_obj.tile_overlap)
+        overlap_yx = (overlap_value, overlap_value)
+
+    if config_obj.tiling_layout_policy == 'matlab_subtile':
+        return build_matlab_subtile_layout(
+            volume_shape_zyx,
+            sqrt_pieces=int(grid_shape_yx[0]),
+            overlap_yx=overlap_yx,
+            grid_source=grid_source,
+        )
+
+    overlap_value = 0 if overlap_yx is None else int(overlap_yx[0])
+    return build_yx_tile_layout(
+        volume_shape_zyx,
+        grid_shape_yx=grid_shape_yx,
+        overlap_yx=(overlap_value, overlap_value),
+        grid_source=grid_source,
+    )
+
+
+def _build_tiling_summary(layout: TileLayout, tile_summaries: list[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "enabled": True,
+        "grid_shape_yx": [int(layout.grid_shape_yx[0]), int(layout.grid_shape_yx[1])],
+        "overlap_yx": [int(layout.overlap_yx[0]), int(layout.overlap_yx[1])],
+        "grid_source": layout.grid_source,
+        "tile_count": int(layout.tile_count),
+        "tiles": tile_summaries,
+    }
+
+
+def _run_tiled_native_demons_registration(
+    ref_volume_zyx: FloatArray,
+    mov_volume_zyx: FloatArray,
+    config_obj: Any,
+    layout: TileLayout,
+) -> Tuple[Optional[FloatArray], Dict[str, Any]]:
+    print(
+        "     [Tiling] Native demons_3d on "
+        f"{layout.tile_count} tiles ({layout.grid_shape_yx[0]}x{layout.grid_shape_yx[1]}, source={layout.grid_source})"
+    )
+
+    tile_outputs: list[tuple[TileSpec, FloatArray]] = []
+    tile_summaries: list[Dict[str, Any]] = []
+    for tile in layout.tiles:
+        tile_label = f"tile {tile.tile_index}/{layout.tile_count}"
+        print(
+            f"       [Tiling] {tile_label} | origin={tile.region_origin_zyx} shape={tile.region_shape_zyx}"
+        )
+        ref_tile = np.asarray(extract_tile(ref_volume_zyx, tile), dtype=np.float32)
+        mov_tile = np.asarray(extract_tile(mov_volume_zyx, tile), dtype=np.float32)
+        flow_tile = register_local_demons_3d(ref_tile, mov_tile, config_obj)
+        if flow_tile is None:
+            raise RuntimeError(
+                "Tiled native demons_3d returned no flow for "
+                f"{tile_label}; refusing to silently degrade local registration."
+            )
+
+        tile_outputs.append((tile, np.asarray(flow_tile, dtype=np.float32)))
+        tile_summaries.append(
+            {
+                **tile.as_dict(),
+                "provider": "native",
+                "status": "completed",
+                "mean_abs_displacement": float(np.abs(flow_tile).mean()),
+            }
+        )
+
+    stitched = np.asarray(
+        stitch_tiles(tile_outputs, full_shape_zyx=layout.full_volume_shape_zyx),
+        dtype=np.float32,
+    )
+    return stitched, _build_tiling_summary(layout, tile_summaries)
+
+
+def _run_tiled_matlab_demons_registration(
+    *,
+    backend: MATLABGlobalRegistrationBackend,
+    ref_volume_zyx: FloatArray,
+    mov_volume_zyx: FloatArray,
+    fov_id: int,
+    round_id: int,
+    reference_round: int,
+    scope_descriptor: Dict[str, Any],
+    layout: TileLayout,
+) -> Tuple[FloatArray, Dict[str, Any]]:
+    print(
+        "     [Tiling] MATLAB demons_3d on "
+        f"{layout.tile_count} tiles ({layout.grid_shape_yx[0]}x{layout.grid_shape_yx[1]}, source={layout.grid_source})"
+    )
+
+    tile_outputs: list[tuple[TileSpec, FloatArray]] = []
+    tile_summaries: list[Dict[str, Any]] = []
+    for tile in layout.tiles:
+        tile_label = f"tile {tile.tile_index}/{layout.tile_count}"
+        print(
+            f"       [Tiling] {tile_label} | origin={tile.region_origin_zyx} shape={tile.region_shape_zyx}"
+        )
+        ref_tile = np.asarray(extract_tile(ref_volume_zyx, tile), dtype=np.float32)
+        mov_tile = np.asarray(extract_tile(mov_volume_zyx, tile), dtype=np.float32)
+        local_result = backend.compute_local_flow(
+            ref_tile,
+            mov_tile,
+            fov_id=fov_id,
+            round_id=int(round_id),
+            reference_round=int(reference_round),
+            scope_descriptor=scope_descriptor,
+            compute_tile=tile.as_dict(),
+        )
+        flow_tile = np.asarray(local_result["flow_3d"], dtype=np.float32)
+        if flow_tile.shape != (3, *tile.region_shape_zyx):
+            raise ValueError(
+                "MATLAB tiled local registration returned flow_3d with incompatible tile shape: "
+                f"expected {(3, *tile.region_shape_zyx)}, got {flow_tile.shape} for tile {tile.tile_index}"
+            )
+
+        tile_outputs.append((tile, flow_tile))
+        tile_backend_metadata = cast(Dict[str, Any], local_result.get("backend_metadata", {}))
+        tile_normalized = cast(Dict[str, Any], tile_backend_metadata.get("normalized_result", {}))
+        tile_summaries.append(
+            {
+                **tile.as_dict(),
+                "provider": "matlab",
+                "status": "completed",
+                "mean_abs_displacement": float(tile_normalized.get("mean_abs_displacement", float(np.abs(flow_tile).mean()))),
+            }
+        )
+
+    stitched = np.asarray(
+        stitch_tiles(tile_outputs, full_shape_zyx=layout.full_volume_shape_zyx),
+        dtype=np.float32,
+    )
+    return stitched, _build_tiling_summary(layout, tile_summaries)
+
+
+def _build_scope_descriptor(ref_clean_3d: FloatArray, scope_mode: str) -> Dict[str, Any]:
+    z_dim, y_dim, x_dim = (int(value) for value in ref_clean_3d.shape)
+    full_volume_shape = [z_dim, y_dim, x_dim]
+
+    if scope_mode == "full_fov":
+        return {
+            "coverage_mode": "full_fov",
+            "region_origin_zyx": [0, 0, 0],
+            "region_shape_zyx": full_volume_shape,
+            "full_volume_shape_zyx": full_volume_shape,
+        }
+
+    if scope_mode != "tile_local":
+        raise ValueError(f"Unsupported scope_mode: {scope_mode!r}")
+
+    layout = build_matlab_subtile_layout(
+        (z_dim, y_dim, x_dim),
+        sqrt_pieces=4,
+        grid_source="scope_tile_local_fixed_4x4",
+    )
+    tile_scores: list[float] = []
+    for tile in layout.tiles:
+        tile_scores.append(float(np.asarray(extract_tile_write_window(ref_clean_3d, tile), dtype=np.float32).sum()))
+
+    if not tile_scores:
+        raise ValueError("Unable to derive tile_local scope descriptor from an empty reference volume")
+
+    selected_index = int(np.argmax(np.asarray(tile_scores, dtype=np.float32)))
+    selected_tile = layout.tiles[selected_index]
+    _, y0, x0 = selected_tile.write_origin_zyx
+    _, dy, dx = selected_tile.write_shape_zyx
+    return {
+        "coverage_mode": "tile_local",
+        "region_origin_zyx": [0, int(y0), int(x0)],
+        "region_shape_zyx": [z_dim, int(dy), int(dx)],
+        "full_volume_shape_zyx": full_volume_shape,
+        "tile_grid_shape_yx": [int(layout.grid_shape_yx[0]), int(layout.grid_shape_yx[1])],
+        "tile_index": selected_index + 1,
+    }
+
+
+def _crop_volume_to_scope(img_3d: FloatArray, scope_descriptor: Dict[str, Any]) -> FloatArray:
+    z0, y0, x0 = (int(value) for value in scope_descriptor["region_origin_zyx"])
+    dz, dy, dx = (int(value) for value in scope_descriptor["region_shape_zyx"])
+    z1, y1, x1 = z0 + dz, y0 + dy, x0 + dx
+    return img_3d[z0:z1, y0:y1, x0:x1]
+
+
+def _format_scope_descriptor(scope_descriptor: Dict[str, Any]) -> str:
+    coverage_mode = scope_descriptor["coverage_mode"]
+    z0, y0, x0 = scope_descriptor["region_origin_zyx"]
+    dz, dy, dx = scope_descriptor["region_shape_zyx"]
+    region_summary = f"z[{z0}:{z0 + dz}) y[{y0}:{y0 + dy}) x[{x0}:{x0 + dx})"
+    if coverage_mode == "full_fov":
+        return f"full_fov ({region_summary})"
+
+    tile_grid_shape = scope_descriptor.get("tile_grid_shape_yx", [1, 1])
+    tile_index = scope_descriptor.get("tile_index", "?")
+    return f"tile_local tile {tile_index}/{int(tile_grid_shape[0]) * int(tile_grid_shape[1])} ({region_summary})"
+
+
+def _attach_local_flow_metadata(
+    backend_metadata: Optional[Dict[str, Any]],
+    *,
+    provider: str,
+    local_method: str,
+    status: str,
+    corr_after_global: float,
+    corr_after_local: Optional[float] = None,
+    reject_if_worse: Optional[bool] = None,
+    default_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    metadata = dict(backend_metadata) if backend_metadata is not None else {}
+    if default_mode is not None:
+        metadata['mode'] = default_mode
+    metadata.setdefault('provider', provider)
+
+    local_flow_metadata: Dict[str, Any] = {
+        'provider': provider,
+        'requested_local_method': local_method,
+        'status': status,
+        'diagnostic_corr_after_global': float(corr_after_global),
+    }
+    if corr_after_local is not None:
+        local_flow_metadata['diagnostic_corr_after_local'] = float(corr_after_local)
+        local_flow_metadata['diagnostic_corr_delta'] = float(corr_after_local - corr_after_global)
+    if reject_if_worse is not None:
+        local_flow_metadata['reject_if_correlation_worse_configured'] = bool(reject_if_worse)
+        local_flow_metadata['correlation_gate_effective'] = 'diagnostic_only'
+
+    metadata['local_flow'] = local_flow_metadata
+    return metadata
+
 # ==============================================================================
 # SECTION E: Registration Engine (Orchestration)
 # ==============================================================================
@@ -599,15 +897,170 @@ class RegistrationEngine:
     def __init__(self, config: ExperimentConfig):
         self.cfg = config
         self.reg_cfg = config.pipeline.registration
+        self._matlab_backend: Optional[MATLABGlobalRegistrationBackend] = None
 
-    def _save_transforms(self, transforms: Dict, fov_id: int):
+    def close(self) -> None:
+        if self._matlab_backend is None:
+            return
+        self._matlab_backend.close()
+        self._matlab_backend = None
+
+    def __del__(self):  # pragma: no cover - best-effort cleanup only
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _get_matlab_backend(self) -> MATLABGlobalRegistrationBackend:
+        if self._matlab_backend is None:
+            self._matlab_backend = MATLABGlobalRegistrationBackend(self.cfg)
+        return self._matlab_backend
+
+    def _build_provenance(
+        self,
+        transforms: Dict[Any, Any],
+        round_summary: Dict[int, Dict[str, str]],
+        started_at: str,
+        ended_at: str,
+        backend_round_metadata: Optional[Dict[int, Dict[str, Any]]] = None,
+        registration_backend_details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        execution_envelope = build_execution_envelope(self.cfg)
+        release_contract = build_release_contract(self.cfg, transforms)
+
+        software_versions: Dict[str, str] = {
+            "Python": sys.version.split()[0],
+            "NumPy": np.__version__,
+        }
+        sitk_version = sitk.Version_VersionString() if hasattr(sitk, "Version_VersionString") else None
+        if sitk_version:
+            software_versions["SimpleITK"] = sitk_version
+        if registration_backend_details is not None:
+            matlab_version = registration_backend_details.get("matlab_version")
+            if isinstance(matlab_version, str) and matlab_version.strip():
+                software_versions["MATLAB"] = matlab_version
+
+        hardware_context: Dict[str, Any] = {
+            "cpu_count": os.cpu_count() or 1,
+        }
+        available_memory_bytes = _get_available_memory_bytes()
+        if available_memory_bytes is not None:
+            hardware_context["memory_available_bytes"] = available_memory_bytes
+
+        config_source_path = self.cfg.config_source_path
+        config_hash = self.cfg.config_sha256 or "sha256:unknown"
+        profile = release_contract["requested_intent"]["registration_profile"]
+        expected_field_semantics = self.cfg.pipeline.field_semantics.as_dict()
+        declared_field_semantics = self.cfg.pipeline.registration.field_semantics.as_dict()
+        demons_tiling = self.cfg.pipeline.registration.demons_3d
+        key_parameters = {
+            "scope_mode": self.cfg.pipeline.scope_mode,
+            "transform_application_mode": self.cfg.pipeline.extraction.transform_application_mode,
+            "application_intent": release_contract["requested_intent"]["application_intent"],
+            "preprocessing_provider_mode": release_contract["requested_intent"].get("preprocessing_provider_mode"),
+            "preprocessing_steps": release_contract["requested_intent"].get("preprocessing_steps"),
+            "spot_finding_provider": release_contract["requested_intent"].get("spot_finding_provider"),
+            "extraction_provider": release_contract["requested_intent"].get("extraction_provider"),
+            "matlab_stage_contracts": release_contract["requested_intent"].get("matlab_stage_contracts"),
+            "local_acceptance_mode": release_contract["requested_intent"]["local_acceptance_mode"],
+            "final_corr_metric": release_contract["requested_intent"]["final_corr_metric"],
+            "final_corr_diagnostic_only": release_contract["requested_intent"]["final_corr_diagnostic_only"],
+            "final_corr_release_gate": release_contract["requested_intent"]["final_corr_release_gate"],
+            "registration_profile": profile["name"],
+            "registration_global_method": profile.get("global_method"),
+            "registration_global_provider": profile.get("global_provider"),
+            "registration_local_method": profile.get("local_method"),
+            "registration_local_provider": profile.get("local_provider"),
+            "declared_transform_capabilities": profile["declared_transform_capabilities"],
+            "preprocessing_backend": execution_envelope["preprocessing_backend"],
+            "registration_backend": execution_envelope["registration_backend"],
+            "accelerator": self.cfg.pipeline.accelerator,
+            "backend_mode_status": release_contract["requested_intent"].get("backend_mode_status"),
+            "field_semantics": expected_field_semantics,
+            "registration_field_semantics": declared_field_semantics,
+            "local_tiling_enabled": bool(demons_tiling.use_tiling),
+            "local_tiling_layout_policy": demons_tiling.tiling_layout_policy,
+            "local_tiling_tile_size": int(demons_tiling.tile_size),
+            "local_tiling_tile_overlap": (
+                None if demons_tiling.tile_overlap is None else int(demons_tiling.tile_overlap)
+            ),
+            "local_tiling_sqrt_pieces": (
+                None if demons_tiling.sqrt_pieces is None else int(demons_tiling.sqrt_pieces)
+            ),
+            "local_tiling_grid_shape_yx": (
+                None
+                if demons_tiling.tile_grid_shape_yx is None
+                else [
+                    int(demons_tiling.tile_grid_shape_yx[0]),
+                    int(demons_tiling.tile_grid_shape_yx[1]),
+                ]
+            ),
+        }
+        if self.reg_cfg.global_provider == "matlab":
+            key_parameters["matlab_registration_entrypoint"] = self.cfg.providers.matlab.registration.entrypoint
+        if self.reg_cfg.local_provider == "matlab":
+            key_parameters["matlab_local_registration_entrypoint"] = self.cfg.providers.matlab.registration.local_entrypoints.get(
+                self.reg_cfg.local_method
+            )
+
+        runtime_context = {
+            "pipeline_version": "0+unknown",
+            "execution_timestamp": ended_at,
+            "environment_hash": _compute_environment_hash(config_hash, execution_envelope, software_versions),
+            "start_time": started_at,
+            "end_time": ended_at,
+            "duration_seconds": (
+                datetime.fromisoformat(ended_at).timestamp() - datetime.fromisoformat(started_at).timestamp()
+            ),
+            "software_versions": software_versions,
+            "hardware_context": hardware_context,
+            "config_reference": {
+                "config_path": str(config_source_path) if config_source_path is not None else "inline-config",
+                "config_hash": config_hash,
+                "key_parameters": key_parameters,
+            },
+        }
+        if registration_backend_details is not None:
+            runtime_context["registration_backend_details"] = registration_backend_details
+
+        stage_outcomes: Dict[str, Any] = {"round_summary": round_summary}
+        if backend_round_metadata:
+            stage_outcomes["registration_backend"] = {
+                "name": execution_envelope["registration_backend"],
+                "experimental": execution_envelope["registration_backend"] != "native_pystar",
+                "round_results": backend_round_metadata,
+            }
+
+        return {
+            "provenance_version": PROVENANCE_VERSION,
+            "execution_envelope": execution_envelope,
+            "runtime_context": runtime_context,
+            "stage_outcomes": stage_outcomes,
+            "release_contract": release_contract,
+        }
+
+    def _save_transforms(self, transforms: Dict[int, Dict[str, Any]], fov_id: int, provenance: Optional[Dict[str, Any]] = None):
         base_dir = Path(self.cfg.pipeline.output.directory)
-        paths = get_fov_output_structure(base_dir, fov_id)
+        save_transform_manifest(base_dir, fov_id, transforms, provenance=provenance)
+
+    def _annotate_transform_semantics(self, transforms: Dict[int, Dict[str, Any]]) -> None:
+        semantics = self.cfg.pipeline.registration.field_semantics.as_dict()
+        recorded_at = _iso_utc_now()
+        for round_id, transform_data in transforms.items():
+            if not isinstance(transform_data, dict) or 'global_shift_3d' not in transform_data:
+                continue
+            transform_data['_semantics'] = {
+                **semantics,
+                'recorded_at': recorded_at,
+            }
+
+    def _annotate_transform_scope(self, transforms: Dict[int, Dict[str, Any]], scope_descriptor: Dict[str, Any]) -> None:
+        for _, transform_data in transforms.items():
+            if not isinstance(transform_data, dict) or 'global_shift_3d' not in transform_data:
+                continue
+            transform_data['_scope'] = dict(scope_descriptor)
         
-        out_file = paths["transforms"] / f"transforms_fov_{fov_id}.npy"
-        np.save(out_file, transforms)
-        
-    def _load_combined_clean_volume(self, fov_id: int, round_id: int) -> np.ndarray:
+    def _load_combined_clean_volume(self, fov_id: int, round_id: int) -> FloatArray:
         """
         加载该轮次所有 Sequence 通道的 Clean Data，
         并计算 Channel-wise Max Projection，生成一个 3D 体积用于配准。
@@ -621,9 +1074,8 @@ class RegistrationEngine:
         # 2. 找出该轮次的 Seq 通道
         # 我们的逻辑是：用所有经过清洗的测序信号来做配准，这样信号最丰富
         round_structure = self.cfg.dataset.round_structure.get(int(round_id))
-        if not round_structure:
-            # 兼容 key 是 str 的情况
-            round_structure = self.cfg.dataset.round_structure.get(str(round_id))
+        if round_structure is None:
+            raise KeyError(f"Round {round_id} is missing from dataset.round_structure")
             
         roles = self.cfg.dataset.channel_roles
         
@@ -650,9 +1102,579 @@ class RegistrationEngine:
         
         return combined_vol
 
-    def register_fov(self, data: xr.DataArray, fov_id: int) -> Dict:
+    def _register_round_native(
+        self,
+        *,
+        ref_scope_3d: FloatArray,
+        ref_mip_clean: FloatArray,
+        mov_scope_3d: FloatArray,
+    ) -> Tuple[Dict[str, Any], FloatArray, Optional[Dict[str, Any]]]:
+        global_shift_3d, global_corr = compute_global_shift_3d(
+            ref_scope_3d,
+            mov_scope_3d,
+            downsample_factor=self.reg_cfg.downsample_factor,
+            max_shift=self.reg_cfg.global_max_shift,
+        )
+        print(f"     Global Shift (3D): {global_shift_3d}, Corr (Est): {global_corr:.4f}")
+
+        mov_mip_clean = mov_scope_3d.max(axis=0)
+        shift_2d = global_shift_3d[1:]
+        mov_mip_shifted = np.asarray(
+            scipy_shift(mov_mip_clean, shift_2d, order=1),
+            dtype=np.float32,
+        )
+        corr_after_global = simple_correlation(ref_mip_clean, mov_mip_shifted)
+        print(f"     After Global (Clean MIP): Corr = {corr_after_global:.4f}")
+
+        flow_2d = None
+        flow_3d = None
+        final_corr = corr_after_global
+        final_img_qc = mov_mip_shifted
+        backend_metadata: Optional[Dict[str, Any]] = None
+        reject_if_worse = bool(self.reg_cfg.guards.reject_if_correlation_worse)
+
+        if self.reg_cfg.enable_local:
+            overlap_mask = compute_overlap_roi(
+                (int(ref_mip_clean.shape[0]), int(ref_mip_clean.shape[1])),
+                shift_2d,
+            )
+            mask = create_quality_mask(ref_mip_clean, valid_roi_mask=overlap_mask)
+
+            if corr_after_global < 0.2:
+                warnings.warn(f"Low correlation {corr_after_global:.3f}, skipping local.")
+                backend_metadata = _attach_local_flow_metadata(
+                    backend_metadata,
+                    provider='native',
+                    local_method=self.reg_cfg.local_method,
+                    status='skipped_low_global_corr',
+                    corr_after_global=float(corr_after_global),
+                    reject_if_worse=reject_if_worse,
+                    default_mode='native_local_registration',
+                )
+
+            elif self.reg_cfg.local_method == "demons_3d":
+                mov_shifted_3d = apply_rigid_shift_3d(mov_scope_3d, global_shift_3d)
+                flow_3d = register_local_demons_3d(
+                    ref_scope_3d,
+                    mov_shifted_3d,
+                    self.cfg.pipeline.registration.demons_3d,
+                )
+
+                if flow_3d is None:
+                    backend_metadata = _attach_local_flow_metadata(
+                        backend_metadata,
+                        provider='native',
+                        local_method=self.reg_cfg.local_method,
+                        status='no_flow_returned',
+                        corr_after_global=float(corr_after_global),
+                        reject_if_worse=reject_if_worse,
+                        default_mode='native_local_registration',
+                    )
+                else:
+                    final_img_qc_clean = apply_warp_field_3d(mov_shifted_3d, flow_3d).max(axis=0)
+                    rec_corr = simple_correlation(ref_mip_clean, final_img_qc_clean)
+                    status = 'accepted'
+
+                    if rec_corr < corr_after_global:
+                        print(
+                            "  [Diagnostic] Correlation decreased, but keeping local 3D flow; "
+                            "final_corr remains diagnostic-only "
+                            f"({rec_corr:.4f} < {corr_after_global:.4f})"
+                        )
+                        status = 'accepted_correlation_decrease'
+                    else:
+                        print(
+                            "  [Diagnostic] After Local 3D: "
+                            f"Corr = {rec_corr:.4f} (Δ = {rec_corr - corr_after_global:+.4f})"
+                        )
+                    final_corr = rec_corr
+                    final_img_qc = final_img_qc_clean
+                    backend_metadata = _attach_local_flow_metadata(
+                        backend_metadata,
+                        provider='native',
+                        local_method=self.reg_cfg.local_method,
+                        status=status,
+                        corr_after_global=float(corr_after_global),
+                        corr_after_local=float(rec_corr),
+                        reject_if_worse=reject_if_worse,
+                        default_mode='native_local_registration',
+                    )
+            elif self.reg_cfg.local_method == "optical_flow":
+                flow_2d = compute_optical_flow_masked(
+                    ref_mip_clean,
+                    mov_mip_shifted,
+                    mask,
+                    self.cfg.pipeline.registration.optical_flow,
+                )
+            elif self.reg_cfg.local_method == "bspline":
+                flow_2d = register_local_bspline(
+                    ref_mip_clean,
+                    mov_mip_shifted,
+                    mask,
+                    self.cfg.pipeline.registration.bspline,
+                )
+
+            if self.reg_cfg.local_method in {"optical_flow", "bspline"} and flow_2d is None and corr_after_global >= 0.2:
+                backend_metadata = _attach_local_flow_metadata(
+                    backend_metadata,
+                    provider='native',
+                    local_method=self.reg_cfg.local_method,
+                    status='no_flow_returned',
+                    corr_after_global=float(corr_after_global),
+                    reject_if_worse=reject_if_worse,
+                    default_mode='native_local_registration',
+                )
+
+            if flow_2d is not None:
+                final_img_qc_clean = composite_transform_2d(mov_mip_clean, shift_2d, flow_2d)
+                rec_corr = simple_correlation(ref_mip_clean, final_img_qc_clean)
+                diff = rec_corr - corr_after_global
+                status = 'accepted'
+
+                if rec_corr < corr_after_global:
+                    print(
+                        "     [Diagnostic] Correlation decreased, but keeping local flow; "
+                        "final_corr remains diagnostic-only "
+                        f"({rec_corr:.4f} < {corr_after_global:.4f})"
+                    )
+                    status = 'accepted_correlation_decrease'
+                else:
+                    print(
+                        "     [Diagnostic] After Local:  "
+                        f"Corr = {rec_corr:.4f} (Δ = {diff:+.4f})"
+                    )
+                final_corr = rec_corr
+                final_img_qc = final_img_qc_clean
+                backend_metadata = _attach_local_flow_metadata(
+                    backend_metadata,
+                    provider='native',
+                    local_method=self.reg_cfg.local_method,
+                    status=status,
+                    corr_after_global=float(corr_after_global),
+                    corr_after_local=float(rec_corr),
+                    reject_if_worse=reject_if_worse,
+                    default_mode='native_local_registration',
+                )
+
+        return (
+            {
+                'global_shift_3d': global_shift_3d,
+                'global_corr': global_corr,
+                'flow_2d': flow_2d,
+                'flow_3d': flow_3d,
+                'final_corr': final_corr,
+                'is_reference_round': False,
+            },
+            final_img_qc,
+            backend_metadata,
+        )
+
+    def _register_round_matlab_extracted(
+        self,
+        *,
+        fov_id: int,
+        round_id: int,
+        ref_round: int,
+        ref_scope_3d: FloatArray,
+        ref_mip_clean: FloatArray,
+        mov_scope_3d: FloatArray,
+        scope_descriptor: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], FloatArray, Optional[Dict[str, Any]]]:
+        matlab_backend = self._get_matlab_backend()
+        result = matlab_backend.compute_global_shift(
+            ref_scope_3d,
+            mov_scope_3d,
+            fov_id=fov_id,
+            round_id=int(round_id),
+            reference_round=int(ref_round),
+            scope_descriptor=scope_descriptor,
+        )
+        global_shift_3d = np.asarray(result['global_shift_3d'], dtype=np.float32)
+        global_corr = float(result['global_corr'])
+        print(f"     MATLAB Global Shift (3D): {global_shift_3d}, Corr (Kernel): {global_corr:.4f}")
+
+        mov_mip_clean = mov_scope_3d.max(axis=0)
+        shift_2d = global_shift_3d[1:]
+        mov_mip_shifted = np.asarray(
+            scipy_shift(mov_mip_clean, shift_2d, order=1),
+            dtype=np.float32,
+        )
+        corr_after_global = simple_correlation(ref_mip_clean, mov_mip_shifted)
+        print(f"     After MATLAB Global (Clean MIP): Corr = {corr_after_global:.4f}")
+
+        flow_3d = None
+        final_corr = corr_after_global
+        final_img_qc = mov_mip_shifted
+        backend_metadata = cast(Optional[Dict[str, Any]], result.get('backend_metadata'))
+
+        if self.reg_cfg.enable_local:
+            if self.reg_cfg.local_method != 'demons_3d':
+                _ensure_supported_matlab_local_method(self.reg_cfg.local_method)
+            elif corr_after_global < 0.2:
+                warnings.warn(f"Low correlation {corr_after_global:.3f}, skipping local.")
+                if backend_metadata is not None:
+                    backend_metadata['local_flow'] = {
+                        'status': 'skipped_low_global_corr',
+                        'requested_local_method': self.reg_cfg.local_method,
+                        'diagnostic_corr_after_global': float(corr_after_global),
+                    }
+            else:
+                mov_shifted_3d = apply_rigid_shift_3d(mov_scope_3d, global_shift_3d)
+                local_result = matlab_backend.compute_local_flow(
+                    ref_scope_3d,
+                    mov_shifted_3d,
+                    fov_id=fov_id,
+                    round_id=int(round_id),
+                    reference_round=int(ref_round),
+                    scope_descriptor=scope_descriptor,
+                )
+                flow_3d = np.asarray(local_result['flow_3d'], dtype=np.float32)
+                expected_shape = (3, *mov_shifted_3d.shape)
+                if flow_3d.shape != expected_shape:
+                    raise ValueError(
+                        "MATLAB local registration returned flow_3d with incompatible shape: "
+                        f"expected {expected_shape}, got {flow_3d.shape}"
+                    )
+
+                final_img_qc_clean = apply_warp_field_3d(mov_shifted_3d, flow_3d).max(axis=0)
+                rec_corr = simple_correlation(ref_mip_clean, final_img_qc_clean)
+                local_backend_metadata = cast(Dict[str, Any], local_result['backend_metadata'])
+                local_backend_metadata['diagnostic_corr_after_global'] = float(corr_after_global)
+                local_backend_metadata['diagnostic_corr_after_local'] = float(rec_corr)
+
+                if rec_corr < corr_after_global:
+                    print(
+                        "  [Diagnostic] MATLAB local correlation decreased; reverting local 3D heuristic "
+                        f"({rec_corr:.4f} < {corr_after_global:.4f})"
+                    )
+                    flow_3d = None
+                    local_backend_metadata['status'] = 'reverted_correlation_decrease'
+                else:
+                    print(
+                        "  [Diagnostic] After MATLAB Local 3D: "
+                        f"Corr = {rec_corr:.4f} (Δ = {rec_corr - corr_after_global:+.4f})"
+                    )
+                    final_corr = rec_corr
+                    final_img_qc = final_img_qc_clean
+                    local_backend_metadata['status'] = 'accepted'
+
+                if backend_metadata is not None:
+                    backend_metadata['mode'] = 'experimental_local_kernel_swap'
+                    backend_metadata['local_flow'] = local_backend_metadata
+
+        return (
+            {
+                'global_shift_3d': global_shift_3d,
+                'global_corr': global_corr,
+                'flow_2d': None,
+                'flow_3d': flow_3d,
+                'final_corr': final_corr,
+                'is_reference_round': False,
+            },
+            final_img_qc,
+            backend_metadata,
+        )
+
+    def _register_round(
+        self,
+        *,
+        fov_id: int,
+        round_id: int,
+        ref_round: int,
+        ref_scope_3d: FloatArray,
+        ref_mip_clean: FloatArray,
+        mov_scope_3d: FloatArray,
+        scope_descriptor: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], FloatArray, Optional[Dict[str, Any]]]:
+        global_provider = cast(str, self.reg_cfg.global_provider)
+        local_provider = cast(str, self.reg_cfg.local_provider)
+
+        backend_metadata: Optional[Dict[str, Any]] = None
+        if global_provider == 'native':
+            global_shift_3d, global_corr = compute_global_shift_3d(
+                ref_scope_3d,
+                mov_scope_3d,
+                downsample_factor=self.reg_cfg.downsample_factor,
+                max_shift=self.reg_cfg.global_max_shift,
+            )
+            print(f"     Global Shift (3D): {global_shift_3d}, Corr (Est): {global_corr:.4f}")
+        elif global_provider == 'matlab':
+            matlab_backend = self._get_matlab_backend()
+            result = matlab_backend.compute_global_shift(
+                ref_scope_3d,
+                mov_scope_3d,
+                fov_id=fov_id,
+                round_id=int(round_id),
+                reference_round=int(ref_round),
+                scope_descriptor=scope_descriptor,
+            )
+            global_shift_3d = np.asarray(result['global_shift_3d'], dtype=np.float32)
+            global_corr = float(result['global_corr'])
+            backend_metadata = cast(Optional[Dict[str, Any]], result.get('backend_metadata'))
+            print(f"     MATLAB Global Shift (3D): {global_shift_3d}, Corr (Kernel): {global_corr:.4f}")
+        else:
+            raise ValueError(f"Unsupported registration.global.provider: {global_provider!r}")
+
+        mov_mip_clean = mov_scope_3d.max(axis=0)
+        shift_2d = global_shift_3d[1:]
+        mov_mip_shifted = np.asarray(
+            scipy_shift(mov_mip_clean, shift_2d, order=1),
+            dtype=np.float32,
+        )
+        corr_after_global = simple_correlation(ref_mip_clean, mov_mip_shifted)
+        print(f"     After Global (Clean MIP): Corr = {corr_after_global:.4f}")
+
+        flow_2d = None
+        flow_3d = None
+        final_corr = corr_after_global
+        final_img_qc = mov_mip_shifted
+
+        if self.reg_cfg.enable_local:
+            local_threshold = self.reg_cfg.guards.skip_if_global_corr_below
+            reject_if_worse = self.reg_cfg.guards.reject_if_correlation_worse
+            overlap_mask = compute_overlap_roi(
+                (int(ref_mip_clean.shape[0]), int(ref_mip_clean.shape[1])),
+                shift_2d,
+            )
+            mask = create_quality_mask(ref_mip_clean, valid_roi_mask=overlap_mask)
+
+            if corr_after_global < local_threshold:
+                warnings.warn(f"Low correlation {corr_after_global:.3f}, skipping local.")
+                backend_metadata = _attach_local_flow_metadata(
+                    backend_metadata,
+                    provider=local_provider,
+                    local_method=self.reg_cfg.local_method,
+                    status='skipped_low_global_corr',
+                    corr_after_global=float(corr_after_global),
+                    reject_if_worse=reject_if_worse,
+                    default_mode='experimental_local_kernel_swap' if local_provider == 'matlab' else 'native_local_registration',
+                )
+            elif local_provider == 'native':
+                if self.reg_cfg.local_method == 'demons_3d':
+                    mov_shifted_3d = apply_rigid_shift_3d(mov_scope_3d, global_shift_3d)
+                    tiling_layout = _resolve_demons_tiling_layout(
+                        cast(Tuple[int, int, int], tuple(int(value) for value in mov_shifted_3d.shape)),
+                        self.cfg.pipeline.registration.demons_3d,
+                    )
+                    tiling_summary: Optional[Dict[str, Any]] = None
+                    if tiling_layout is None:
+                        flow_3d = register_local_demons_3d(
+                            ref_scope_3d,
+                            mov_shifted_3d,
+                            self.cfg.pipeline.registration.demons_3d,
+                        )
+                    else:
+                        flow_3d, tiling_summary = _run_tiled_native_demons_registration(
+                            ref_scope_3d,
+                            mov_shifted_3d,
+                            self.cfg.pipeline.registration.demons_3d,
+                            tiling_layout,
+                        )
+                    if flow_3d is None:
+                        backend_metadata = _attach_local_flow_metadata(
+                            backend_metadata,
+                            provider='native',
+                            local_method=self.reg_cfg.local_method,
+                            status='no_flow_returned',
+                            corr_after_global=float(corr_after_global),
+                            reject_if_worse=reject_if_worse,
+                            default_mode='native_local_registration',
+                        )
+                        if tiling_summary is not None:
+                            backend_metadata['local_flow']['tiling'] = tiling_summary
+                    else:
+                        final_img_qc_clean = apply_warp_field_3d(mov_shifted_3d, flow_3d).max(axis=0)
+                        rec_corr = simple_correlation(ref_mip_clean, final_img_qc_clean)
+                        status = 'accepted'
+                        if rec_corr < corr_after_global:
+                            print(
+                                "  [Diagnostic] Correlation decreased, but keeping local 3D flow; "
+                                "final_corr remains diagnostic-only "
+                                f"({rec_corr:.4f} < {corr_after_global:.4f})"
+                            )
+                            status = 'accepted_correlation_decrease'
+                        else:
+                            print(
+                                "  [Diagnostic] After Local 3D: "
+                                f"Corr = {rec_corr:.4f} (Δ = {rec_corr - corr_after_global:+.4f})"
+                            )
+                        final_corr = rec_corr
+                        final_img_qc = final_img_qc_clean
+                        backend_metadata = _attach_local_flow_metadata(
+                            backend_metadata,
+                            provider='native',
+                            local_method=self.reg_cfg.local_method,
+                            status=status,
+                            corr_after_global=float(corr_after_global),
+                            corr_after_local=float(rec_corr),
+                            reject_if_worse=reject_if_worse,
+                            default_mode='native_local_registration',
+                        )
+                        if tiling_summary is not None:
+                            backend_metadata['local_flow']['tiling'] = tiling_summary
+                elif self.reg_cfg.local_method == 'optical_flow':
+                    flow_2d = compute_optical_flow_masked(
+                        ref_mip_clean,
+                        mov_mip_shifted,
+                        mask,
+                        self.cfg.pipeline.registration.optical_flow,
+                    )
+                elif self.reg_cfg.local_method == 'bspline':
+                    flow_2d = register_local_bspline(
+                        ref_mip_clean,
+                        mov_mip_shifted,
+                        mask,
+                        self.cfg.pipeline.registration.bspline,
+                    )
+
+                if self.reg_cfg.local_method in {'optical_flow', 'bspline'} and flow_2d is None:
+                    backend_metadata = _attach_local_flow_metadata(
+                        backend_metadata,
+                        provider='native',
+                        local_method=self.reg_cfg.local_method,
+                        status='no_flow_returned',
+                        corr_after_global=float(corr_after_global),
+                        reject_if_worse=reject_if_worse,
+                        default_mode='native_local_registration',
+                    )
+
+                if flow_2d is not None:
+                    final_img_qc_clean = composite_transform_2d(mov_mip_clean, shift_2d, flow_2d)
+                    rec_corr = simple_correlation(ref_mip_clean, final_img_qc_clean)
+                    diff = rec_corr - corr_after_global
+                    status = 'accepted'
+
+                    if rec_corr < corr_after_global:
+                        print(
+                            "     [Diagnostic] Correlation decreased, but keeping local flow; "
+                            "final_corr remains diagnostic-only "
+                            f"({rec_corr:.4f} < {corr_after_global:.4f})"
+                        )
+                        status = 'accepted_correlation_decrease'
+                    else:
+                        print(
+                            "     [Diagnostic] After Local:  "
+                            f"Corr = {rec_corr:.4f} (Δ = {diff:+.4f})"
+                        )
+                    final_corr = rec_corr
+                    final_img_qc = final_img_qc_clean
+                    backend_metadata = _attach_local_flow_metadata(
+                        backend_metadata,
+                        provider='native',
+                        local_method=self.reg_cfg.local_method,
+                        status=status,
+                        corr_after_global=float(corr_after_global),
+                        corr_after_local=float(rec_corr),
+                        reject_if_worse=reject_if_worse,
+                        default_mode='native_local_registration',
+                    )
+            elif local_provider == 'matlab':
+                if self.reg_cfg.local_method != 'demons_3d':
+                    _ensure_supported_matlab_local_method(self.reg_cfg.local_method)
+                else:
+                    matlab_backend = self._get_matlab_backend()
+                    mov_shifted_3d = apply_rigid_shift_3d(mov_scope_3d, global_shift_3d)
+                    tiling_layout = _resolve_demons_tiling_layout(
+                        cast(Tuple[int, int, int], tuple(int(value) for value in mov_shifted_3d.shape)),
+                        self.cfg.pipeline.registration.demons_3d,
+                    )
+                    tiling_summary: Optional[Dict[str, Any]] = None
+                    if tiling_layout is None:
+                        local_result = matlab_backend.compute_local_flow(
+                            ref_scope_3d,
+                            mov_shifted_3d,
+                            fov_id=fov_id,
+                            round_id=int(round_id),
+                            reference_round=int(ref_round),
+                            scope_descriptor=scope_descriptor,
+                        )
+                        flow_3d = np.asarray(local_result['flow_3d'], dtype=np.float32)
+                        local_backend_details = cast(Dict[str, Any], local_result['backend_metadata'])
+                    else:
+                        flow_3d, tiling_summary = _run_tiled_matlab_demons_registration(
+                            backend=matlab_backend,
+                            ref_volume_zyx=ref_scope_3d,
+                            mov_volume_zyx=mov_shifted_3d,
+                            fov_id=fov_id,
+                            round_id=int(round_id),
+                            reference_round=int(ref_round),
+                            scope_descriptor=scope_descriptor,
+                            layout=tiling_layout,
+                        )
+                        local_backend_details = {
+                            'provider': 'matlab',
+                            'mode': 'experimental_local_kernel_swap',
+                            'runtime': {
+                                'runtime_path': str(matlab_backend.runtime_dir),
+                                'runtime_manifest': str(matlab_backend.runtime_dir / 'runtime_manifest.json'),
+                                'entrypoint': matlab_backend.local_entrypoint,
+                            },
+                            'normalized_result': {
+                                'flow_3d_shape': [int(value) for value in flow_3d.shape],
+                                'flow_3d_dtype': str(flow_3d.dtype),
+                                'mean_abs_displacement': float(np.abs(flow_3d).mean()),
+                            },
+                        }
+
+                    expected_shape = (3, *mov_shifted_3d.shape)
+                    if flow_3d.shape != expected_shape:
+                        raise ValueError(
+                            "MATLAB local registration returned flow_3d with incompatible shape: "
+                            f"expected {expected_shape}, got {flow_3d.shape}"
+                        )
+
+                    final_img_qc_clean = apply_warp_field_3d(mov_shifted_3d, flow_3d).max(axis=0)
+                    rec_corr = simple_correlation(ref_mip_clean, final_img_qc_clean)
+                    if rec_corr < corr_after_global:
+                        print(
+                            "  [Diagnostic] MATLAB local correlation decreased, but keeping local 3D flow; "
+                            "final_corr remains diagnostic-only "
+                            f"({rec_corr:.4f} < {corr_after_global:.4f})"
+                        )
+                        status = 'accepted_correlation_decrease'
+                    else:
+                        print(
+                            "  [Diagnostic] After MATLAB Local 3D: "
+                            f"Corr = {rec_corr:.4f} (Δ = {rec_corr - corr_after_global:+.4f})"
+                        )
+                        status = 'accepted'
+                    final_corr = rec_corr
+                    final_img_qc = final_img_qc_clean
+                    backend_metadata = _attach_local_flow_metadata(
+                        backend_metadata,
+                        provider='matlab',
+                        local_method=self.reg_cfg.local_method,
+                        status=status,
+                        corr_after_global=float(corr_after_global),
+                        corr_after_local=float(rec_corr),
+                        reject_if_worse=reject_if_worse,
+                        default_mode='experimental_local_kernel_swap',
+                    )
+                    backend_metadata['local_flow'].update(local_backend_details)
+                    if tiling_summary is not None:
+                        backend_metadata['local_flow']['tiling'] = tiling_summary
+            else:
+                raise ValueError(f"Unsupported registration.local.provider: {local_provider!r}")
+
+        return (
+            {
+                'global_shift_3d': np.asarray(global_shift_3d, dtype=np.float32),
+                'global_corr': float(global_corr),
+                'flow_2d': flow_2d,
+                'flow_3d': flow_3d,
+                'final_corr': float(final_corr),
+                'is_reference_round': False,
+            },
+            final_img_qc,
+            backend_metadata,
+        )
+
+    def register_fov(self, data: xr.DataArray, fov_id: int) -> Dict[int, Dict[str, Any]]:
         ref_round = self.reg_cfg.reference_round
         all_rounds = sorted(data.coords["round"].values)
+        run_started_at = _iso_utc_now()
+        round_summary: Dict[int, Dict[str, str]] = {}
+        backend_round_metadata: Dict[int, Dict[str, Any]] = {}
 
         print(f"\n{'='*60}")
         print(f"  [Registration] FOV {fov_id} | Reference: Round {ref_round}")
@@ -660,13 +1682,22 @@ class RegistrationEngine:
 
         # --- Phase 1: Preprocess Everything ---
         ref_clean_3d = self._load_combined_clean_volume(fov_id, ref_round)
-        
-        ref_mip_clean = ref_clean_3d.max(axis=0)
+        scope_descriptor = _build_scope_descriptor(ref_clean_3d, self.cfg.pipeline.scope_mode)
+        ref_scope_3d = _crop_volume_to_scope(ref_clean_3d, scope_descriptor)
+        ref_mip_clean = ref_scope_3d.max(axis=0)
+        print(f" [Registration] Scope: {_format_scope_descriptor(scope_descriptor)}")
+        if (
+            self.reg_cfg.local_provider == 'matlab'
+            and self.reg_cfg.enable_local
+            and self.reg_cfg.local_method != 'demons_3d'
+        ):
+            _ensure_supported_matlab_local_method(self.reg_cfg.local_method)
         
         transforms = {}
 
         # --- Phase 2: Register Round by Round ---
         for r_id in all_rounds:
+            round_started_at = _iso_utc_now()
             if r_id == ref_round:
                 transforms[r_id] = {
                     'global_shift_3d': np.array([0., 0., 0.]),
@@ -674,114 +1705,67 @@ class RegistrationEngine:
                     'flow_2d': None,
                     'flow_3d': None,
                     'final_corr': 1.0,
+                    'round_id': int(r_id),
+                    'is_reference_round': True,
+                }
+                round_summary[int(r_id)] = {
+                    'status': 'completed',
+                    'start_time': round_started_at,
+                    'end_time': _iso_utc_now(),
                 }
                 continue
 
             print(f"\n  >> Round {r_id}")
             
             mov_clean_3d = self._load_combined_clean_volume(fov_id, r_id)
-            
-            # ========== Step A: Global 3D (Clean vs Clean) ==========
-            # 注意：参数中不再包含 preprocess 的选项，因为输入已经是 Clean 的了
-            global_shift_3d, global_corr = compute_global_shift_3d(
-                ref_clean_3d, mov_clean_3d,
-                downsample_factor=self.reg_cfg.downsample_factor, # e.g. 4
-                max_shift=self.reg_cfg.global_max_shift
+            mov_scope_3d = _crop_volume_to_scope(mov_clean_3d, scope_descriptor)
+            round_transform, final_img_qc, backend_metadata = self._register_round(
+                fov_id=fov_id,
+                round_id=int(r_id),
+                ref_round=int(ref_round),
+                ref_scope_3d=ref_scope_3d,
+                ref_mip_clean=ref_mip_clean,
+                mov_scope_3d=mov_scope_3d,
+                scope_descriptor=scope_descriptor,
             )
-            print(f"     Global Shift (3D): {global_shift_3d}, Corr (Est): {global_corr:.4f}")
 
-            # ========== Step B: Prep for Local (Clean MIPs) ==========
-            mov_mip_clean = mov_clean_3d.max(axis=0)
-            
-            # Apply Global Shift to Moving MIP
-            shift_2d = global_shift_3d[1:] # [dy, dx]
-            mov_mip_shifted = scipy_shift(mov_mip_clean, shift_2d, order=1)
-
-            # Check Correlation
-            corr_after_global = simple_correlation(ref_mip_clean, mov_mip_shifted)
-            print(f"     After Global (Clean MIP): Corr = {corr_after_global:.4f}")
-
-            # ========== Step C: Local Flow (MIP vs MIP) ==========
-            flow_2d = None
-            flow_3d = None
-            final_corr = corr_after_global
-            final_img_qc = mov_mip_shifted
-
-            if self.reg_cfg.enable_local:
-                # 1. Masking
-                overlap_mask = compute_overlap_roi(ref_mip_clean.shape, shift_2d)
-                mask = create_quality_mask(ref_mip_clean, valid_roi_mask=overlap_mask)
-
-                if corr_after_global < 0.2:
-                    warnings.warn(f"Low correlation {corr_after_global:.3f}, skipping local.")
-                
-                elif self.reg_cfg.local_method == "demons_3d":
-                    # 使用 3D Demons（推荐）
-                    # 注意：这里需要用 3D volume，不是 MIP
-                    mov_shifted_3d = apply_rigid_shift_3d(mov_clean_3d, global_shift_3d)
-                    
-                    flow_3d = register_local_demons_3d(
-                        ref_clean_3d, 
-                        mov_shifted_3d, 
-                        self.cfg.pipeline.registration.demons_3d
-                    )
-                    
-                    if flow_3d is not None:
-                        # 验证：对 MIP 做投影检查相关性
-                        final_img_qc_clean = apply_warp_field_3d(mov_shifted_3d, flow_3d).max(axis=0)
-                        rec_corr = simple_correlation(ref_mip_clean, final_img_qc_clean)
-                        
-                        if rec_corr < corr_after_global:
-                            print(f"  !!! Reverting Local (Worse: {rec_corr:.4f} < {corr_after_global:.4f})")
-                            flow_3d = None
-                        else:
-                            print(f"  After Local 3D: Corr = {rec_corr:.4f} (Δ = {rec_corr - corr_after_global:+.4f})")
-                            final_corr = rec_corr
-                            final_img_qc = final_img_qc_clean
-                elif self.reg_cfg.local_method == "optical_flow":
-                    flow_2d = compute_optical_flow_masked(
-                        ref_mip_clean, mov_mip_shifted, mask,
-                        self.cfg.pipeline.registration.optical_flow
-                    )
-                elif self.reg_cfg.local_method == "bspline":
-                    flow_2d = register_local_bspline(
-                        ref_mip_clean, mov_mip_shifted, mask,
-                        self.cfg.pipeline.registration.bspline
-                    )
-
-                # 2. Validation
-                if flow_2d is not None:
-                    final_img_qc_clean = composite_transform_2d(mov_mip_clean, shift_2d, flow_2d)
-                    rec_corr = simple_correlation(ref_mip_clean, final_img_qc_clean)
-                    diff = rec_corr - corr_after_global
-                    
-                    if rec_corr < corr_after_global:
-                        print(f"     !!! Reverting Local (Worse: {rec_corr:.4f} < {corr_after_global:.4f})")
-                        flow_2d = None
-                        final_corr = corr_after_global
-                    else:
-                        print(f"     After Local:  Corr = {rec_corr:.4f} (Δ = {diff:+.4f})")
-                        final_corr = rec_corr
-                        final_img_qc = final_img_qc_clean
-
-            # ========== Step D: Save Results & QC ==========
-            transforms[r_id] = {
-                'global_shift_3d': global_shift_3d,
-                'global_corr': global_corr,
-                'flow_2d': flow_2d,
-                'flow_3d': flow_3d,
-                'final_corr': final_corr
+            round_transform['round_id'] = int(r_id)
+            if backend_metadata is not None:
+                round_transform['backend_metadata'] = backend_metadata
+            transforms[r_id] = round_transform
+            round_summary[int(r_id)] = {
+                'status': 'completed',
+                'start_time': round_started_at,
+                'end_time': _iso_utc_now(),
             }
+            if backend_metadata is not None:
+                backend_round_metadata[int(r_id)] = backend_metadata
 
             if self.cfg.pipeline.output.save_qc_images:
                 base_dir = Path(self.cfg.pipeline.output.directory)
                 paths = get_fov_output_structure(base_dir, fov_id)
                 qc_dir = paths["qc"]
+                mov_mip_clean = mov_scope_3d.max(axis=0)
                 save_registration_qc(
                     ref_mip_clean, mov_mip_clean, final_img_qc,
                     r_id, simple_correlation(ref_mip_clean, mov_mip_clean), # Raw initial corr
-                    final_corr, qc_dir, fov_id
+                    float(round_transform['final_corr']), qc_dir, fov_id
                 )
 
-        self._save_transforms(transforms, fov_id)
+        self._annotate_transform_semantics(transforms)
+        self._annotate_transform_scope(transforms, scope_descriptor)
+        run_ended_at = _iso_utc_now()
+        provenance = self._build_provenance(
+            transforms,
+            round_summary,
+            run_started_at,
+            run_ended_at,
+            backend_round_metadata=backend_round_metadata or None,
+            registration_backend_details=(
+                self._get_matlab_backend().build_provenance_trace(backend_round_metadata)
+                if self.reg_cfg.global_provider == 'matlab' or self.reg_cfg.local_provider == 'matlab'
+                else None
+            ),
+        )
+        self._save_transforms(transforms, fov_id, provenance=provenance)
         return transforms

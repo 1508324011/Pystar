@@ -1,0 +1,32 @@
+{
+  "package_name": "pystar_registration",
+  "entrypoint": "pystar_register_global_entry",
+  "local_entrypoint": "pystar_register_local_demons_entry",
+  "required_files": [
+    {
+      "name": "pystar_register_global_entry.m",
+      "source_path": "repo-local entrypoint",
+      "role": "python-facing global registration entrypoint",
+      "required": true
+    },
+    {
+      "name": "pystar_register_local_demons_entry.m",
+      "source_path": "repo-local entrypoint",
+      "role": "python-facing local demons registration entrypoint",
+      "required": true
+    },
+    {
+      "name": "pystar_phasecorr_global_shift.m",
+      "source_path": "repo-local extracted MATLAB global registration helper",
+      "role": "3D phase-correlation global shift kernel",
+      "required": true
+    },
+    {
+      "name": "new_LoadMultipageTiff.m",
+      "source_path": "matlab_runtime/pystar_preprocessing/new_LoadMultipageTiff.m",
+      "role": "multipage TIFF loader for staged combined registration volumes",
+      "required": true
+    }
+  ],
+  "optional_files": []
+}
