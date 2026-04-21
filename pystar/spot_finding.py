@@ -1,12 +1,35 @@
+import json
 import numpy as np
 import pandas as pd
 import tifffile
 from pathlib import Path
+from typing import Any, Optional, cast
 from scipy import ndimage
 from skimage.feature import peak_local_max, blob_dog
 from .io import ImageLoader
-from .io import get_fov_output_structure
+from .io import get_fov_output_structure, get_matlab_stage_contract
+from .matlab_spot_finding import MATLABSpotFindingBackend
 from .visualization import inspect_spots_interactive
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    return value
+
+
+def _write_backend_metadata(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=True), encoding="utf-8")
 
 class SpotFinder:
     def __init__(self, config):
@@ -16,12 +39,32 @@ class SpotFinder:
         
         # 预留模型槽位，不要在初始化时乱占显存
         self._model = None
+        self._matlab_backend: Optional[MATLABSpotFindingBackend] = None
+
+    def close(self) -> None:
+        if self._matlab_backend is None:
+            return
+        try:
+            self._matlab_backend.close()
+        finally:
+            self._matlab_backend = None
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _get_matlab_backend(self) -> MATLABSpotFindingBackend:
+        if self._matlab_backend is None:
+            self._matlab_backend = MATLABSpotFindingBackend(self.cfg)
+        return self._matlab_backend
 
     def _get_spotiflow_model(self):
         """延迟加载模型：只有真正开始挖矿时，才启动大型机械。"""
         if self._model is None:
             try:
-                from spotiflow.model import Spotiflow
+                from spotiflow.model import Spotiflow  # pyright: ignore[reportMissingImports]
                 model_name = self.spot_cfg.spotiflow.model_name
                 print(f" [SpotFinder] 正在从硬盘调取 Spotiflow 模型: {model_name}...")
                 self._model = Spotiflow.from_pretrained(model_name)
@@ -46,10 +89,12 @@ class SpotFinder:
         
         print(f" [SpotFinding] Mining FOV {fov_id} using Clean Data (Ref Round {ref_round})...")
         print(f" [SpotFinding] Target Channels: {channels}")
-
-        algo = self.spot_cfg.algorithm
+        print(f" [SpotFinding] Provider: {self.spot_cfg.provider}")
 
         all_spots_dfs = []
+        backend_records: list[dict[str, Any]] = []
+        algo = self.spot_cfg.algorithm
+        final_algo = f"matlab_{algo}" if self.spot_cfg.provider == "matlab" else algo
         
         # 用于 QC 可视化的容器 (Channel -> Image)
         qc_images = {}
@@ -78,15 +123,27 @@ class SpotFinder:
             qc_images[c] = vol[z_mid].copy()
 
             # 4. 选择算法
-            # 运行具体算法
-            if algo == "spotiflow":
-                df_c = self._run_spotiflow(vol)
-            elif algo == "blob_dog":
-                df_c = self._run_blob_dog(vol)
-            elif algo == "peak_local_max":
-                df_c = self._run_peak_local_max(vol)
+            if self.spot_cfg.provider == "matlab":
+                result = self._get_matlab_backend().find_spots(
+                    vol,
+                    fov_id=fov_id,
+                    round_id=ref_round,
+                    channel_id=c,
+                )
+                df_c = result["spots"].copy()
+                backend_metadata = result.get("backend_metadata")
+                if isinstance(backend_metadata, dict):
+                    backend_records.append(backend_metadata)
             else:
-                raise ValueError(f"Unknown algorithm: {algo}")
+                # 运行具体算法
+                if algo == "spotiflow":
+                    df_c = self._run_spotiflow(vol)
+                elif algo == "blob_dog":
+                    df_c = self._run_blob_dog(vol)
+                elif algo == "peak_local_max":
+                    df_c = self._run_peak_local_max(vol)
+                else:
+                    raise ValueError(f"Unknown algorithm: {algo}")
             
             # 5.标签注入
             df_c['channel'] = c
@@ -95,6 +152,18 @@ class SpotFinder:
             
         # 4. 合并结果
         if not all_spots_dfs:
+            if self.spot_cfg.provider == "matlab" and backend_records:
+                _write_backend_metadata(
+                    paths["qc"] / f"spot_finding_backend_fov_{fov_id}.json",
+                    {
+                        "provider": self.spot_cfg.provider,
+                        "matlab_stage_contract": get_matlab_stage_contract(self.cfg, "spot_finding"),
+                        "fov_id": int(fov_id),
+                        "reference_round": int(ref_round),
+                        "algorithm": final_algo,
+                        "channel_results": backend_records,
+                    },
+                )
             print(" [SpotFinding] No spots found in any channel!")
             return pd.DataFrame()
 
@@ -102,11 +171,23 @@ class SpotFinder:
 
         # 注入元数据
         df['fov'] = fov_id
-        df['algo'] = algo
+        df['algo'] = final_algo
 
         # 固化结果
         out_csv = paths["spots"] / f"spots_fov_{fov_id}.csv"
         df.to_csv(out_csv, index=False)
+        if self.spot_cfg.provider == "matlab" and backend_records:
+            _write_backend_metadata(
+                paths["qc"] / f"spot_finding_backend_fov_{fov_id}.json",
+                {
+                    "provider": self.spot_cfg.provider,
+                    "matlab_stage_contract": get_matlab_stage_contract(self.cfg, "spot_finding"),
+                    "fov_id": int(fov_id),
+                    "reference_round": int(ref_round),
+                    "algorithm": final_algo,
+                    "channel_results": backend_records,
+                },
+            )
         print(f" [SpotFinding] Finished. Total: {len(df)} spots. Saved to {out_csv.name}")
         
         if self.cfg.pipeline.output.save_qc_images:
@@ -146,7 +227,7 @@ class SpotFinder:
         ndim = coords.shape[1] 
         cols = ['z', 'y', 'x'][-ndim:] # 自动取后N个标签
         
-        df = pd.DataFrame(coords, columns=cols)
+        df = pd.DataFrame({col: coords[:, idx] for idx, col in enumerate(cols)})
         
         # 修正：防御性地获取 details
         # 有些版本返回对象，有些可能是字典，我们做一个简单的兼容处理
@@ -179,7 +260,7 @@ class SpotFinder:
             # 万一以后有更奇怪的输出，直接按索引给个默认列名，而不是崩溃
             cols = [f'col_{i}' for i in range(blobs.shape[1])]
 
-        df = pd.DataFrame(blobs, columns=cols)
+        df = pd.DataFrame({col: blobs[:, idx] for idx, col in enumerate(cols)})
         return df
 
     def _run_peak_local_max(self, vol_3d):
@@ -206,10 +287,15 @@ class SpotFinder:
         mask = is_max & (vol_3d > abs_thresh)
         
         # 3. 快速连通性分析
-        labeled, n_spots = ndimage.label(mask, structure=np.ones((3,3,3)))
+        labeled, n_spots = cast(tuple[object, int], ndimage.label(mask, structure=np.ones((3,3,3))))
         
         if n_spots == 0:
-            return pd.DataFrame(columns=['z', 'y', 'x', 'intensity'])
+            return pd.DataFrame({
+                'z': pd.Series(dtype=np.float32),
+                'y': pd.Series(dtype=np.float32),
+                'x': pd.Series(dtype=np.float32),
+                'intensity': pd.Series(dtype=np.float32),
+            })
         
         # 4. 向量化批量计算（比循环快 10-100 倍）
         indices = np.arange(1, n_spots + 1)
@@ -220,7 +306,7 @@ class SpotFinder:
         
         # 5. 快速构造（避免列表推导）
         coords = np.array(centroids)
-        df = pd.DataFrame(coords, columns=['z', 'y', 'x'])
+        df = pd.DataFrame({'z': coords[:, 0], 'y': coords[:, 1], 'x': coords[:, 2]})
         df['intensity'] = max_intensities
         
         return df
@@ -273,11 +359,11 @@ def detect_spots_max3d(vol_3d, threshold=0.05, min_dist=3):
             threshold_rel=threshold,
             exclude_border=True
         )
-        return pd.DataFrame(coords, columns=['z', 'y', 'x'])
+        return pd.DataFrame({'z': coords[:, 0], 'y': coords[:, 1], 'x': coords[:, 2]})
 
     return _run_algo_on_channels(vol_3d, _logic)
 
-def detect_spots_blob_dog(vol_3d, min_sigma=(0.5, 0.5, 0.5), max_sigma=3.0, threshold=0.05, overlap=0.5):
+def detect_spots_blob_dog(vol_3d, min_sigma=(0.5, 0.5, 0.5), max_sigma=3, threshold=0.05, overlap=0.5):
     """
     这是一个轻量级的辅助函数，专门在 Notebook 里做实验用的。
     不用读文件，直接传内存里的数组就行。
@@ -297,7 +383,7 @@ def detect_spots_blob_dog(vol_3d, min_sigma=(0.5, 0.5, 0.5), max_sigma=3.0, thre
         else:
             cols = [f'col_{i}' for i in range(blobs.shape[1])]
 
-        return pd.DataFrame(blobs, columns=cols)
+        return pd.DataFrame({col: blobs[:, idx] for idx, col in enumerate(cols)})
 
     return _run_algo_on_channels(vol_3d, _logic)
 
@@ -307,7 +393,7 @@ def detect_spots_spotiflow(vol_3d, model_name="general", prob_thresh=0.5, use_gp
     不用读文件，直接传内存里的数组就行。
     """
     try:
-        from spotiflow.model import Spotiflow
+        from spotiflow.model import Spotiflow  # pyright: ignore[reportMissingImports]
     except ImportError:
         print(" 错误: 未安装Spotiflow库")
         print(" 运行: pip install spotiflow")
@@ -327,7 +413,7 @@ def detect_spots_spotiflow(vol_3d, model_name="general", prob_thresh=0.5, use_gp
         ndim = coords.shape[1] 
         cols = ['z', 'y', 'x'][-ndim:] 
         
-        df = pd.DataFrame(coords, columns=cols)
+        df = pd.DataFrame({col: coords[:, idx] for idx, col in enumerate(cols)})
         
         if hasattr(details, 'intens'):
             df['intensity'] = details.intens

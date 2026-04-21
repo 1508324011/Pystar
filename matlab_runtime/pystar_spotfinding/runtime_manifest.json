@@ -1,0 +1,25 @@
+{
+  "package_name": "pystar_spotfinding",
+  "entrypoint": "pystar_spotfind_entry",
+  "required_files": [
+    {
+      "name": "pystar_spotfind_entry.m",
+      "source_path": "repo-local entrypoint",
+      "role": "python-facing spot-finding entrypoint",
+      "required": true
+    },
+    {
+      "name": "pystar_spotfind_max3d.m",
+      "source_path": "derived from matlab_script/STATES-matlab-tissue/SpotFindingMax3D.m",
+      "role": "MATLAB max3d-style spot detector with explicit zyx normalization",
+      "required": true
+    },
+    {
+      "name": "pystar_load_volume_tiff.m",
+      "source_path": "repo-local helper",
+      "role": "multipage TIFF loader for staged clean-data volumes",
+      "required": true
+    }
+  ],
+  "optional_files": []
+}
