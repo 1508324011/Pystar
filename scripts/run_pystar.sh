@@ -5,8 +5,10 @@
 # 用法: bash run_pystar.sh [config_path]
 # =================================================================
 
-# 1. 确定 Config 路径
+set -euo pipefail
+
 CONFIG_FILE="${1:-config/experiment_config.yaml}"
+PIXIRUN=(pixi run --manifest-path env/pixi.toml -e pystar)
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "Error: Config file not found at $CONFIG_FILE"
@@ -16,25 +18,22 @@ fi
 echo "--- PyStar Launcher ---"
 echo "Reading config: $CONFIG_FILE"
 
-# 用 Python 单行脚本读取 YAML 里的 FOV 数量
-# 这样我们永远不需要手动修改 --array
-NUM_JOBS=$(pixi run -e pystar python -c "
-import sys, yaml
+NUM_JOBS=$("${PIXIRUN[@]}" python -c "
+import yaml
 try:
-    with open('$CONFIG_FILE') as f:
+    with open('$CONFIG_FILE', encoding='utf-8') as f:
         data = yaml.safe_load(f)
     fovs = data['dataset']['fov_list']
-    # 处理 '1-56' 这种字符串
     if isinstance(fovs, str) and '-' in fovs:
         start, end = map(int, fovs.split('-'))
         print(end - start + 1)
     elif isinstance(fovs, str) and ',' in fovs:
-        print(len(fovs.split(',')))
+        print(len([x for x in fovs.split(',') if x.strip()]))
     elif isinstance(fovs, list):
         print(len(fovs))
     else:
-        print(1) # Fallback
-except Exception as e:
+        print(1)
+except Exception:
     print(0)
 ")
 
@@ -44,16 +43,10 @@ if [ "$NUM_JOBS" -eq "0" ]; then
 fi
 
 echo "Detected $NUM_JOBS FOVs to process."
-
-# 3. 准备 log 目录 (Slurm 的 log，不是 PyStar 内部 log)
 mkdir -p logs/pystar
 
-# 4. 生成并提交任务
-# 使用 Here-Doc (EOF) 动态生成 sbatch 脚本
-# 将 python 计算出的 NUM_JOBS 注入到 --array 参数中
-
-CPUS_PER_FOV=4  # 每个 FOV 分配的 CPU 数量
-Batch_FOV=128 #并行FOV数
+CPUS_PER_FOV=4
+Batch_FOV=128
 
 JOB_ID=$(sbatch << EOF | awk '{print $4}'
 #!/bin/bash
@@ -73,14 +66,11 @@ JOB_ID=$(sbatch << EOF | awk '{print $4}'
 echo "Running on node: \$(hostname)"
 echo "Slurm Task ID: \$SLURM_ARRAY_TASK_ID"
 
-# 在 Python 内部限制线程数，防止 OpenBLAS/MKL 乱抢资源
 export OMP_NUM_THREADS=${CPUS_PER_FOV}
 export MKL_NUM_THREADS=${CPUS_PER_FOV}
 export OPENBLAS_NUM_THREADS=${CPUS_PER_FOV}
 
-# 运行 Worker
-# 传 Config 路径 和 Task ID 给 Python
-pixi run runpystar --config "$CONFIG_FILE" --task_id "\$SLURM_ARRAY_TASK_ID"
+pixi run --manifest-path env/pixi.toml -e pystar   python scripts/batch_pystar.py   --config "$CONFIG_FILE"   --task_id "\$SLURM_ARRAY_TASK_ID"
 
 EOF
 )

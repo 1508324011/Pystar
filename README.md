@@ -1,26 +1,24 @@
 # PyStar
 
-PyStar 是一个用于空间转录组学（Spatial Transcriptomics）图像处理和分析的 Python 管道。它提供了从原始显微镜图像到基因表达矩阵的完整流程，包括图像预处理、配准、斑点检测和解码。
+PyStar 是一个面向空间转录组图像处理的 Python 管道，覆盖从原始显微镜图像到解码结果的主要处理链路。当前发布口径以 **Python-native PyStar 流程** 为主线；仓库中同时保留 MATLAB 兼容/提供者相关实现，用于持续开发与验证，但**不属于当前受支持的用户工作流**。
 
-## 功能特点
+## 当前支持状态
 
-- **图像预处理**：中值滤波、高斯模糊、直方图匹配、背景扣除等
-- **图像配准**：支持全局对齐和局部变形校正（光流法、B-spline、Demons 3D）
-- **斑点检测**：支持 Spotiflow、Blob DoG、Peak Local Max 等多种算法
-- **基因解码**：支持自定义编码规则和多色通道解码
-- **GPU 加速**：支持 CUDA 加速的图像处理
-- **并行处理**：基于 Dask 的分布式计算
+### 受支持
+- Python-native PyStar 预处理、配准、Spot finding、信号提取与解码流程
+- 本次同步纳入的非 MATLAB 运行时改进
+- 以 `config/experiment_config.yaml` 为示例入口、在本仓库内运行的 Python 管道
+
+### 实验性 / 暂不支持
+- `provider='matlab'` 的运行时调用路径
+- MATLAB compatibility/provider 集成
+- MATLAB-backed 的生产工作流、对外承诺或发布级支持
+
+> MATLAB 相关代码和 `matlab_runtime/` 资源保留在仓库中，目的是让开发与验证工作保持可见；它们仍处于主动测试阶段，不应被视为当前 release-ready 能力。
 
 ## 安装
 
-### 环境要求
-
-- Python >= 3.9
-- CUDA 12.x（可选，用于 GPU 加速）
-
 ### 从源码安装（当前推荐）
-
-由于项目尚未发布到 PyPI，请从 GitHub 直接安装：
 
 ```bash
 git clone https://github.com/1508324011/pystar.git
@@ -28,131 +26,133 @@ cd pystar
 pip install -e .
 ```
 
-### 使用 pixi 安装
+### 使用 pixi 环境
 
-如果你使用 pixi 包管理器：
-
-```bash
-pixi install
-```
-
-<!-- ### 使用 pip 安装（即将推出）
+本仓库沿用旧版发布仓库布局，pixi manifest 位于 `env/pixi.toml`：
 
 ```bash
-pip install pystar
+pixi install --manifest-path env/pixi.toml
+pixi run --manifest-path env/pixi.toml -e pystar python -c "import pystar; print('ok')"
 ```
--->
 
 ## 快速开始
 
 ### 1. 准备配置文件
 
-创建 `experiment_config.yaml` 文件，配置数据集路径、图像结构、通道定义等。
+- 示例配置：`config/experiment_config.yaml`
+- 当前示例配置默认走 **Python-native** 主线（`provider: native`）
+- 示例配置里的 `dataset.raw_data_path`、`codebook.gene_list` 和 `pipeline.output.directory` 仍是集群上的站点路径；在你自己的环境中运行前，请先改成可访问的本地/集群路径
+- 若你手动启用 MATLAB provider，请将其视为实验功能，而不是受支持路径
 
-示例配置请参考 `config/experiment_config.yaml`
-
-### 2. 运行预处理
+### 2. 运行完整单个 FOV 流程
 
 ```python
+from pystar.infrastructure import load_config
 from pystar.preprocessing import DataSanitizer
-from pystar.infrastructure import ExperimentConfig
-
-# 加载配置
-config = ExperimentConfig.from_yaml("config/experiment_config.yaml")
-
-# 创建处理器
-sanitizer = DataSanitizer(config)
-
-# 处理单个 FOV
-sanitizer.sanitize_fov(fov_id=1)
-```
-
-### 3. 运行配准
-
-```python
 from pystar.registration import RegistrationEngine
-
-engine = RegistrationEngine(config)
-engine.register_all_fovs()
-```
-
-### 4. 斑点检测和解码
-
-```python
 from pystar.spot_finding import SpotFinder
+from pystar.mining import SignalMiner
 from pystar.decoding import Decoder
+from pystar.io import ImageLoader
 
-# 斑点检测
-finder = SpotFinder(config)
-spots = finder.find_spots(fov_id=1)
+cfg = load_config("config/experiment_config.yaml")
 
-# 解码
-decoder = Decoder(config)
-results = decoder.decode(spots)
+fov_id = cfg.dataset.parsed_fovs[0]
+
+sanitizer = DataSanitizer(cfg)
+sanitizer.sanitize_fov(fov_id)
+
+loader = ImageLoader(cfg)
+data = loader.load_fov(fov_id)
+
+reg_engine = RegistrationEngine(cfg)
+reg_engine.register_fov(data, fov_id)
+
+finder = SpotFinder(cfg)
+finder.find_spots_in_fov(fov_id)
+
+miner = SignalMiner(cfg)
+miner.mine_fov(fov_id)
+
+decoder = Decoder(cfg)
+decoder.decode_fov(fov_id)
 ```
 
-## 项目结构
+### 3. 使用批处理脚本
 
+```bash
+bash scripts/run_pystar.sh config/experiment_config.yaml
 ```
-pystar/
-├── pystar/              # 核心模块
-│   ├── __init__.py
-│   ├── preprocessing.py    # 图像预处理
-│   ├── registration.py     # 图像配准
-│   ├── spot_finding.py     # 斑点检测
-│   ├── decoding.py         # 基因解码
-│   ├── io.py               # 输入输出
-│   ├── infrastructure.py   # 基础设施/配置
-│   ├── mining.py           # 数据挖掘
-│   └── visualization.py    # 可视化
-├── notebooks/           # Jupyter notebooks
-├── scripts/             # 批处理脚本
-├── config/              # 配置文件示例
-├── env/                 # 环境配置
-├── pyproject.toml       # 项目配置
+
+脚本会通过 `env/pixi.toml` 环境提交 `scripts/batch_pystar.py`，这是当前发布仓库布局下的推荐批处理入口。
+
+> `scripts/run_pystar.sh` 依赖 SLURM 的 `sbatch`；如果你不在集群环境中，请直接使用上面的 Python API 或自行调用 `scripts/batch_pystar.py`。
+
+## 仓库结构
+
+```text
+repo-root/
+├── pystar/
+│   ├── infrastructure.py
+│   ├── io.py
+│   ├── preprocessing.py
+│   ├── registration.py
+│   ├── spot_finding.py
+│   ├── extraction_utils.py
+│   ├── mining.py
+│   ├── decoding.py
+│   ├── visualization.py
+│   ├── tiling.py
+│   ├── matlab_engine_bootstrap.py
+│   ├── matlab_preprocessing.py
+│   ├── matlab_registration.py
+│   ├── matlab_spot_finding.py
+│   └── matlab_extraction.py
+├── matlab_runtime/          # 实验性 MATLAB provider 运行时资源（非当前支持主线）
+├── config/
+├── scripts/
+├── env/
+├── notebooks/
+├── sitecustomize.py         # 可选 MATLAB Engine 启动辅助（可用 PYSTAR_DISABLE_MATLAB_ENGINE_BOOTSTRAP=1 禁用）
+├── pyproject.toml
 ├── README.md
-└── LICENSE
+└── CHANGELOG.md
 ```
 
 ## 依赖
 
-核心依赖：
+核心运行依赖包括：
 - numpy
 - pandas
-- tifffile
-- dask
 - scipy
+- tifffile
+- dask / distributed
+- xarray
 - scikit-image
-- opencv-python
-- tqdm
+- SimpleITK
+- matplotlib / seaborn
+- pydantic
+- PyYAML
+- opencv-python-headless
 
-可选依赖：
-- cupy (GPU 加速)
-- dask-cuda (GPU 分布式计算)
-- spotiflow (深度学习斑点检测)
+可选/按需依赖：
+- cupy / dask-cuda（GPU 相关实验）
+- spotiflow（特定 spot-finding 算法）
+- MATLAB Engine for Python（仅实验性 provider seam）
 
-## 支持的编码方案
+## MATLAB 相关说明
 
-- **3-color**：AT/GT/TT/AG/GG/TG/AA/GA/TA
-- **4-color**：16 种双碱基组合
-- **自定义**：可根据实验设计灵活配置
+仓库内包含以下 MATLAB 相关资源：
+- `pystar/matlab_*.py`
+- `matlab_runtime/`
+- `scripts/check_matlab_engine.py`
+- `sitecustomize.py`
+
+这些内容用于**开发、验证和未来兼容性工作**。当前发布说明下：
+- 它们不是默认路径
+- 它们不是生产承诺
+- 它们失败时应显式报错，而不是静默回退成受支持路径
 
 ## 许可证
 
-本项目采用 MIT 许可证。详见 [LICENSE](LICENSE) 文件。
-
-## 作者
-
-- Zhurui Zenglab
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-## 引用
-
-如果您在研究中使用了 PyStar，请引用：
-
-```
-PyStar: A Python Pipeline for Spatial Transcriptomics Analysis
-```
+本项目采用 MIT 许可证。详见 `LICENSE`。
