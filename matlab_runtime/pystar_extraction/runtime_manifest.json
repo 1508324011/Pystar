@@ -1,0 +1,25 @@
+{
+  "package_name": "pystar_extraction",
+  "entrypoint": "pystar_extract_entry",
+  "required_files": [
+    {
+      "name": "pystar_extract_entry.m",
+      "source_path": "repo-local entrypoint",
+      "role": "python-facing extraction entrypoint",
+      "required": true
+    },
+    {
+      "name": "pystar_boxsum_extract.m",
+      "source_path": "derived from matlab_script/STATES-matlab-tissue/ExtractFromLocation3d.m",
+      "role": "MATLAB box-sum integration helper for staged registered volumes",
+      "required": true
+    },
+    {
+      "name": "pystar_load_volume_tiff.m",
+      "source_path": "repo-local helper",
+      "role": "multipage TIFF loader for staged extraction volumes",
+      "required": true
+    }
+  ],
+  "optional_files": []
+}

@@ -1,130 +1,273 @@
 # pystar/mining.py
+import json
+from typing import Any, Optional
+
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from scipy.ndimage import map_coordinates
+from importlib import import_module
 from pathlib import Path
 from .infrastructure import ExperimentConfig
-from .io import ImageLoader
-from.io import get_fov_output_structure
+from .extraction_utils import (
+    coords_within_transform_scope,
+    extract_box_sum_integer,
+    extract_signal_volume,
+    get_transform_scope,
+    map_spot_coordinates,
+    warp_volume_to_reference,
+)
+from .io import ImageLoader, get_matlab_stage_contract, load_transform_manifest, validate_scope_contract
+from .io import get_fov_output_structure
+from .matlab_extraction import MATLABExtractionBackend
 # visualization 模块保留引用，按需导入即可
-from .visualization import plot_spot_traces, plot_spot_extraction_check
 
-def map_spot_coordinates(
-    ref_coords: np.ndarray,
-    transform_data: dict
-) -> np.ndarray:
-    """
-    将参考坐标映射到目标轮次 (保持 float32 精度以支持亚像素配准)
-    """
-    if transform_data is None:
-        return ref_coords.astype(np.float32)
 
-    mapped = ref_coords.copy().astype(np.float32)
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    return value
 
-    # 1. Global Shift
-    global_shift = transform_data.get('global_shift_3d', np.zeros(3))
-    mapped -= global_shift
 
-    # 2. Local Flow
-    flow_2d = transform_data.get('flow_2d')
-    flow_3d = transform_data.get('flow_3d')
-    flow = flow_2d if flow_2d is not None else flow_3d
-
-    if flow is not None:
-        # 这里的 map_coordinates 是必须的，因为 flow 场本身是连续的
-        # 但这一步只对 N 个点做，开销很小
-        if flow.ndim == 3:  # 2D flow
-            h, w = flow.shape[1], flow.shape[2]
-            sample_y = np.clip(mapped[:, 1], 0, h-1)
-            sample_x = np.clip(mapped[:, 2], 0, w-1)
-            
-            dy = map_coordinates(flow[0], [sample_y, sample_x], order=1, mode='nearest')
-            dx = map_coordinates(flow[1], [sample_y, sample_x], order=1, mode='nearest')
-            mapped[:, 1] += dy
-            mapped[:, 2] += dx
-
-        elif flow.ndim == 4:  # 3D flow
-            d, h, w = flow.shape[1:]
-            sample_z = np.clip(mapped[:, 0], 0, d-1)
-            sample_y = np.clip(mapped[:, 1], 0, h-1)
-            sample_x = np.clip(mapped[:, 2], 0, w-1)
-            
-            dz = map_coordinates(flow[0], [sample_z, sample_y, sample_x], order=1, mode='nearest')
-            dy = map_coordinates(flow[1], [sample_z, sample_y, sample_x], order=1, mode='nearest')
-            dx = map_coordinates(flow[2], [sample_z, sample_y, sample_x], order=1, mode='nearest')
-            
-            mapped[:, 0] += dz
-            mapped[:, 1] += dy
-            mapped[:, 2] += dx
-            
-    return mapped
-
-def extract_box_sum_integer(
-    img_vol: np.ndarray, 
-    coords: np.ndarray, 
-    box_size: tuple = (1, 3, 3)
-) -> np.ndarray:
-    """    
-    img_vol: (Z, Y, X)
-    coords: (N, 3) float32 -> 将被四舍五入为 int
-    """
-    D, H, W = img_vol.shape
-    bz, by, bx = box_size
-    rz, ry, rx = bz // 2, by // 2, bx // 2
-
-    n_spots = len(coords)
-    intensities = np.zeros(n_spots, dtype=np.float32)
-
-    # 1. 四舍五入到最近整数 (Round to Nearest Integer)
-    # 这与 MATLAB 的索引逻辑一致（MATLAB extents 是基于整数位置）
-    # 使用 rint 比 astype(int) 更准确，避免 3.99 -> 3 的截断误差
-    coords_int = np.rint(coords).astype(np.int32)
-    
-    ic_z = coords_int[:, 0]
-    ic_y = coords_int[:, 1]
-    ic_x = coords_int[:, 2]
-
-    # 2. 遍历 Box 内的所有偏移量
-    # 相比生成巨大的 index grid，简单的 Python 循环处理小 box (3x3=9次循环) 反而更快
-    # 因为它避免了分配巨大的中间数组
-    for dz in range(-rz, rz + 1):
-        for dy in range(-ry, ry + 1):
-            for dx in range(-rx, rx + 1):
-                # 计算当前偏移下的 absolute coordinates
-                cur_z = ic_z + dz
-                cur_y = ic_y + dy
-                cur_x = ic_x + dx
-                
-                # 3. 极速边界检查 (Vectorized)
-                # 虽然增加了逻辑，但直接索引越界的代价是崩溃或 wrap-around
-                # 我们只选取有效的点
-                valid_mask = (
-                    (cur_z >= 0) & (cur_z < D) &
-                    (cur_y >= 0) & (cur_y < H) &
-                    (cur_x >= 0) & (cur_x < W)
-                )
-                
-                # 4. 累加强度
-                # 利用 Boolean Masking 进行部分更新
-                if np.any(valid_mask):
-                    # 只读取有效坐标的像素值
-                    val = img_vol[cur_z[valid_mask], cur_y[valid_mask], cur_x[valid_mask]]
-                    intensities[valid_mask] += val
-
-    return intensities
+def _write_backend_metadata(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=True), encoding="utf-8")
 
 class SignalMiner:
     def __init__(self, config: ExperimentConfig):
         self.cfg = config
         self.loader = ImageLoader(config)
+        self._matlab_backend: Optional[MATLABExtractionBackend] = None
+
+    def close(self) -> None:
+        if self._matlab_backend is None:
+            return
+        try:
+            self._matlab_backend.close()
+        finally:
+            self._matlab_backend = None
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _get_matlab_backend(self) -> MATLABExtractionBackend:
+        if self._matlab_backend is None:
+            self._matlab_backend = MATLABExtractionBackend(self.cfg)
+        return self._matlab_backend
+
+    def _expected_field_semantics(self) -> dict[str, str]:
+        return self.cfg.pipeline.field_semantics.as_dict()
         
-    def _load_transforms(self, fov_id):
+    def _load_transforms(self, fov_id: int) -> dict[Any, Any]:
         base_dir = Path(self.cfg.pipeline.output.directory)
-        paths = get_fov_output_structure(base_dir, fov_id)
-        path = paths["transforms"] / f"transforms_fov_{fov_id}.npy"
-        if not path.exists(): return {} 
-        return np.load(path, allow_pickle=True).item()
+        return load_transform_manifest(base_dir, fov_id, load_provenance=True)
+
+    def _validate_scope_contract(self, fov_id: int, transforms: dict[Any, Any]) -> dict[str, Any]:
+        provenance = transforms.get('_provenance')
+        if not isinstance(provenance, dict):
+            raise ValueError(
+                f"FOV {fov_id} transform manifest is missing _provenance; explicit scope metadata is required before extraction"
+            )
+
+        contract = provenance.get('release_contract')
+        if not isinstance(contract, dict):
+            raise ValueError(
+                f"FOV {fov_id} transform manifest is missing release_contract; explicit scope metadata is required before extraction"
+            )
+
+        scope_contract = validate_scope_contract(
+            contract,
+            expected_scope_mode=self.cfg.pipeline.scope_mode,
+        )
+        print(
+            f" [Miner] Scope contract: requested={scope_contract['requested_scope_mode']} | delivered={scope_contract['delivered_coverage']} | status={scope_contract['scope_status']}"
+        )
+
+        if not scope_contract['scope_valid']:
+            raise ValueError(
+                f"FOV {fov_id} scope contract mismatch: requested {scope_contract['requested_scope_mode']!r} but registration delivered {scope_contract['delivered_coverage']!r}; scope_status={scope_contract['scope_status']!r}. Extraction will not proceed."
+            )
+
+        if scope_contract['scope_status'] != 'valid':
+            raise ValueError(
+                f"FOV {fov_id} scope contract is not extraction-legal: scope_status={scope_contract['scope_status']!r}"
+            )
+
+        return contract
+
+    def _resolve_scope_metadata(
+        self,
+        fov_id: int,
+        transforms: dict[Any, Any],
+        contract: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        delivered_coverage = contract['delivered_coverage']
+        resolved_scope: dict[str, Any] | None = None
+        missing_rounds: list[int] = []
+
+        for round_id, transform_data in transforms.items():
+            if not isinstance(round_id, int):
+                continue
+            if not isinstance(transform_data, dict) or 'global_shift_3d' not in transform_data:
+                continue
+
+            scope_metadata = get_transform_scope(transform_data)
+            if scope_metadata is None:
+                missing_rounds.append(int(round_id))
+                continue
+            if scope_metadata['coverage_mode'] != delivered_coverage:
+                raise ValueError(
+                    f"FOV {fov_id} round {round_id} scope metadata reports {scope_metadata['coverage_mode']!r}, "
+                    f"but release_contract delivered_coverage is {delivered_coverage!r}"
+                )
+
+            normalized_scope = dict(scope_metadata)
+            if resolved_scope is None:
+                resolved_scope = normalized_scope
+                continue
+            if normalized_scope != resolved_scope:
+                raise ValueError(
+                    f"FOV {fov_id} transform manifest mixes inconsistent round _scope metadata; round {round_id} differs from earlier rounds"
+                )
+
+        if delivered_coverage == 'tile_local':
+            if missing_rounds:
+                raise ValueError(
+                    f"FOV {fov_id} tile_local manifest is missing per-round _scope metadata for rounds {sorted(missing_rounds)}"
+                )
+            if resolved_scope is None:
+                raise ValueError(
+                    f"FOV {fov_id} tile_local manifest does not contain any persisted _scope metadata"
+                )
+
+        return resolved_scope
+
+    def _validate_image_warp_contract(self, fov_id: int, transforms: dict[Any, Any]) -> None:
+        provenance = transforms.get('_provenance')
+        if not isinstance(provenance, dict):
+            raise ValueError(
+                f"FOV {fov_id} transform manifest is missing _provenance; image_warp extraction requires explicit runtime metadata"
+            )
+
+        contract = provenance.get('release_contract')
+        if not isinstance(contract, dict):
+            raise ValueError(
+                f"FOV {fov_id} transform manifest is missing release_contract; image_warp extraction requires explicit runtime metadata"
+            )
+
+        release_gate = contract.get('release_gate')
+        if not isinstance(release_gate, dict):
+            raise ValueError(
+                f"FOV {fov_id} transform manifest is missing release_gate metadata; image_warp extraction cannot validate legality"
+            )
+
+        status = release_gate.get('status')
+        if status != 'valid':
+            reasons = release_gate.get('reasons') or []
+            raise ValueError(
+                f"FOV {fov_id} transform contract is not a valid image_warp Phase 1 RC artifact: status={status!r}, reasons={reasons}"
+            )
+
+    def _validate_round_transform_for_mode(
+        self,
+        round_id: int,
+        transform_data: dict[str, Any],
+        transform_application_mode: str,
+    ) -> None:
+        if transform_application_mode != 'image_warp':
+            return
+
+        if isinstance(transform_data.get('flow_2d'), np.ndarray):
+            raise ValueError(
+                f"Round {round_id} delivered flow_2d, but image_warp mainline only supports flow_3d"
+            )
+
+        is_reference_round = bool(transform_data.get('is_reference_round', False))
+        if transform_data.get('flow_3d') is None and not is_reference_round:
+            raise ValueError(
+                f"Round {round_id} is missing flow_3d. image_warp is the Phase 1 RC mainline and does not silently downgrade."
+            )
+
+    def _extract_intensities_for_channel(
+        self,
+        *,
+        img_vol: Any,
+        ref_coords: Any,
+        transform_data: dict[str, Any],
+        box_size: tuple[int, int, int],
+        transform_application_mode: str,
+        fov_id: int,
+        round_id: int,
+        channel_id: int,
+    ) -> tuple[Any, Optional[dict[str, Any]]]:
+        expected_semantics = self._expected_field_semantics()
+        provider = self.cfg.pipeline.extraction.provider
+
+        if provider == 'native':
+            if transform_application_mode == 'coordinate_mapping':
+                target_coords = map_spot_coordinates(
+                    ref_coords,
+                    transform_data,
+                    expected_field_semantics=expected_semantics,
+                )
+                return extract_box_sum_integer(img_vol, target_coords, box_size), None
+
+            return (
+                extract_signal_volume(
+                    img_vol,
+                    ref_coords,
+                    transform_data,
+                    box_size,
+                    transform_application_mode,
+                    expected_field_semantics=expected_semantics,
+                ),
+                None,
+            )
+
+        backend = self._get_matlab_backend()
+        if transform_application_mode == 'coordinate_mapping':
+            target_coords = map_spot_coordinates(
+                ref_coords,
+                transform_data,
+                expected_field_semantics=expected_semantics,
+            )
+            result = backend.extract_intensities(
+                img_vol,
+                target_coords,
+                fov_id=fov_id,
+                round_id=round_id,
+                channel_id=channel_id,
+                box_size=box_size,
+                transform_application_mode=transform_application_mode,
+            )
+            return result['intensities'], result.get('backend_metadata')
+
+        warped_volume = warp_volume_to_reference(
+            img_vol,
+            transform_data,
+            expected_field_semantics=expected_semantics,
+        )
+        result = backend.extract_intensities(
+            warped_volume,
+            ref_coords,
+            fov_id=fov_id,
+            round_id=round_id,
+            channel_id=channel_id,
+            box_size=box_size,
+            transform_application_mode=transform_application_mode,
+        )
+        return result['intensities'], result.get('backend_metadata')
 
     def mine_fov(self, fov_id: int):
         print(f"[{'='*20} Mining FOV {fov_id} {'='*20}]")
@@ -150,7 +293,28 @@ class SignalMiner:
         intensity_matrix = np.zeros((n_spots, len(rounds), len(channels)), dtype=np.float32)
         
         # Box Size
-        box_size = self.cfg.pipeline.extraction.integration_box 
+        box_vals = self.cfg.pipeline.extraction.integration_box
+        box_size: tuple[int, int, int] = (int(box_vals[0]), int(box_vals[1]), int(box_vals[2]))
+        transform_application_mode = self.cfg.pipeline.extraction.transform_application_mode
+        extraction_provider = self.cfg.pipeline.extraction.provider
+        backend_records: list[dict[str, Any]] = []
+        scope_contract = self._validate_scope_contract(fov_id, transforms)
+        scope_metadata = self._resolve_scope_metadata(fov_id, transforms, scope_contract)
+        scope_transform = None if scope_metadata is None else {'_scope': scope_metadata}
+        in_scope_mask = coords_within_transform_scope(ref_coords, scope_transform)
+        in_scope_coords = ref_coords[in_scope_mask]
+        if scope_metadata is not None and scope_metadata.get('coverage_mode') == 'tile_local':
+            in_scope_count = int(in_scope_mask.sum())
+            if in_scope_count == 0:
+                raise ValueError(
+                    f"FOV {fov_id} tile_local scope excludes every detected spot; extraction cannot proceed"
+                )
+            print(
+                f" [Miner] Tile-local scope keeps {in_scope_count}/{n_spots} detected spots inside delivered coverage"
+            )
+        print(f" [Miner] Extraction provider: {extraction_provider}")
+        if transform_application_mode == 'image_warp':
+            self._validate_image_warp_contract(fov_id, transforms)
 
         # 2. Main Loop
         # 优化点：外层循环是 Round，内层是 Channel。
@@ -160,13 +324,11 @@ class SignalMiner:
         with tqdm(total=total_steps, desc="Extracting Signals") as pbar:
             for r_idx, r_id in enumerate(rounds):
                 # Pre-calculate coordinates for this round ONCE
-                trans_data = transforms.get(
-                    r_id,
-                    {'global_shift_3d': np.zeros(3), 'flow_2d': None, 'flow_3d': None},
-                )
-                
-                # 这一步计算浮点坐标
-                target_coords = map_spot_coordinates(ref_coords, trans_data)
+                if r_id not in transforms:
+                    raise KeyError(f"Missing transform entry for round {r_id} in FOV {fov_id} transform manifest")
+
+                trans_data = transforms[r_id]
+                self._validate_round_transform_for_mode(r_id, trans_data, transform_application_mode)
 
                 current_round_channels = self.cfg.dataset.round_structure[r_id]
                 
@@ -174,15 +336,25 @@ class SignalMiner:
                     if c_id not in current_round_channels:
                         pbar.update(1)
                         continue
-                    
+
                     # Load Image - 这是主要的 IO 开销
                     # 确保是 clean data
                     img_vol = self.loader.load_clean_image(fov_id, r_id, c_id) 
+
+                    vals, backend_metadata = self._extract_intensities_for_channel(
+                        img_vol=img_vol,
+                        ref_coords=in_scope_coords,
+                        transform_data=trans_data,
+                        box_size=box_size,
+                        transform_application_mode=transform_application_mode,
+                        fov_id=fov_id,
+                        round_id=r_id,
+                        channel_id=c_id,
+                    )
+                    if isinstance(backend_metadata, dict):
+                        backend_records.append(backend_metadata)
                     
-                    # Extraction - The Optimized Part
-                    vals = extract_box_sum_integer(img_vol, target_coords, tuple(box_size))
-                    
-                    intensity_matrix[:, r_idx, c_idx] = vals
+                    intensity_matrix[in_scope_mask, r_idx, c_idx] = vals
                     
                     # 显式删除引用，帮助 GC 
                     del img_vol
@@ -191,6 +363,17 @@ class SignalMiner:
         # 4. Save
         out_name = paths["extraction"] / f"intensity_matrix_fov_{fov_id}.npy"
         np.save(out_name, intensity_matrix)
+        if extraction_provider == 'matlab' and backend_records:
+            _write_backend_metadata(
+                paths["qc"] / f"extraction_backend_fov_{fov_id}.json",
+                {
+                    "provider": extraction_provider,
+                    "matlab_stage_contract": get_matlab_stage_contract(self.cfg, "extraction"),
+                    "fov_id": int(fov_id),
+                    "transform_application_mode": transform_application_mode,
+                    "records": backend_records,
+                },
+            )
         print(f" [Miner] Saved extraction matrix to {out_name.name} | Shape: {intensity_matrix.shape}")
         
         # 5. QC (Optional visualization code kept minimal here for speed)
@@ -200,6 +383,8 @@ class SignalMiner:
         # 剥离出来的 QC 逻辑，保持主流程清晰
         if not self.cfg.pipeline.output.save_qc_images:
             return
+
+        plot_spot_traces = import_module('pystar.visualization').plot_spot_traces
             
         print(f" [QC] Generating extraction QC plots...")
         base_dir = Path(self.cfg.pipeline.output.directory)
@@ -222,13 +407,13 @@ class SignalMiner:
 
     def _save_debug_csv(self, matrix, spots_df, rounds, channels, fov_id):
         n_debug = min(100, len(spots_df))
-        cols = []
+        cols: list[str] = []
         for r in rounds:
             for c in channels:
                 cols.append(f"R{r}_C{c}")
         flat_mat = matrix[:n_debug].reshape(n_debug, -1)
         df_debug = spots_df.iloc[:n_debug].copy()
-        df_vals = pd.DataFrame(flat_mat, columns=cols, index=df_debug.index)
+        df_vals = pd.DataFrame(flat_mat, columns=pd.Index(cols), index=df_debug.index)
         final = pd.concat([df_debug, df_vals], axis=1)
         base_dir = Path(self.cfg.pipeline.output.directory)
         paths = get_fov_output_structure(base_dir, fov_id)
