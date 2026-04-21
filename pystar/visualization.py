@@ -240,27 +240,41 @@ def save_registration_qc(
     fov_id: int
 ):
     """
-    生成三联图：原始叠加 -> 配准后叠加
+    生成注册 QC 叠加图。
+
+    注意：这里展示的相关性分数属于 diagnostic MIP correlation snapshot，
+    用于运行时 QC / 回退启发式可视化，不是 release gate。
     """
     # 这里不需要显式调用 _ensure_2d，因为 overlay_images 内部会处理
     # 这样代码更简洁
     
     fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    fig.suptitle(
+        f"FOV {fov_id} Round {round_id} Registration QC\n"
+        "Diagnostic MIP correlation snapshots only — not a release gate",
+        fontsize=14,
+    )
     
     # 1. Before
     ax0 = axes[0]
     ax0.imshow(overlay_images(ref_img, mov_original))
-    ax0.set_title(f"Before: Round {round_id} vs Ref\nCorr: {score_before:.4f}")
+    ax0.set_title(
+        f"Before: Round {round_id} vs Ref\n"
+        f"Diagnostic MIP corr (pre-global): {score_before:.4f}"
+    )
     ax0.axis('off')
 
     # 2. After
     ax1 = axes[1]
     ax1.imshow(overlay_images(ref_img, mov_registered))
-    ax1.set_title(f"After: Round {round_id} vs Ref\nCorr: {score_after:.4f}")
+    ax1.set_title(
+        f"After: Round {round_id} vs Ref\n"
+        f"Diagnostic MIP corr (selected transform): {score_after:.4f}"
+    )
     ax1.axis('off')
     
     out_name = output_dir / f"alignment_qc_fov{fov_id}_round{round_id}.jpg"
-    plt.tight_layout()
+    plt.tight_layout(rect=(0, 0, 1, 0.92))
     plt.savefig(out_name, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"   [QC] Saved visual report: {out_name.name}")
@@ -792,7 +806,8 @@ def plot_spot_extraction_check(
         plt.show()
         
 
-from .io import ImageLoader
+from .mining import map_spot_coordinates # 确保 mining.py 里暴露了这个函数
+from .io import ImageLoader, get_fov_output_structure, load_transform_manifest
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -808,18 +823,20 @@ class SpotInspector:
         
         # 预加载 Spots DataFrame (可选，如果内存够大)
         self.df = self._load_decoded_csv()
+
+    def _expected_field_semantics(self) -> dict[str, str]:
+        return self.cfg.pipeline.field_semantics.as_dict()
         
     def _load_transforms(self):
         """加载位移场数据"""
-        path = Path(self.cfg.pipeline.output.directory) / "transforms" / f"transforms_fov_{self.fov_id}.npy"
-        if not path.exists():
-            print(f"Warning: Transform file not found: {path}")
-            return {}
-        return np.load(path, allow_pickle=True).item()
+        base_dir = Path(self.cfg.pipeline.output.directory)
+        return load_transform_manifest(base_dir, self.fov_id)
 
     def _load_decoded_csv(self):
         """加载解码后的 CSV"""
-        path = Path(self.cfg.pipeline.output.directory) / "decoded" / f"decoded_fov_{self.fov_id}.csv"
+        base_dir = Path(self.cfg.pipeline.output.directory)
+        paths = get_fov_output_structure(base_dir, self.fov_id)
+        path = paths["decoded"] / f"decoded_fov_{self.fov_id}.csv"
         if not path.exists():
             raise FileNotFoundError(f"Decoded CSV not found: {path}")
         return pd.read_csv(path)
@@ -863,18 +880,23 @@ class SpotInspector:
         # 这是最关键的一步：我们需要把 R1 的坐标映射到所有轮次
         base_coord = np.array([target_row['z'], target_row['y'], target_row['x']], dtype=np.float32)
         
-        from .mining import map_spot_coordinates
-
         coords_per_round = {}
         rounds = sorted(list(self.cfg.dataset.round_structure.keys()))
         
         for r_id in rounds:
             # 获取该轮的位移参数
-            trans_data = self.transforms.get(r_id, {'global_shift_3d': np.zeros(3), 'flow_2d': None})
+            if r_id not in self.transforms:
+                raise KeyError(f"Missing transform entry for round {r_id} in FOV {self.fov_id} transform manifest")
+
+            trans_data = self.transforms[r_id]
             
             # 计算映射坐标
             # map_spot_coordinates 需要 (N, 3) 输入，所以增加一个维度
-            mapped = map_spot_coordinates(base_coord[np.newaxis, :], trans_data)[0]
+            mapped = map_spot_coordinates(
+                base_coord[np.newaxis, :],
+                trans_data,
+                expected_field_semantics=self._expected_field_semantics(),
+            )[0]
             coords_per_round[r_id] = mapped # [z, y, x]
             
         # 4. 构建 spot_info
