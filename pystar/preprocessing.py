@@ -2,6 +2,10 @@
 import numpy as np
 import tifffile
 from pathlib import Path
+from tempfile import TemporaryDirectory
+import time
+import shutil
+from datetime import datetime, timezone
 from tqdm import tqdm
 import cv2
 from skimage import exposure, morphology, img_as_float32, img_as_ubyte
@@ -10,6 +14,11 @@ from typing import Dict, Any, List, Optional, Tuple
 from .infrastructure import ExperimentConfig
 from .io import ImageLoader
 from .io import get_fov_output_structure
+from .matlab_preprocessing import (
+    PREPROCESSING_PROVENANCE_VERSION,
+    MATLABPreprocessingBackend,
+    write_preprocessing_provenance,
+)
 
 # ==============================================================================
 # 1. THE ATOMS
@@ -234,6 +243,319 @@ class DataSanitizer:
     def __init__(self, config):
         self.cfg = config
         self.loader = ImageLoader(config)
+        self._matlab_backend: Optional[MATLABPreprocessingBackend] = None
+
+    def close(self) -> None:
+        if self._matlab_backend is None:
+            return
+        self._matlab_backend.close()
+        self._matlab_backend = None
+
+    def __del__(self):  # pragma: no cover - best-effort cleanup only
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _base_output_dir(self) -> Path:
+        return Path(self.cfg.pipeline.output.directory)
+
+    def _utc_now(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _build_native_preprocessing_provenance(
+        self,
+        *,
+        fov_id: int,
+        started_at: str,
+        finished_at: str,
+        duration_ms: float,
+        rounds_processed: List[int],
+        calibration_steps: List[Any],
+        extraction_steps: List[Any],
+        output_files: List[str],
+        target_rounds: Optional[List[int]],
+    ) -> Dict[str, Any]:
+        return {
+            "version": PREPROCESSING_PROVENANCE_VERSION,
+            "generated_at": finished_at,
+            "fov_id": int(fov_id),
+            "backend": "native_pystar",
+            "provider": "native",
+            "duration_ms": duration_ms,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "input_contract": {
+                "raw_data_path": str(self.cfg.dataset.raw_data_path),
+                "filename_pattern": self.cfg.dataset.filename_pattern,
+                "target_rounds": list(target_rounds) if target_rounds is not None else None,
+                "rounds_processed": rounds_processed,
+            },
+            "pipeline_split": {
+                "calibration_steps": [step.method for step in calibration_steps],
+                "extraction_steps": [step.method for step in extraction_steps],
+            },
+            "raw_sequence": [
+                {
+                    "index": index,
+                    "method": step.method,
+                    "provider": step.provider,
+                    "params": dict(step.params),
+                }
+                for index, step in enumerate(self.cfg.pipeline.preprocessing.sequence)
+            ],
+            "output_files": output_files,
+        }
+
+    def _build_provider_dispatch_provenance(
+        self,
+        *,
+        fov_id: int,
+        started_at: str,
+        finished_at: str,
+        duration_ms: float,
+        rounds_processed: List[int],
+        target_rounds: Optional[List[int]],
+        output_files: List[str],
+        segment_records: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        providers_used = sorted({record["provider"] for record in segment_records})
+        if providers_used == ["native"]:
+            backend_label = "native_pystar"
+        elif providers_used == ["matlab"]:
+            backend_label = "matlab_extracted"
+        else:
+            backend_label = "provider_dispatch"
+
+        return {
+            "version": PREPROCESSING_PROVENANCE_VERSION,
+            "generated_at": finished_at,
+            "fov_id": int(fov_id),
+            "backend": backend_label,
+            "provider_mode": self.cfg.pipeline.preprocessing_provider_mode(),
+            "providers_used": providers_used,
+            "duration_ms": duration_ms,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "input_contract": {
+                "raw_data_path": str(self.cfg.dataset.raw_data_path),
+                "filename_pattern": self.cfg.dataset.filename_pattern,
+                "target_rounds": list(target_rounds) if target_rounds is not None else None,
+                "rounds_processed": rounds_processed,
+            },
+            "raw_sequence": [
+                {
+                    "index": index,
+                    "method": step.method,
+                    "provider": step.provider,
+                    "params": dict(step.params),
+                }
+                for index, step in enumerate(self.cfg.pipeline.preprocessing.sequence)
+            ],
+            "segments": segment_records,
+            "output_files": output_files,
+        }
+
+    def _resolve_rounds_to_process(self, target_rounds: Optional[List[int]]) -> List[int]:
+        all_config_rounds = sorted(self.cfg.dataset.round_structure.keys())
+        if target_rounds is None:
+            return all_config_rounds
+
+        rounds_to_process = sorted([r for r in target_rounds if r in all_config_rounds])
+        if not rounds_to_process:
+            raise ValueError(f"No valid rounds found in target_rounds: {target_rounds}")
+        return rounds_to_process
+
+    def _ordered_round_queue(self, rounds_to_process: List[int]) -> List[int]:
+        ref_round_id = 1
+        final_queue: List[int] = []
+        if ref_round_id in rounds_to_process:
+            final_queue.append(ref_round_id)
+        for round_id in rounds_to_process:
+            if round_id != ref_round_id:
+                final_queue.append(round_id)
+        return final_queue
+
+    def _sequence_segments(self, sequence: List[Any]) -> List[Tuple[str, List[Any]]]:
+        segments: List[Tuple[str, List[Any]]] = []
+        if not sequence:
+            return segments
+
+        current_provider = sequence[0].provider
+        current_steps: List[Any] = []
+        for step in sequence:
+            if step.provider != current_provider:
+                segments.append((current_provider, current_steps))
+                current_provider = step.provider
+                current_steps = []
+            current_steps.append(step)
+
+        if current_steps:
+            segments.append((current_provider, current_steps))
+        return segments
+
+    def _make_loader(self, input_root: Path, filename_pattern: str) -> ImageLoader:
+        temp_dataset = self.cfg.dataset.model_copy(
+            update={
+                "raw_data_path": Path(input_root),
+                "filename_pattern": filename_pattern,
+            }
+        )
+        temp_cfg = self.cfg.model_copy(update={"dataset": temp_dataset})
+        return ImageLoader(temp_cfg)
+
+    def _stage_relative_path(self, fov_id: int, round_id: int, channel_id: int) -> Path:
+        formatted = self.cfg.dataset.filename_pattern.format(
+            round=round_id,
+            fov=fov_id,
+            ch=f"{channel_id:02d}",
+        )
+        if "*" in formatted:
+            formatted = formatted.replace("*", f"clean_fov_{fov_id}_round_{round_id}")
+        return Path(formatted)
+
+    def _save_stage_clean(self, img: np.ndarray, stage_root: Path, fov_id: int, round_id: int, channel_id: int) -> Path:
+        rel_path = self._stage_relative_path(fov_id, round_id, channel_id)
+        output_path = stage_root / rel_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        tifffile.imwrite(output_path, img, compression='zlib')
+        return output_path
+
+    def _flat_clean_filename(self, fov_id: int, round_id: int, channel_id: int) -> str:
+        return f"clean_fov_{fov_id}_round_{round_id}_ch_{channel_id}.tif"
+
+    def _materialize_flat_outputs_to_stage(
+        self,
+        flat_output_dir: Path,
+        stage_root: Path,
+        fov_id: int,
+        rounds_to_process: List[int],
+    ) -> None:
+        roles = self.cfg.dataset.channel_roles
+        for round_id in rounds_to_process:
+            seq_channels = sorted(
+                channel_id
+                for channel_id in self.cfg.dataset.round_structure[round_id]
+                if roles.get(channel_id) == 'seq'
+            )
+            for channel_id in seq_channels:
+                source_path = flat_output_dir / self._flat_clean_filename(fov_id, round_id, channel_id)
+                if not source_path.exists():
+                    raise FileNotFoundError(
+                        f"Expected MATLAB preprocessing output is missing: {source_path}"
+                    )
+                destination_path = stage_root / self._stage_relative_path(fov_id, round_id, channel_id)
+                destination_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_path, destination_path)
+
+    def _copy_stage_outputs_to_clean_dir(
+        self,
+        stage_root: Path,
+        fov_id: int,
+        rounds_to_process: List[int],
+    ) -> List[str]:
+        loader = self._make_loader(stage_root, self.cfg.dataset.filename_pattern)
+        roles = self.cfg.dataset.channel_roles
+        output_files: List[str] = []
+        for round_id in rounds_to_process:
+            seq_channels = sorted(
+                channel_id
+                for channel_id in self.cfg.dataset.round_structure[round_id]
+                if roles.get(channel_id) == 'seq'
+            )
+            for channel_id in seq_channels:
+                stage_path = loader._get_path(fov_id, round_id, channel_id)
+                destination_path = self.get_clean_path(fov_id, round_id, channel_id)
+                destination_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(stage_path, destination_path)
+                output_files.append(str(destination_path))
+        return output_files
+
+    def get_clean_path(self, fov_id: int, round_id: int, channel_id: int) -> Path:
+        base_dir = self._base_output_dir()
+        paths = get_fov_output_structure(base_dir, fov_id)
+        return paths['cleaned'] / self._flat_clean_filename(fov_id, round_id, channel_id)
+
+    def _run_native_sequence_segment(
+        self,
+        fov_id: int,
+        sequence: List[Any],
+        *,
+        input_root: Path,
+        input_filename_pattern: str,
+        output_root: Path,
+        target_rounds: Optional[List[int]] = None,
+        segment_index: int,
+    ) -> Dict[str, Any]:
+        full_seq = sequence
+        if not full_seq:
+            raise ValueError("Native preprocessing segment cannot be empty")
+
+        loader = self._make_loader(input_root, input_filename_pattern)
+        seq_calibration, seq_extraction = self._split_sequence(full_seq)
+        rounds_to_process = self._resolve_rounds_to_process(target_rounds)
+        final_queue = self._ordered_round_queue(rounds_to_process)
+        inter_round_ref_cache = {}
+        started_at = self._utc_now()
+        start_time = time.perf_counter()
+        output_files: List[str] = []
+
+        for r_id in final_queue:
+            intra_round_ref_img = None
+            roles = self.cfg.dataset.channel_roles
+            channels_in_round = self.cfg.dataset.round_structure[r_id]
+            seq_channels = sorted([c for c in channels_in_round if roles.get(c) == 'seq'])
+
+            for c_id in seq_channels:
+                path = loader._get_path(fov_id, r_id, c_id)
+                raw_vol = loader._lazy_load_tiff(path).compute()
+                ctx = {
+                    'ref_round_image': inter_round_ref_cache.get(c_id),
+                    'ref_channel_image': intra_round_ref_img,
+                }
+
+                img_calibrated = self._run_pipeline(raw_vol, seq_calibration, ctx)
+
+                if r_id == 1:
+                    inter_round_ref_cache[c_id] = img_calibrated.copy()
+
+                if intra_round_ref_img is None:
+                    intra_round_ref_img = img_calibrated.copy()
+
+                final_vol = self._run_pipeline(img_calibrated, seq_extraction, ctx)
+                final_u8 = img_as_ubyte(np.clip(final_vol, 0, 1))
+                output_path = self._save_stage_clean(final_u8, output_root, fov_id, r_id, c_id)
+                output_files.append(str(output_path))
+
+        finished_at = self._utc_now()
+        duration_ms = round((time.perf_counter() - start_time) * 1000.0, 3)
+        return {
+            "provider": "native",
+            "segment_index": segment_index,
+            "duration_ms": duration_ms,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "input_contract": {
+                "raw_data_path": str(input_root),
+                "filename_pattern": input_filename_pattern,
+                "rounds_processed": final_queue,
+                "target_rounds": list(target_rounds) if target_rounds is not None else None,
+            },
+            "pipeline_split": {
+                "calibration_steps": [step.method for step in seq_calibration],
+                "extraction_steps": [step.method for step in seq_extraction],
+            },
+            "raw_sequence": [
+                {
+                    "index": index,
+                    "method": step.method,
+                    "provider": step.provider,
+                    "params": dict(step.params),
+                }
+                for index, step in enumerate(full_seq)
+            ],
+            "output_files": output_files,
+        }
 
     def _split_sequence(self, full_seq: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
         """
@@ -274,8 +596,167 @@ class DataSanitizer:
             if func:
                 current_data = func(current_data, step.params, context)
             # else: warning handled in upper logic or crash
-            
+        
         return current_data
+
+    def _native_sanitize_fov(self, fov_id: int, target_rounds: Optional[List[int]] = None) -> Dict[str, Any]:
+        full_seq = self.cfg.pipeline.preprocessing.sequence
+        if not full_seq:
+            print("Warning: Pipeline sequence is empty.")
+            return {
+                "version": PREPROCESSING_PROVENANCE_VERSION,
+                "generated_at": self._utc_now(),
+                "fov_id": int(fov_id),
+                "backend": "native_pystar",
+                "provider": "native",
+                "duration_ms": 0.0,
+                "started_at": None,
+                "finished_at": None,
+                "input_contract": {
+                    "raw_data_path": str(self.cfg.dataset.raw_data_path),
+                    "filename_pattern": self.cfg.dataset.filename_pattern,
+                    "target_rounds": list(target_rounds) if target_rounds is not None else None,
+                    "rounds_processed": [],
+                },
+                "pipeline_split": {
+                    "calibration_steps": [],
+                    "extraction_steps": [],
+                },
+                "raw_sequence": [],
+                "output_files": [],
+            }
+
+        seq_calibration, seq_extraction = self._split_sequence(full_seq)
+        rounds_to_process = self._resolve_rounds_to_process(target_rounds)
+        if target_rounds is not None:
+            print(f" -> DEBUG: Only processing user-selected rounds: {rounds_to_process}")
+        final_queue = self._ordered_round_queue(rounds_to_process)
+
+        print(f" -> Pipeline Split: {len(seq_calibration)} Calibration steps + {len(seq_extraction)} Extraction steps")
+
+        inter_round_ref_cache = {}
+        started_at = self._utc_now()
+        start_time = time.perf_counter()
+        output_files: List[str] = []
+
+        for r_id in final_queue:
+            print(f" -> Processing Round {r_id}...")
+            intra_round_ref_img = None
+            roles = self.cfg.dataset.channel_roles
+            channels_in_round = self.cfg.dataset.round_structure[r_id]
+            seq_channels = sorted([c for c in channels_in_round if roles.get(c) == 'seq'])
+
+            for c_id in seq_channels:
+                path = self.loader._get_path(fov_id, r_id, c_id)
+                raw_vol = self.loader._lazy_load_tiff(path).compute()
+                ctx = {
+                    'ref_round_image': inter_round_ref_cache.get(c_id),
+                    'ref_channel_image': intra_round_ref_img,
+                }
+
+                img_calibrated = self._run_pipeline(raw_vol, seq_calibration, ctx)
+
+                if r_id == 1:
+                    inter_round_ref_cache[c_id] = img_calibrated.copy()
+
+                if intra_round_ref_img is None:
+                    intra_round_ref_img = img_calibrated.copy()
+
+                final_vol = self._run_pipeline(img_calibrated, seq_extraction, ctx)
+                final_u8 = img_as_ubyte(np.clip(final_vol, 0, 1))
+                output_path = self._save_clean(final_u8, fov_id, r_id, c_id)
+                output_files.append(str(output_path))
+
+        finished_at = self._utc_now()
+        duration_ms = round((time.perf_counter() - start_time) * 1000.0, 3)
+        return self._build_native_preprocessing_provenance(
+            fov_id=fov_id,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_ms=duration_ms,
+            rounds_processed=final_queue,
+            calibration_steps=seq_calibration,
+            extraction_steps=seq_extraction,
+            output_files=output_files,
+            target_rounds=target_rounds,
+        )
+
+    def _provider_dispatch_sanitize_fov(self, fov_id: int, target_rounds: Optional[List[int]] = None) -> Dict[str, Any]:
+        full_seq = self.cfg.pipeline.preprocessing.sequence
+        if not full_seq:
+            print("Warning: Pipeline sequence is empty.")
+            return self._build_provider_dispatch_provenance(
+                fov_id=fov_id,
+                started_at=self._utc_now(),
+                finished_at=self._utc_now(),
+                duration_ms=0.0,
+                rounds_processed=[],
+                target_rounds=target_rounds,
+                output_files=[],
+                segment_records=[],
+            )
+
+        rounds_to_process = self._resolve_rounds_to_process(target_rounds)
+        segment_records: List[Dict[str, Any]] = []
+        started_at = self._utc_now()
+        start_time = time.perf_counter()
+
+        with TemporaryDirectory(prefix=f"pystar_preprocessing_fov{fov_id}_") as tmpdir:
+            current_input_root = Path(self.cfg.dataset.raw_data_path)
+            current_input_pattern = self.cfg.dataset.filename_pattern
+
+            for segment_index, (provider, steps) in enumerate(self._sequence_segments(full_seq)):
+                stage_root = Path(tmpdir) / f"segment_{segment_index}_{provider}"
+                if provider == "native":
+                    segment_record = self._run_native_sequence_segment(
+                        fov_id,
+                        steps,
+                        input_root=current_input_root,
+                        input_filename_pattern=current_input_pattern,
+                        output_root=stage_root,
+                        target_rounds=target_rounds,
+                        segment_index=segment_index,
+                    )
+                elif provider == "matlab":
+                    if self._matlab_backend is None:
+                        self._matlab_backend = MATLABPreprocessingBackend(self.cfg)
+                    matlab_output_root = Path(tmpdir) / f"segment_{segment_index}_{provider}_flat"
+                    segment_record = self._matlab_backend.execute_sequence(
+                        fov_id,
+                        sequence=steps,
+                        input_root=current_input_root,
+                        input_filename_pattern=current_input_pattern,
+                        output_dir=matlab_output_root,
+                        target_rounds=target_rounds,
+                        segment_label=f"segment_{segment_index}",
+                    )
+                    self._materialize_flat_outputs_to_stage(
+                        matlab_output_root,
+                        stage_root,
+                        fov_id,
+                        rounds_to_process,
+                    )
+                else:
+                    raise ValueError(f"Unsupported preprocessing provider: {provider!r}")
+
+                segment_records.append(segment_record)
+                current_input_root = stage_root
+                current_input_pattern = self.cfg.dataset.filename_pattern
+
+            output_files = self._copy_stage_outputs_to_clean_dir(current_input_root, fov_id, rounds_to_process)
+
+        finished_at = self._utc_now()
+        duration_ms = round((time.perf_counter() - start_time) * 1000.0, 3)
+        return self._build_provider_dispatch_provenance(
+            fov_id=fov_id,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_ms=duration_ms,
+            rounds_processed=rounds_to_process,
+            target_rounds=target_rounds,
+            output_files=output_files,
+            segment_records=segment_records,
+        )
 
     def sanitize_fov(self, fov_id: int, target_rounds: Optional[List[int]] = None):
         """
@@ -283,90 +764,17 @@ class DataSanitizer:
             如果提供，只处理列表中的轮次 (e.g. [1])。用于快速测试参数。
         """
         print(f"[{'='*20} Sanitizing FOV {fov_id} {'='*20}]")
-        
-        full_seq = self.cfg.pipeline.preprocessing.sequence
-        if not full_seq:
-            print("Warning: Pipeline sequence is empty.")
-            return
 
-        seq_calibration, seq_extraction = self._split_sequence(full_seq)
-        
-        # 1. 确定要处理哪些轮次
-        all_config_rounds = sorted(self.cfg.dataset.round_structure.keys())
-        
-        if target_rounds is not None:
-            # 取交集，防止用户输入不存在的轮次
-            rounds_to_process = sorted([r for r in target_rounds if r in all_config_rounds])
-            if not rounds_to_process:
-                print(f"Warning: No valid rounds found in target_rounds: {target_rounds}")
-                return
-            print(f" -> DEBUG: Only processing user-selected rounds: {rounds_to_process}")
+        providers_used = set(self.cfg.pipeline.preprocessing_providers_used())
+        if providers_used == {"native"}:
+            provenance = self._native_sanitize_fov(fov_id, target_rounds=target_rounds)
         else:
-            rounds_to_process = all_config_rounds
+            provenance = self._provider_dispatch_sanitize_fov(fov_id, target_rounds=target_rounds)
 
-        # 2. 调度逻辑：确保 Reference Round (R1) 总是排在队伍最前面
-        # 只有当 R1 真的在我们要处理的列表里时，才应用这个排序
-        ref_round_id = 1 # 或者从 config 读
-        
-        final_queue = []
-        
-        # 如果 R1 在任务清单里，先加它
-        if ref_round_id in rounds_to_process:
-            final_queue.append(ref_round_id)
-            
-        # 再加其他的
-        for r_id in rounds_to_process:
-            if r_id != ref_round_id:
-                final_queue.append(r_id)
+        write_preprocessing_provenance(self._base_output_dir(), fov_id, provenance)
+        return provenance
 
-        # 3. 开始执行
-        print(f" -> Pipeline Split: {len(seq_calibration)} Calibration steps + {len(seq_extraction)} Extraction steps")
-        
-        # 全局缓存 (Inter-round Ref)
-        inter_round_ref_cache = {}
-
-        for r_id in final_queue:
-            print(f" -> Processing Round {r_id}...")
-            
-            # 局部缓存 (Intra-round Ref - Reset for each round)
-            intra_round_ref_img = None
-            
-            # 获取该轮的通道
-            roles = self.cfg.dataset.channel_roles
-            channels_in_round = self.cfg.dataset.round_structure[r_id]
-            # 只处理 seq 通道
-            seq_channels = sorted([c for c in channels_in_round if roles.get(c) == 'seq'])
-            
-            for c_id in seq_channels:
-                # 1. Load
-                path = self.loader._get_path(fov_id, r_id, c_id)
-                raw_vol = self.loader._lazy_load_tiff(path).compute()
-                
-                # 2. Context
-                ctx = {
-                    'ref_round_image': inter_round_ref_cache.get(c_id),
-                    'ref_channel_image': intra_round_ref_img
-                }
-
-                # === Phase A: Calibration ===
-                img_calibrated = self._run_pipeline(raw_vol, seq_calibration, ctx)
-                
-                # Update Caches
-                if r_id == ref_round_id:
-                    inter_round_ref_cache[c_id] = img_calibrated.copy()
-                
-                if intra_round_ref_img is None:
-                    intra_round_ref_img = img_calibrated.copy()
-
-                # === Phase B: Extraction ===
-                final_vol = self._run_pipeline(img_calibrated, seq_extraction, ctx)
-
-                # 3. Save
-                final_u8 = img_as_ubyte(np.clip(final_vol, 0, 1))
-                self._save_clean(final_u8, fov_id, r_id, c_id)
-    def _save_clean(self, img, f, r, c):
-        base_dir = Path(self.cfg.pipeline.output.directory)
-        paths = get_fov_output_structure(base_dir, f)
-        out_path = paths['cleaned'] / f"clean_fov_{f}_round_{r}_ch_{c}.tif"
+    def _save_clean(self, img, f, r, c) -> Path:
+        out_path = self.get_clean_path(f, r, c)
         tifffile.imwrite(out_path, img, compression='zlib')
-
+        return out_path

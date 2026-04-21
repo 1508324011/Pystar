@@ -1,0 +1,49 @@
+{
+  "package_name": "pystar_preprocessing",
+  "entrypoint": "pystar_preprocess_entry",
+  "required_files": [
+    {
+      "name": "pystar_preprocess_entry.m",
+      "source_path": "repo-local entrypoint",
+      "role": "python-facing preprocessing entrypoint",
+      "required": true
+    },
+    {
+      "name": "test_LoadImageStacks_zf.m",
+      "source_path": "matlab_script/STATES-matlab-tissue/test_LoadImageStacks_zf.m",
+      "role": "reviewable stack loader adapted for extracted preprocessing runtime",
+      "required": true
+    },
+    {
+      "name": "new_LoadMultipageTiff.m",
+      "source_path": "matlab_script/STATES-matlab-tissue/new_LoadMultipageTiff.m",
+      "role": "multipage TIFF loader",
+      "required": true
+    },
+    {
+      "name": "new_MinMaxNorm.m",
+      "source_path": "matlab_script/STATES-matlab-tissue/new_MinMaxNorm.m",
+      "role": "min-max normalization",
+      "required": true
+    },
+    {
+      "name": "new_EqualizeHist3D.m",
+      "source_path": "matlab_script/STATES-matlab-tissue/new_EqualizeHist3D.m",
+      "role": "3D histogram equalization",
+      "required": true
+    },
+    {
+      "name": "new_MorphologicalReconstruction.m",
+      "source_path": "matlab_script/STATES-matlab-tissue/new_MorphologicalReconstruction.m",
+      "role": "morphological background reconstruction",
+      "required": true
+    },
+    {
+      "name": "SaveSingleTiff.m",
+      "source_path": "matlab_script/STATES-matlab-tissue/SaveSingleTiff.m",
+      "role": "clean-data TIFF writer",
+      "required": true
+    }
+  ],
+  "optional_files": []
+}
