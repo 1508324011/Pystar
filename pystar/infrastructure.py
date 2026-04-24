@@ -685,6 +685,7 @@ class WeightedRescueConfig(BaseModel):
 
 class DecodingConfig(BaseModel):
     quality_threshold: float = 0.5
+    gating_mode: Literal["pattern_first", "legacy_membership_first"] = "pattern_first"
     max_soft_penalty: Optional[float] = None
     rules: List[DecodingRuleConfig] = Field(default_factory=list)
     round_channel_bias: Dict[int, List[float]] = Field(default_factory=dict)
@@ -731,6 +732,15 @@ class PipelineConfig(BaseModel):
             )
 
         return self
+
+    def qc_images_enabled(self) -> bool:
+        """Backward-compatible effective switch for QC image generation.
+
+        `pipeline.qc.enable` is treated as the semantic master switch, while
+        `pipeline.output.save_qc_images` remains the legacy output-level guard.
+        QC image generation is enabled only when both are true.
+        """
+        return bool(self.qc.enable) and bool(self.output.save_qc_images)
 
     def preprocessing_providers_used(self) -> List[str]:
         used = {step.provider for step in self.preprocessing.sequence}
