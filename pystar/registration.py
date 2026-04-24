@@ -20,7 +20,7 @@ import warnings
 from .infrastructure import ExperimentConfig
 from .io import ImageLoader
 from .io import get_fov_output_structure
-from .io import PROVENANCE_VERSION, build_execution_envelope, build_release_contract, save_transform_manifest
+from .io import PROVENANCE_VERSION, build_execution_envelope, build_release_contract, save_transform_manifest, persist_flow_3d_sidecar
 from .matlab_registration import MATLABGlobalRegistrationBackend
 from .tiling import (
     TileLayout,
@@ -550,6 +550,7 @@ def composite_transform_2d(
 
     return shifted.astype(np.float32)
 
+
 def apply_warp_field_3d(img_3d: FloatArray, flow_3d: FloatArray) -> FloatArray:
     """
     应用 3D 变形场
@@ -565,9 +566,11 @@ def apply_warp_field_3d(img_3d: FloatArray, flow_3d: FloatArray) -> FloatArray:
     """
     nz, ny, nx = img_3d.shape
     
-    # 创建网格坐标
     z_coords, y_coords, x_coords = np.meshgrid(
-        np.arange(nz), np.arange(ny), np.arange(nx), indexing='ij'
+        np.arange(nz, dtype=np.float32),
+        np.arange(ny, dtype=np.float32),
+        np.arange(nx, dtype=np.float32),
+        indexing='ij'
     )
     
     # 应用位移（逆向映射）
@@ -578,7 +581,7 @@ def apply_warp_field_3d(img_3d: FloatArray, flow_3d: FloatArray) -> FloatArray:
     # 插值
     warped = map_coordinates(
         img_3d,
-        np.array([new_z, new_y, new_x]),
+        np.array([new_z, new_y, new_x], dtype=np.float32),
         order=1,
         mode='constant',
         cval=0,
@@ -1043,6 +1046,15 @@ class RegistrationEngine:
         base_dir = Path(self.cfg.pipeline.output.directory)
         save_transform_manifest(base_dir, fov_id, transforms, provenance=provenance)
 
+    def _spill_round_flow_3d(self, fov_id: int, round_id: int, round_transform: Dict[str, Any]) -> None:
+        flow_3d = round_transform.get('flow_3d')
+        if flow_3d is None or not isinstance(flow_3d, np.ndarray):
+            return
+
+        base_dir = Path(self.cfg.pipeline.output.directory)
+        descriptor = persist_flow_3d_sidecar(base_dir, fov_id, int(round_id), np.asarray(flow_3d))
+        round_transform['flow_3d'] = descriptor
+
     def _annotate_transform_semantics(self, transforms: Dict[int, Dict[str, Any]]) -> None:
         semantics = self.cfg.pipeline.registration.field_semantics.as_dict()
         recorded_at = _iso_utc_now()
@@ -1062,44 +1074,58 @@ class RegistrationEngine:
         
     def _load_combined_clean_volume(self, fov_id: int, round_id: int) -> FloatArray:
         """
-        加载该轮次所有 Sequence 通道的 Clean Data，
-        并计算 Channel-wise Max Projection，生成一个 3D 体积用于配准。
-        
+        加载该轮次用于 registration 的 clean data 体积。
+
+        - method='mip_all_channels'：读取指定 seq 通道并在 channel 轴做 max projection
+        - method='single_channel'：只读取单个 seq 通道，避免不必要的堆叠峰值内存
+
         Returns:
-            volume_3d: (Z, Y, X) float32
+            volume_3d: (Z, Y, X)
         """
-        # 1. 实例化 Loader (如果类初始化时没存 loader，这里实例化一个)
         loader = ImageLoader(self.cfg)
-        
-        # 2. 找出该轮次的 Seq 通道
-        # 我们的逻辑是：用所有经过清洗的测序信号来做配准，这样信号最丰富
+
         round_structure = self.cfg.dataset.round_structure.get(int(round_id))
         if round_structure is None:
             raise KeyError(f"Round {round_id} is missing from dataset.round_structure")
-            
+
         roles = self.cfg.dataset.channel_roles
-        
-        # 过滤：既在该轮次存在，又是 seq 类型的通道
-        target_channels = [c for c in round_structure if roles.get(c) == 'seq']
-        
-        if not target_channels:
+        seq_channels = [c for c in round_structure if roles.get(c) == 'seq']
+        if not seq_channels:
             raise ValueError(f"Round {round_id} has no SEQ channels for registration!")
 
-        # 3. 加载并合成
-        # print(f"   (Loading Clean Data for Round {round_id}: {target_channels})")
-        vol_list = []
-        for c in target_channels:
-            # 这是一个 IO 操作，直接读 clean_data 目录
-            vol = loader.load_clean_image(fov_id, round_id, c)
-            vol_list.append(vol)
-            
-        # Stack -> (C, Z, Y, X)
-        stack = np.stack(vol_list, axis=0)
-        
-        # Max Project along Channel Axis -> (Z, Y, X)
-        # 这就是这一轮的"总信号图"
-        combined_vol = np.max(stack, axis=0)
-        
+        source_cfg = self.reg_cfg.source
+        if source_cfg.method == 'single_channel':
+            target_channel = int(source_cfg.single_channel_id)
+            if target_channel not in seq_channels:
+                raise ValueError(
+                    f"registration.source.single_channel_id={target_channel} is not a seq channel available in round {round_id}: {seq_channels}"
+                )
+            return loader.load_clean_image(fov_id, round_id, target_channel)
+
+        if source_cfg.method != 'mip_all_channels':
+            raise ValueError(f"Unsupported registration.source.method: {source_cfg.method!r}")
+
+        requested_channels = [int(c) for c in (source_cfg.mip_channels or [])]
+        target_channels = [c for c in requested_channels if c in seq_channels]
+        if not target_channels:
+            raise ValueError(
+                f"registration.source.mip_channels={requested_channels} does not overlap with available seq channels in round {round_id}: {seq_channels}"
+            )
+
+        if len(target_channels) == 1:
+            return loader.load_clean_image(fov_id, round_id, target_channels[0])
+
+        first_channel, *remaining_channels = target_channels
+        combined_vol = np.array(
+            loader.load_clean_image(fov_id, round_id, first_channel),
+            copy=True,
+        )
+        for channel_id in remaining_channels:
+            np.maximum(
+                combined_vol,
+                loader.load_clean_image(fov_id, round_id, channel_id),
+                out=combined_vol,
+            )
         return combined_vol
 
     def _register_round_native(
@@ -1732,6 +1758,7 @@ class RegistrationEngine:
             round_transform['round_id'] = int(r_id)
             if backend_metadata is not None:
                 round_transform['backend_metadata'] = backend_metadata
+            self._spill_round_flow_3d(fov_id, int(r_id), round_transform)
             transforms[r_id] = round_transform
             round_summary[int(r_id)] = {
                 'status': 'completed',
@@ -1741,7 +1768,7 @@ class RegistrationEngine:
             if backend_metadata is not None:
                 backend_round_metadata[int(r_id)] = backend_metadata
 
-            if self.cfg.pipeline.output.save_qc_images:
+            if self.cfg.pipeline.qc_images_enabled():
                 base_dir = Path(self.cfg.pipeline.output.directory)
                 paths = get_fov_output_structure(base_dir, fov_id)
                 qc_dir = paths["qc"]

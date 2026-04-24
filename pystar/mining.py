@@ -16,7 +16,13 @@ from .extraction_utils import (
     map_spot_coordinates,
     warp_volume_to_reference,
 )
-from .io import ImageLoader, get_matlab_stage_contract, load_transform_manifest, validate_scope_contract
+from .io import (
+    ImageLoader,
+    get_matlab_stage_contract,
+    load_transform_manifest,
+    materialize_round_transform_entry,
+    validate_scope_contract,
+)
 from .io import get_fov_output_structure
 from .matlab_extraction import MATLABExtractionBackend
 # visualization 模块保留引用，按需导入即可
@@ -71,7 +77,16 @@ class SignalMiner:
         
     def _load_transforms(self, fov_id: int) -> dict[Any, Any]:
         base_dir = Path(self.cfg.pipeline.output.directory)
-        return load_transform_manifest(base_dir, fov_id, load_provenance=True)
+        return load_transform_manifest(
+            base_dir,
+            fov_id,
+            load_provenance=True,
+            hydrate_flow_3d=False,
+        )
+
+    def _materialize_round_transform(self, fov_id: int, round_id: int, transform_data: dict[str, Any]) -> dict[str, Any]:
+        base_dir = Path(self.cfg.pipeline.output.directory)
+        return materialize_round_transform_entry(base_dir, fov_id, round_id, transform_data)
 
     def _validate_scope_contract(self, fov_id: int, transforms: dict[Any, Any]) -> dict[str, Any]:
         provenance = transforms.get('_provenance')
@@ -327,7 +342,7 @@ class SignalMiner:
                 if r_id not in transforms:
                     raise KeyError(f"Missing transform entry for round {r_id} in FOV {fov_id} transform manifest")
 
-                trans_data = transforms[r_id]
+                trans_data = self._materialize_round_transform(fov_id, r_id, transforms[r_id])
                 self._validate_round_transform_for_mode(r_id, trans_data, transform_application_mode)
 
                 current_round_channels = self.cfg.dataset.round_structure[r_id]
@@ -360,6 +375,8 @@ class SignalMiner:
                     del img_vol
                     pbar.update(1)
 
+                del trans_data
+
         # 4. Save
         out_name = paths["extraction"] / f"intensity_matrix_fov_{fov_id}.npy"
         np.save(out_name, intensity_matrix)
@@ -381,7 +398,7 @@ class SignalMiner:
 
     def _generate_qc(self, matrix, spots_df, rounds, channels, fov_id):
         # 剥离出来的 QC 逻辑，保持主流程清晰
-        if not self.cfg.pipeline.output.save_qc_images:
+        if not self.cfg.pipeline.qc_images_enabled():
             return
 
         plot_spot_traces = import_module('pystar.visualization').plot_spot_traces

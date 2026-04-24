@@ -666,7 +666,12 @@ def summarize_delivered_capability(
         flow_2d = transform_data.get("flow_2d")
         flow_3d = transform_data.get("flow_3d")
         has_flow_2d = isinstance(flow_2d, np.ndarray)
-        has_flow_3d = isinstance(flow_3d, np.ndarray)
+        has_flow_3d = isinstance(flow_3d, np.ndarray) or (
+            isinstance(flow_3d, Mapping)
+            and flow_3d.get("storage") == FLOW_3D_SIDECAR_STORAGE
+            and isinstance(flow_3d.get("path"), str)
+            and bool(flow_3d.get("path"))
+        )
         is_reference_round = bool(transform_data.get("is_reference_round", round_id == reference_round))
 
         if has_flow_2d:
@@ -2119,6 +2124,45 @@ def _ensure_round_field_semantics(
     )
 
 
+def persist_flow_3d_sidecar(
+    base_dir: Path,
+    fov_id: int,
+    round_id: int,
+    flow_3d: NDArray[Any],
+) -> Dict[str, Any]:
+    """
+    将单个 round 的 dense `flow_3d` 立即写成 sidecar，并返回 manifest descriptor。
+
+    这个 helper 用于 registration 过程中“每轮即写即释放”的内存优化，也可被
+    `save_transform_manifest()` 复用，保证 sidecar 命名与描述符格式一致。
+    """
+    _ = get_fov_output_structure(base_dir, fov_id)
+    transforms_dir = get_transform_manifest_path(base_dir, fov_id).parent
+
+    flow_3d_arr = np.asarray(flow_3d)
+    if flow_3d_arr.ndim != 4:
+        raise ValueError(
+            f"flow_3d for round {round_id} must be 4D [3, Z, Y, X], got shape {flow_3d_arr.shape}"
+        )
+
+    sidecar_name = get_flow_3d_sidecar_filename(fov_id, round_id)
+    sidecar_path = transforms_dir / sidecar_name
+    temp_path = sidecar_path.with_suffix(f"{sidecar_path.suffix}.tmp")
+    if temp_path.exists():
+        temp_path.unlink()
+
+    with temp_path.open("wb") as handle:
+        np.save(handle, flow_3d_arr, allow_pickle=False)
+    temp_path.replace(sidecar_path)
+
+    return {
+        "storage": FLOW_3D_SIDECAR_STORAGE,
+        "path": sidecar_name,
+        "shape": list(flow_3d_arr.shape),
+        "dtype": str(flow_3d_arr.dtype),
+    }
+
+
 def save_transform_manifest(
     base_dir: Path, 
     fov_id: int, 
@@ -2131,6 +2175,10 @@ def save_transform_manifest(
     主 manifest 仍保持 `transforms_fov_{fov_id}.npy` 这一既有入口，
     每个 round 的 `flow_3d` 字段在磁盘上存为 sidecar 描述符，
     由下游 loader 再物化回 ndarray。
+
+    兼容两种输入：
+    - `flow_3d` 仍是内存中的 ndarray（旧路径）
+    - `flow_3d` 已经是 sidecar descriptor（registration 每轮即写即释放的新路径）
     
     Parameters
     ----------
@@ -2155,7 +2203,7 @@ def save_transform_manifest(
     transforms_dir = manifest_path.parent
 
     manifest_payload: Dict[Any, Any] = {}
-    sidecar_payloads: Dict[Path, NDArray[Any]] = {}
+    referenced_sidecars: set[Path] = set()
 
     for round_key, transform_data in transforms.items():
         if not _is_round_transform_entry(transform_data):
@@ -2175,27 +2223,45 @@ def save_transform_manifest(
         flow_3d = round_payload.get("flow_3d")
 
         if isinstance(flow_3d, Mapping):
-            raise ValueError("save_transform_manifest expects materialized flow_3d arrays, not manifest descriptors")
+            storage_kind = flow_3d.get("storage")
+            if storage_kind != FLOW_3D_SIDECAR_STORAGE:
+                raise ValueError(
+                    f"Unsupported flow_3d storage kind for round {round_id}: {storage_kind!r}"
+                )
+
+            sidecar_rel = flow_3d.get("path")
+            if not isinstance(sidecar_rel, str) or not sidecar_rel:
+                raise ValueError(
+                    f"flow_3d manifest for round {round_id} is missing a valid sidecar path"
+                )
+
+            sidecar_rel_path = Path(sidecar_rel)
+            if sidecar_rel_path.is_absolute():
+                raise ValueError(f"flow_3d sidecar path must stay relative to transforms/: {sidecar_rel}")
+            if sidecar_rel_path.parent != Path('.'):
+                raise ValueError(
+                    f"flow_3d sidecar path must be a direct filename under transforms/: {sidecar_rel}"
+                )
+
+            sidecar_path = transforms_dir / sidecar_rel_path
+            if not sidecar_path.exists():
+                raise FileNotFoundError(
+                    f"flow_3d sidecar referenced by transform manifest is missing: {sidecar_path}"
+                )
+
+            referenced_sidecars.add(sidecar_path)
+            round_payload["flow_3d"] = dict(flow_3d)
+            manifest_payload[round_id] = round_payload
+            continue
 
         if flow_3d is None:
             round_payload.setdefault("flow_3d", None)
             manifest_payload[round_id] = round_payload
             continue
 
-        flow_3d_arr = np.asarray(flow_3d)
-        if flow_3d_arr.ndim != 4:
-            raise ValueError(f"flow_3d for round {round_id} must be 4D [3, Z, Y, X], got shape {flow_3d_arr.shape}")
-
-        sidecar_name = get_flow_3d_sidecar_filename(fov_id, round_id)
-        sidecar_path = transforms_dir / sidecar_name
-        sidecar_payloads[sidecar_path] = flow_3d_arr
-
-        round_payload["flow_3d"] = {
-            "storage": FLOW_3D_SIDECAR_STORAGE,
-            "path": sidecar_name,
-            "shape": list(flow_3d_arr.shape),
-            "dtype": str(flow_3d_arr.dtype),
-        }
+        descriptor = persist_flow_3d_sidecar(base_dir, fov_id, round_id, np.asarray(flow_3d))
+        referenced_sidecars.add(transforms_dir / cast(str, descriptor["path"]))
+        round_payload["flow_3d"] = descriptor
         manifest_payload[round_id] = round_payload
 
     if provenance is not None:
@@ -2210,10 +2276,8 @@ def save_transform_manifest(
         summary_markdown = build_provenance_summary_markdown(fov_id, manifest_payload, provenance)
 
     for stale_path in transforms_dir.glob(f"transforms_fov_{fov_id}_round_*_flow_3d.npy"):
-        stale_path.unlink()
-
-    for sidecar_path, flow_3d_arr in sidecar_payloads.items():
-        np.save(sidecar_path, flow_3d_arr, allow_pickle=False)
+        if stale_path not in referenced_sidecars:
+            stale_path.unlink()
 
     np.save(manifest_path, cast(Any, manifest_payload))
     if summary_markdown is not None:
@@ -2221,9 +2285,117 @@ def save_transform_manifest(
     return manifest_path
 
 
-def load_transform_manifest(base_dir: Path, fov_id: int, load_provenance: bool = False) -> Dict[Any, Any]:
+def _validate_flow_3d_sidecar_descriptor(
+    flow_3d: Mapping[str, Any],
+    *,
+    round_key: Any,
+    transforms_dir: Path,
+) -> tuple[Dict[str, Any], Path]:
+    storage_kind = flow_3d.get("storage")
+    if storage_kind != FLOW_3D_SIDECAR_STORAGE:
+        raise ValueError(f"Unsupported flow_3d storage kind for round {round_key}: {storage_kind!r}")
+
+    sidecar_rel = flow_3d.get("path")
+    if not isinstance(sidecar_rel, str) or not sidecar_rel:
+        raise ValueError(f"flow_3d manifest for round {round_key} is missing a valid sidecar path")
+
+    sidecar_rel_path = Path(sidecar_rel)
+    if sidecar_rel_path.is_absolute():
+        raise ValueError(f"flow_3d sidecar path must stay relative to transforms/: {sidecar_rel}")
+    if sidecar_rel_path.parent != Path('.'):
+        raise ValueError(
+            f"flow_3d sidecar path must be a direct filename under transforms/: {sidecar_rel}"
+        )
+
+    sidecar_path = transforms_dir / sidecar_rel_path
+    if not sidecar_path.exists():
+        raise FileNotFoundError(
+            f"flow_3d sidecar referenced by transform manifest is missing: {sidecar_path}"
+        )
+
+    return dict(flow_3d), sidecar_path
+
+
+def _load_flow_3d_sidecar_array(
+    descriptor: Mapping[str, Any],
+    *,
+    round_key: Any,
+    sidecar_path: Path,
+) -> NDArray[Any]:
+    flow_3d_arr = np.load(sidecar_path, allow_pickle=False)
+    if flow_3d_arr.ndim != 4:
+        raise ValueError(f"flow_3d sidecar for round {round_key} must be 4D, got shape {flow_3d_arr.shape}")
+
+    expected_shape = descriptor.get("shape")
+    if expected_shape is not None and not isinstance(expected_shape, (list, tuple)):
+        raise ValueError(f"flow_3d sidecar shape metadata for round {round_key} must be a list/tuple")
+    if expected_shape is not None and tuple(expected_shape) != tuple(flow_3d_arr.shape):
+        raise ValueError(
+            f"flow_3d sidecar shape mismatch for round {round_key}: "
+            f"manifest={expected_shape}, actual={list(flow_3d_arr.shape)}"
+        )
+
+    expected_dtype = descriptor.get("dtype")
+    if expected_dtype is not None and str(flow_3d_arr.dtype) != expected_dtype:
+        raise ValueError(
+            f"flow_3d sidecar dtype mismatch for round {round_key}: "
+            f"manifest={expected_dtype}, actual={flow_3d_arr.dtype}"
+        )
+
+    return cast(NDArray[Any], flow_3d_arr)
+
+
+def materialize_round_transform_entry(
+    base_dir: Path,
+    fov_id: int,
+    round_id: int,
+    transform_data: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Materialize a single round transform entry from persisted manifest metadata.
+
+    This is used by extraction/mining paths that want to keep the manifest in a
+    descriptor-only form and hydrate `flow_3d` just-in-time for the current
+    round, instead of restoring every round-level sidecar into RAM up front.
     """
-    加载 transform manifest，并把 round-level `flow_3d` sidecar 物化回 ndarray。
+    manifest_path = get_transform_manifest_path(base_dir, fov_id)
+    transforms_dir = manifest_path.parent
+
+    round_payload = dict(transform_data)
+    round_payload.setdefault("flow_2d", None)
+    _ensure_round_field_semantics(
+        round_payload,
+        field_name=f"transform round {round_id} _semantics",
+    )
+
+    flow_3d = round_payload.get("flow_3d")
+    if isinstance(flow_3d, Mapping):
+        descriptor, sidecar_path = _validate_flow_3d_sidecar_descriptor(
+            flow_3d,
+            round_key=round_id,
+            transforms_dir=transforms_dir,
+        )
+        round_payload["flow_3d"] = _load_flow_3d_sidecar_array(
+            descriptor,
+            round_key=round_id,
+            sidecar_path=sidecar_path,
+        )
+    elif flow_3d is not None and not isinstance(flow_3d, np.ndarray):
+        raise ValueError(f"Unsupported flow_3d payload type for round {round_id}: {type(flow_3d)}")
+    else:
+        round_payload.setdefault("flow_3d", None)
+
+    return round_payload
+
+
+def load_transform_manifest(
+    base_dir: Path,
+    fov_id: int,
+    load_provenance: bool = False,
+    *,
+    hydrate_flow_3d: bool = True,
+) -> Dict[Any, Any]:
+    """
+    加载 transform manifest；默认会把 round-level `flow_3d` sidecar 物化回 ndarray。
     
     Parameters
     ----------
@@ -2234,11 +2406,18 @@ def load_transform_manifest(base_dir: Path, fov_id: int, load_provenance: bool =
     load_provenance : bool
         If True, include provenance in returned dict under key '_provenance'.
         If False (default), provenance is validated but not returned (backward compatibility).
+    hydrate_flow_3d : bool
+        If True (default), eagerly materialize persisted round-level `flow_3d`
+        sidecars back into ndarrays. If False, preserve validated sidecar
+        descriptors in the returned manifest so callers can hydrate each round
+        on demand.
         
     Returns
     -------
     dict
         Transform data. If load_provenance=True, includes '_provenance' key.
+        When ``hydrate_flow_3d=False``, non-reference rounds may keep
+        descriptor-style `flow_3d` payloads instead of dense ndarrays.
     """
     manifest_path = get_transform_manifest_path(base_dir, fov_id)
     if not manifest_path.exists():
@@ -2280,49 +2459,19 @@ def load_transform_manifest(base_dir: Path, fov_id: int, load_provenance: bool =
         flow_3d = round_payload.get("flow_3d")
 
         if isinstance(flow_3d, Mapping):
-            storage_kind = flow_3d.get("storage")
-            if storage_kind != FLOW_3D_SIDECAR_STORAGE:
-                raise ValueError(f"Unsupported flow_3d storage kind for round {round_key}: {storage_kind!r}")
-
-            sidecar_rel = flow_3d.get("path")
-            if not isinstance(sidecar_rel, str) or not sidecar_rel:
-                raise ValueError(f"flow_3d manifest for round {round_key} is missing a valid sidecar path")
-
-            sidecar_rel_path = Path(sidecar_rel)
-            if sidecar_rel_path.is_absolute():
-                raise ValueError(f"flow_3d sidecar path must stay relative to transforms/: {sidecar_rel}")
-            if sidecar_rel_path.parent != Path('.'):
-                raise ValueError(
-                    f"flow_3d sidecar path must be a direct filename under transforms/: {sidecar_rel}"
+            descriptor, sidecar_path = _validate_flow_3d_sidecar_descriptor(
+                flow_3d,
+                round_key=round_key,
+                transforms_dir=transforms_dir,
+            )
+            if hydrate_flow_3d:
+                round_payload["flow_3d"] = _load_flow_3d_sidecar_array(
+                    descriptor,
+                    round_key=round_key,
+                    sidecar_path=sidecar_path,
                 )
-
-            sidecar_path = transforms_dir / sidecar_rel_path
-            if not sidecar_path.exists():
-                raise FileNotFoundError(
-                    f"flow_3d sidecar referenced by transform manifest is missing: {sidecar_path}"
-                )
-
-            flow_3d_arr = np.load(sidecar_path, allow_pickle=False)
-            if flow_3d_arr.ndim != 4:
-                raise ValueError(f"flow_3d sidecar for round {round_key} must be 4D, got shape {flow_3d_arr.shape}")
-
-            expected_shape = flow_3d.get("shape")
-            if expected_shape is not None and not isinstance(expected_shape, (list, tuple)):
-                raise ValueError(f"flow_3d sidecar shape metadata for round {round_key} must be a list/tuple")
-            if expected_shape is not None and tuple(expected_shape) != tuple(flow_3d_arr.shape):
-                raise ValueError(
-                    f"flow_3d sidecar shape mismatch for round {round_key}: "
-                    f"manifest={expected_shape}, actual={list(flow_3d_arr.shape)}"
-                )
-
-            expected_dtype = flow_3d.get("dtype")
-            if expected_dtype is not None and str(flow_3d_arr.dtype) != expected_dtype:
-                raise ValueError(
-                    f"flow_3d sidecar dtype mismatch for round {round_key}: "
-                    f"manifest={expected_dtype}, actual={flow_3d_arr.dtype}"
-                )
-
-            round_payload["flow_3d"] = flow_3d_arr
+            else:
+                round_payload["flow_3d"] = descriptor
         elif flow_3d is not None and not isinstance(flow_3d, np.ndarray):
             raise ValueError(f"Unsupported flow_3d payload type for round {round_key}: {type(flow_3d)}")
         else:
