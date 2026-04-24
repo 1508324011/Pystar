@@ -599,23 +599,41 @@ class Decoder:
         
         print(" -> Validating end bases pattern...")
         
+        gating_mode = self.cfg.pipeline.decoding.gating_mode
+        print(f" -> Applying gating mode: {gating_mode}")
+
         # 应用验证函数到每个barcode
         pattern_valid = df_res['barcode'].apply(self._validate_end_bases)
-        
+        in_codebook = df_res['barcode'].isin(self.gene_map)
+
         n_pattern_fail = (~pattern_valid).sum()
         pattern_fail_rate = n_pattern_fail / len(df_res) if len(df_res) > 0 else 0
-        
+        n_codebook = int(in_codebook.sum())
+        codebook_rate = n_codebook / len(df_res) if len(df_res) > 0 else 0
+
         print(f"   Pattern validation removed: {n_pattern_fail} spots ({pattern_fail_rate:.2%})")
-        
+        print(f"   In-codebook after quality filter: {n_codebook} spots ({codebook_rate:.2%})")
+
         # Gene mapping
         df_res['gene'] = df_res['barcode'].map(self.gene_map).fillna('background')
-        
-        # 过滤掉不符合pattern的spots
-        df_res_true = df_res[pattern_valid].copy()
-        
+        df_res['pattern_valid'] = pattern_valid.values
+        df_res['in_codebook'] = in_codebook.values
+        df_res['gating_mode'] = gating_mode
+
+        # 过滤规则：默认保持当前 pattern-first 行为；实验模式下改成 legacy membership-first
+        if gating_mode == 'legacy_membership_first':
+            final_keep_mask = in_codebook
+            print("   Using legacy membership-first gate: keeping all in-codebook reads after quality filter")
+        else:
+            final_keep_mask = pattern_valid
+            print("   Using pattern-first gate: keeping only pattern-valid reads")
+
+        # 过滤掉未保留的spots
+        df_res_true = df_res[final_keep_mask].copy()
+
         if len(df_res_true) == 0:
-            print(" [ERROR] No spots left after pattern validation!")
-            print(" [HINT] Check your anchor_base configuration in experiment_config.yaml")
+            print(f" [ERROR] No spots left after gating mode '{gating_mode}'!")
+            print(" [HINT] Check your anchor_base configuration and codebook compatibility in experiment_config.yaml")
             return pd.DataFrame()
         
         # 计算每轮的平均质量分数（用于诊断）
@@ -638,13 +656,15 @@ class Decoder:
         n_mapped = (df_res_true['gene'] != 'background').sum()
         mapping_rate_quality = n_mapped / len(df_res) if len(df_res) > 0 else 0
         mapping_rate_pattern = n_mapped / len(df_res_true) if len(df_res_true) > 0 else 0
-        
+
         print(f"\n [Mapping Results]")
         print(f"   Spots after quality filter: {len(df_res)}")
-        print(f"   Spots after pattern check:  {len(df_res_true)}")
+        print(f"   Spots after active gate:    {len(df_res_true)}")
+        print(f"   Spots after pattern check:  {int(pattern_valid.sum())}")
+        print(f"   Spots in codebook:          {n_codebook}")
         print(f"   Spots after quality filter matched to genes:   {n_mapped} ({mapping_rate_quality:.2%})")
-        print(f"   Spots after pattern check matched to genes:    {n_mapped} ({mapping_rate_pattern:.2%})")
-        print(f"   Background/Unknown: {len(df_res) - n_mapped}")
+        print(f"   Spots after active gate matched to genes:      {n_mapped} ({mapping_rate_pattern:.2%})")
+        print(f"   Background/Unknown after active gate: {len(df_res_true) - n_mapped}")
         
         # Top genes
         if n_mapped > 0:
