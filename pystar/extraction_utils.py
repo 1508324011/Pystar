@@ -173,6 +173,28 @@ def _map_coordinates_float32(
     return cast(FloatArray, np.asarray(mapped, dtype=np.float32))
 
 
+def _sparse_coordinate_bases_3d(shape: tuple[int, int, int]) -> tuple[FloatArray, FloatArray, FloatArray]:
+    nz, ny, nx = shape
+    return (
+        np.arange(nz, dtype=np.float32)[:, None, None],
+        np.arange(ny, dtype=np.float32)[None, :, None],
+        np.arange(nx, dtype=np.float32)[None, None, :],
+    )
+
+
+def _broadcast_coordinate_views_3d(
+    shape: tuple[int, int, int],
+    z_coords: npt.ArrayLike,
+    y_coords: npt.ArrayLike,
+    x_coords: npt.ArrayLike,
+) -> list[FloatArray]:
+    return [
+        cast(FloatArray, np.broadcast_to(np.asarray(z_coords, dtype=np.float32), shape)),
+        cast(FloatArray, np.broadcast_to(np.asarray(y_coords, dtype=np.float32), shape)),
+        cast(FloatArray, np.broadcast_to(np.asarray(x_coords, dtype=np.float32), shape)),
+    ]
+
+
 def _coerce_int_tuple(
     value: object,
     *,
@@ -489,14 +511,15 @@ def warp_volume_to_reference(
             'coordinate_mapping is the legacy diagnostic path for non-3D transforms'
         )
 
-    z_coords, y_coords, x_coords = np.indices(img_vol.shape, dtype=np.float32)
+    z_coords, y_coords, x_coords = _sparse_coordinate_bases_3d(img_vol.shape)
     warped = _map_coordinates_float32(
         img_vol,
-        [
+        _broadcast_coordinate_views_3d(
+            img_vol.shape,
             z_coords - global_shift[0],
             y_coords - global_shift[1],
             x_coords - global_shift[2],
-        ],
+        ),
         order=1,
         mode='constant',
         cval=0.0,
@@ -518,17 +541,18 @@ def warp_volume_to_reference(
         if flow_arr.shape[1:] != (dz, dy, dx):
             raise ValueError(
                 f"tile_local flow_3d shape {flow_arr.shape[1:]} does not match persisted scope region {(dz, dy, dx)}"
-            )
+        )
         z1, y1, x1 = z0 + dz, y0 + dy, x0 + dx
         warped_region = warped[z0:z1, y0:y1, x0:x1]
-        local_z, local_y, local_x = np.indices(warped_region.shape, dtype=np.float32)
+        local_z, local_y, local_x = _sparse_coordinate_bases_3d(warped_region.shape)
         warped_local = _map_coordinates_float32(
             warped_region,
-            [
+            _broadcast_coordinate_views_3d(
+                warped_region.shape,
                 local_z + flow_arr[0],
                 local_y + flow_arr[1],
                 local_x + flow_arr[2],
-            ],
+            ),
             order=1,
             mode='constant',
             cval=0.0,
@@ -544,14 +568,15 @@ def warp_volume_to_reference(
             'persist explicit _scope metadata for tile_local artifacts'
         )
 
-    z_coords, y_coords, x_coords = np.indices(warped.shape, dtype=np.float32)
+    z_coords, y_coords, x_coords = _sparse_coordinate_bases_3d(warped.shape)
     return _map_coordinates_float32(
         warped,
-        [
+        _broadcast_coordinate_views_3d(
+            warped.shape,
             z_coords + flow_arr[0],
             y_coords + flow_arr[1],
             x_coords + flow_arr[2],
-        ],
+        ),
         order=1,
         mode='constant',
         cval=0.0,
