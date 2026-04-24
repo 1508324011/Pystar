@@ -190,7 +190,7 @@ class SpotFinder:
             )
         print(f" [SpotFinding] Finished. Total: {len(df)} spots. Saved to {out_csv.name}")
         
-        if self.cfg.pipeline.output.save_qc_images:
+        if self.cfg.pipeline.qc_images_enabled():
                 qc_dir = paths["qc"]
                 
                 # 构造一个伪 4D 数组 (C, 1, H, W)
