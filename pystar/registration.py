@@ -20,7 +20,7 @@ import warnings
 from .infrastructure import ExperimentConfig
 from .io import ImageLoader
 from .io import get_fov_output_structure
-from .io import PROVENANCE_VERSION, build_execution_envelope, build_release_contract, save_transform_manifest, persist_flow_3d_sidecar
+from .io import PROVENANCE_VERSION, build_execution_envelope, build_release_contract, save_transform_manifest, persist_flow_3d_sidecar, load_transform_manifest
 from .matlab_registration import MATLABGlobalRegistrationBackend
 from .tiling import (
     TileLayout,
@@ -550,7 +550,6 @@ def composite_transform_2d(
 
     return shifted.astype(np.float32)
 
-
 def apply_warp_field_3d(img_3d: FloatArray, flow_3d: FloatArray) -> FloatArray:
     """
     应用 3D 变形场
@@ -567,10 +566,7 @@ def apply_warp_field_3d(img_3d: FloatArray, flow_3d: FloatArray) -> FloatArray:
     nz, ny, nx = img_3d.shape
     
     z_coords, y_coords, x_coords = np.meshgrid(
-        np.arange(nz, dtype=np.float32),
-        np.arange(ny, dtype=np.float32),
-        np.arange(nx, dtype=np.float32),
-        indexing='ij'
+        np.arange(nz, dtype=np.float32), np.arange(ny, dtype=np.float32), np.arange(nx, dtype=np.float32), indexing='ij'
     )
     
     # 应用位移（逆向映射）
@@ -897,12 +893,30 @@ def _attach_local_flow_metadata(
 # ==============================================================================
 
 class RegistrationEngine:
+    """Orchestrate per-FOV registration and persist transform manifests.
+
+    The engine reads preprocessed clean volumes from the canonical PyStar output
+    tree, computes each moving round's transform relative to
+    ``registration.reference_round``, and writes ``transforms_fov_<id>.npy`` plus
+    provenance. Transform dictionaries use image coordinates in ``z, y, x``:
+    ``global_shift_3d`` is the rigid moving-to-reference shift, while local
+    ``flow_3d`` fields are residual displacements after that rigid shift. The
+    ``_semantics`` and ``_scope`` annotations are part of the runtime contract
+    consumed later by extraction; they prevent applying tile-local or differently
+    composed fields as if they were full-FOV total transforms.
+
+    Native and MATLAB providers share the same manifest schema. Provider choice
+    only changes how global shifts and local flows are computed; missing or
+    unsupported provider contracts fail explicitly instead of falling back.
+    """
+
     def __init__(self, config: ExperimentConfig):
         self.cfg = config
         self.reg_cfg = config.pipeline.registration
         self._matlab_backend: Optional[MATLABGlobalRegistrationBackend] = None
 
     def close(self) -> None:
+        """Release the lazily-created MATLAB registration backend, if any."""
         if self._matlab_backend is None:
             return
         self._matlab_backend.close()
@@ -928,6 +942,14 @@ class RegistrationEngine:
         backend_round_metadata: Optional[Dict[int, Dict[str, Any]]] = None,
         registration_backend_details: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """Build the transform-manifest provenance record.
+
+        The provenance captures the requested registration intent, provider
+        boundaries, field semantics, tiling settings, software versions, hardware
+        context, and per-round backend metadata. Downstream stages use this
+        record as evidence that a transform bundle was produced under the same
+        contract they are about to consume.
+        """
         execution_envelope = build_execution_envelope(self.cfg)
         release_contract = build_release_contract(self.cfg, transforms)
 
@@ -1043,10 +1065,18 @@ class RegistrationEngine:
         }
 
     def _save_transforms(self, transforms: Dict[int, Dict[str, Any]], fov_id: int, provenance: Optional[Dict[str, Any]] = None):
+        """Persist the full per-round transform manifest for one FOV."""
         base_dir = Path(self.cfg.pipeline.output.directory)
         save_transform_manifest(base_dir, fov_id, transforms, provenance=provenance)
 
     def _spill_round_flow_3d(self, fov_id: int, round_id: int, round_transform: Dict[str, Any]) -> None:
+        """Move large 3-D displacement fields to sidecar files.
+
+        ``flow_3d`` arrays have shape ``(3, z, y, x)`` and can dominate manifest
+        size. This helper writes the array under the FOV transform directory and
+        replaces the in-memory array with a descriptor that can be materialized
+        later by ``load_transform_manifest``.
+        """
         flow_3d = round_transform.get('flow_3d')
         if flow_3d is None or not isinstance(flow_3d, np.ndarray):
             return
@@ -1056,6 +1086,7 @@ class RegistrationEngine:
         round_transform['flow_3d'] = descriptor
 
     def _annotate_transform_semantics(self, transforms: Dict[int, Dict[str, Any]]) -> None:
+        """Attach declared field-composition metadata to every round transform."""
         semantics = self.cfg.pipeline.registration.field_semantics.as_dict()
         recorded_at = _iso_utc_now()
         for round_id, transform_data in transforms.items():
@@ -1067,6 +1098,7 @@ class RegistrationEngine:
             }
 
     def _annotate_transform_scope(self, transforms: Dict[int, Dict[str, Any]], scope_descriptor: Dict[str, Any]) -> None:
+        """Attach full-FOV or tile-local coverage metadata to every transform."""
         for _, transform_data in transforms.items():
             if not isinstance(transform_data, dict) or 'global_shift_3d' not in transform_data:
                 continue
@@ -1083,7 +1115,6 @@ class RegistrationEngine:
             volume_3d: (Z, Y, X)
         """
         loader = ImageLoader(self.cfg)
-
         round_structure = self.cfg.dataset.round_structure.get(int(round_id))
         if round_structure is None:
             raise KeyError(f"Round {round_id} is missing from dataset.round_structure")
@@ -1095,7 +1126,12 @@ class RegistrationEngine:
 
         source_cfg = self.reg_cfg.source
         if source_cfg.method == 'single_channel':
-            target_channel = int(source_cfg.single_channel_id)
+            single_channel_id = source_cfg.single_channel_id
+            if single_channel_id is None:
+                raise ValueError(
+                    "registration.source.single_channel_id is required when method='single_channel'"
+                )
+            target_channel = int(single_channel_id)
             if target_channel not in seq_channels:
                 raise ValueError(
                     f"registration.source.single_channel_id={target_channel} is not a seq channel available in round {round_id}: {seq_channels}"
@@ -1135,6 +1171,14 @@ class RegistrationEngine:
         ref_mip_clean: FloatArray,
         mov_scope_3d: FloatArray,
     ) -> Tuple[Dict[str, Any], FloatArray, Optional[Dict[str, Any]]]:
+        """Legacy native-only round registration helper.
+
+        This path computes a native 3-D phase-correlation shift and optional
+        native local refinement, returning a transform dictionary, a 2-D MIP used
+        only for QC visualization, and optional diagnostic metadata. It is kept
+        for older call sites; the mixed-provider path is implemented in
+        ``_register_round``.
+        """
         global_shift_3d, global_corr = compute_global_shift_3d(
             ref_scope_3d,
             mov_scope_3d,
@@ -1306,6 +1350,14 @@ class RegistrationEngine:
         mov_scope_3d: FloatArray,
         scope_descriptor: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], FloatArray, Optional[Dict[str, Any]]]:
+        """Legacy MATLAB-backed round registration helper.
+
+        The helper calls the MATLAB global-registration seam, optionally calls
+        the MATLAB local demons seam, and normalizes outputs into the same PyStar
+        transform schema used by native registration. It is retained for older
+        extracted-volume experiments; current provider mixing flows through
+        ``_register_round``.
+        """
         matlab_backend = self._get_matlab_backend()
         result = matlab_backend.compute_global_shift(
             ref_scope_3d,
@@ -1412,6 +1464,15 @@ class RegistrationEngine:
         mov_scope_3d: FloatArray,
         scope_descriptor: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], FloatArray, Optional[Dict[str, Any]]]:
+        """Register one moving round against the reference round.
+
+        ``ref_scope_3d`` and ``mov_scope_3d`` are already cropped to the declared
+        registration scope. The returned transform dictionary always contains a
+        rigid ``global_shift_3d``; local refinement may add either ``flow_2d`` for
+        diagnostic 2-D methods or ``flow_3d`` for extraction-ready 3-D image
+        warping. ``final_img_qc`` is a MIP for registration QC plots, not the data
+        consumed by extraction.
+        """
         global_provider = cast(str, self.reg_cfg.global_provider)
         local_provider = cast(str, self.reg_cfg.local_provider)
 
@@ -1696,6 +1757,15 @@ class RegistrationEngine:
         )
 
     def register_fov(self, data: xr.DataArray, fov_id: int) -> Dict[int, Dict[str, Any]]:
+        """Register all configured rounds for one FOV and reload the manifest.
+
+        ``data`` supplies the round list and FOV context from ``ImageLoader``;
+        registration itself reloads canonical clean images from disk so provider
+        and preprocessing provenance stay tied to the output contract. The
+        manifest returned by this method is already materialized enough for the
+        next stage, but the large 3-D flow fields may remain sidecar descriptors
+        until extraction requests them.
+        """
         ref_round = self.reg_cfg.reference_round
         all_rounds = sorted(data.coords["round"].values)
         run_started_at = _iso_utc_now()
@@ -1795,4 +1865,5 @@ class RegistrationEngine:
             ),
         )
         self._save_transforms(transforms, fov_id, provenance=provenance)
-        return transforms
+        base_dir = Path(self.cfg.pipeline.output.directory)
+        return load_transform_manifest(base_dir, fov_id, load_provenance=False)

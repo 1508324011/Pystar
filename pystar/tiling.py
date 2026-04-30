@@ -1,3 +1,12 @@
+"""Spatial tiling utilities for local registration fields.
+
+All shapes and origins use trailing image axes in ``z, y, x`` order, while grid
+layout is expressed as ``y, x`` because tiles partition the lateral plane and
+span the full z depth. Each tile has two regions: ``region_*`` is the extracted
+volume including overlap, and ``write_*`` is the non-overlapping core region that
+is copied back into the final stitched full-FOV field.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,6 +21,11 @@ ArrayLike = NDArray[Any]
 
 
 def split_extent_evenly(length: int, parts: int) -> list[tuple[int, int]]:
+    """Split a discrete axis into ``parts`` half-open intervals.
+
+    The returned ranges cover ``[0, length)`` exactly once and differ by at most
+    one voxel. This is used for core tile boundaries, not for overlap expansion.
+    """
     if length <= 0:
         raise ValueError(f"length must be positive, got {length}")
     if parts <= 0:
@@ -32,6 +46,12 @@ def resolve_grid_shape_yx(
     sqrt_pieces: int | None = None,
     tile_grid_shape_yx: Sequence[int] | None = None,
 ) -> tuple[tuple[int, int], str]:
+    """Resolve the ``(y_tiles, x_tiles)`` grid requested by registration config.
+
+    Priority is explicit ``tile_grid_shape_yx``, then MATLAB-style
+    ``sqrt_pieces`` square grids, then automatic coverage by ``tile_size``. The
+    second return value records which knob determined the grid for provenance.
+    """
     if len(full_shape_zyx) != 3:
         raise ValueError(f"full_shape_zyx must contain 3 integers, got {full_shape_zyx!r}")
 
@@ -72,6 +92,14 @@ def resolve_grid_shape_yx(
 
 @dataclass(frozen=True)
 class TileSpec:
+    """One tile's extraction and write-back geometry.
+
+    ``region_origin_zyx``/``region_shape_zyx`` describe the source subvolume sent
+    to registration, including overlap for context. ``write_origin_zyx`` and
+    ``write_shape_zyx`` describe the core destination in the full volume.
+    ``write_offset_zyx`` points from the extracted tile array to that core region.
+    """
+
     tile_index: int
     grid_position_yx: tuple[int, int]
     grid_shape_yx: tuple[int, int]
@@ -83,6 +111,7 @@ class TileSpec:
     full_volume_shape_zyx: tuple[int, int, int]
 
     def as_dict(self) -> dict[str, Any]:
+        """Serialize tile geometry for transform scope/provenance metadata."""
         return {
             "tile_index": self.tile_index,
             "grid_position_yx": [int(self.grid_position_yx[0]), int(self.grid_position_yx[1])],
@@ -98,6 +127,8 @@ class TileSpec:
 
 @dataclass(frozen=True)
 class TileLayout:
+    """Complete tiling plan for a full ``z,y,x`` volume."""
+
     full_volume_shape_zyx: tuple[int, int, int]
     grid_shape_yx: tuple[int, int]
     overlap_yx: tuple[int, int]
@@ -106,9 +137,11 @@ class TileLayout:
 
     @property
     def tile_count(self) -> int:
+        """Number of tiles in this layout."""
         return len(self.tiles)
 
     def summary(self) -> dict[str, Any]:
+        """Return a JSON-safe description stored in backend metadata."""
         return {
             "enabled": True,
             "grid_shape_yx": [int(self.grid_shape_yx[0]), int(self.grid_shape_yx[1])],
@@ -127,6 +160,12 @@ def build_yx_tile_layout(
     grid_source: str = "manual",
     index_order: str = "row_major_yx",
 ) -> TileLayout:
+    """Build a generic ``y,x`` tile layout with optional lateral overlap.
+
+    ``index_order='row_major_yx'`` numbers tiles by y then x. The
+    ``column_major_xy`` option matches MATLAB subtile iteration where x changes
+    outside the y loop.
+    """
     if len(full_shape_zyx) != 3:
         raise ValueError(f"full_shape_zyx must contain 3 integers, got {full_shape_zyx!r}")
     if len(grid_shape_yx) != 2:
@@ -214,6 +253,13 @@ def build_matlab_subtile_layout(
     overlap_yx: Sequence[int] | None = None,
     grid_source: str = "matlab_subtile",
 ) -> TileLayout:
+    """Build the MATLAB ``sqrt_pieces`` subtile layout.
+
+    MATLAB STATES local registration divides the y/x plane into a square grid,
+    commonly ``sqrt_pieces=4`` for 16 subtiles, iterating x-major then y. When no
+    overlap is provided, PyStar uses 10% of the core tile width/height to match
+    the historical MATLAB neighborhood context.
+    """
     if len(full_shape_zyx) != 3:
         raise ValueError(f"full_shape_zyx must contain 3 integers, got {full_shape_zyx!r}")
 
@@ -284,6 +330,11 @@ def build_matlab_subtile_layout(
 
 
 def extract_tile(array: ArrayLike, tile: TileSpec) -> ArrayLike:
+    """Extract the overlap-inclusive tile region from an array.
+
+    Arrays may have arbitrary leading axes, but their trailing axes must match
+    ``tile.full_volume_shape_zyx``. The returned tile retains the leading axes.
+    """
     if tuple(array.shape[-3:]) != tile.full_volume_shape_zyx:
         raise ValueError(
             "Tile extraction shape mismatch: "
@@ -298,6 +349,7 @@ def extract_tile(array: ArrayLike, tile: TileSpec) -> ArrayLike:
 
 
 def extract_tile_write_window(array: ArrayLike, tile: TileSpec) -> ArrayLike:
+    """Extract the core write window directly from a full-size array."""
     if tuple(array.shape[-3:]) != tile.full_volume_shape_zyx:
         raise ValueError(
             "Tile write-window extraction shape mismatch: "
@@ -316,6 +368,12 @@ def stitch_tiles(
     *,
     full_shape_zyx: Sequence[int],
 ) -> ArrayLike:
+    """Stitch overlap-inclusive tile outputs into one full-volume array.
+
+    Only the non-overlapping core write window of each tile is copied. The helper
+    verifies that every voxel is written exactly once, making gaps or accidental
+    overlaps fail loudly before downstream extraction sees an invalid field.
+    """
     outputs = list(tile_outputs)
     if not outputs:
         raise ValueError("tile_outputs must not be empty")
