@@ -1,304 +1,559 @@
+# ==========================================
+# 1. Dataset Specs
+# ==========================================
+# 这一节描述“数据在哪里、每张图像长什么样、每轮有哪些通道”。
+# 通常新数据集最先需要修改的是 raw_data_path、filename_pattern、fov_list、round_structure、channel_roles。
 dataset:
-  raw_data_path: /gpfs/share/home/2201112433/labShare/2501111695/data/202512_mouse_testis_r1_leica/01_data
-  filename_pattern: round{round:03d}/Position{fov}/*_ch{ch}.tif
-  pixel_size_xy_nm: 141.97
-  pixel_size_z_nm: 361.47
+  # 原始 TIFF 数据根目录。
+  # 作用：ImageLoader 会在这个目录下按 filename_pattern 查找每个 FOV / round / channel 的图像。
+  # 调参建议：这是站点路径，不影响算法；换数据集时必须改成你的 raw image 根目录。
+  raw_data_path: "/gpfs/share/home/2201112433/labShare/2501111695/data/202512_mouse_testis_r1_leica/01_data"
+
+  # 图像文件名模板。
+  # 作用：程序用 raw_data_path + filename_pattern 拼出每张图像的 glob pattern。
+  # 可用占位符：{round}、{fov}、{ch}。
+  #   {round:03d} 表示 1 -> 001；若你的目录是 round01，应改成 {round:02d}。
+  #   {fov} 对应 Position{fov}；{ch} 对应 channel 编号。
+  # 注意：这里可以包含通配符 *，用于匹配显微镜导出的变长文件名。
+  filename_pattern: "round{round:03d}/Position{fov}/*_ch{ch}.tif"
+
+  # 显微镜像素尺寸，单位 nm。
+  # 作用：记录物理尺度，用于 QC、报告和后续把像素坐标换算到物理坐标。
+  # 调参影响：不改变图像处理结果；但会影响任何依赖物理尺度的下游解释。
+  pixel_size_xy_nm: 141.97  # XY 平面单像素边长
+  pixel_size_z_nm: 361.47   # 相邻 Z slice 的间距
+
+  # 单个 FOV 的图像尺寸。
+  # 作用：用于预分配、边界检查、transform / extraction 的 shape contract。
+  # 必须与原始 TIFF stack 一致；不一致时通常会在读图、配准或提取阶段暴露错误。
   dimensions:
-    z: 42
-    width: 2048
-    height: 2048
+    z: 42        # Z slice 数
+    width: 2048  # X 方向像素数
+    height: 2048 # Y 方向像素数
+
+  # 大图像读写 chunk 尺寸。
+  # 作用：控制大体积图像读写/缓存的分块大小，主要影响内存占用和 I/O 效率。
+  # 调参建议：
+  #   z 通常设为完整 stack 深度，避免 Z 方向切断 spot。
+  #   y/x 建议是 registration / tile block size 的整数倍；越大 I/O 次数越少但占内存越多。
   io_chunk_size:
     z: 42
     y: 1024
     x: 1024
-  fov_list: 1-324
+
+  # --- 显式结构定义 (Explicit Structure) ---
+
+  # 要处理的 FOV ID。
+  # 支持写法：
+  #   "1-324" 表示连续范围；
+  #   [1, 2, 5, 8] 表示只处理指定 FOV。
+  # 调参建议：调试时先用小列表；正式跑全数据时再切回完整范围。
+  fov_list: "1-324"
+
+  # 每个 round 包含哪些 channel。
+  # 作用：定义 ImageLoader 应该读取哪些 channel，以及 decoding / registration 可用的通道集合。
+  # 当前示例每轮都有 0/1/2 三个测序通道和 3 号 anchor 通道。
+  # 调参注意：如果某轮缺 channel，必须在这里删掉；否则会在读图阶段找不到文件。
   round_structure:
-    1:
-    - 0
-    - 1
-    - 2
-    - 3
-    2:
-    - 0
-    - 1
-    - 2
-    - 3
-    3:
-    - 0
-    - 1
-    - 2
-    - 3
-    4:
-    - 0
-    - 1
-    - 2
-    - 3
-    5:
-    - 0
-    - 1
-    - 2
-    - 3
-    6:
-    - 0
-    - 1
-    - 2
-    - 3
-    7:
-    - 0
-    - 1
-    - 2
-    - 3
-    8:
-    - 0
-    - 1
-    - 2
-    - 3
-    9:
-    - 0
-    - 1
-    - 2
-    - 3
-    10:
-    - 0
-    - 1
-    - 2
-    - 3
-    11:
-    - 0
-    - 1
-    - 2
-    - 3
+    1: [0, 1, 2, 3]
+    2: [0, 1, 2, 3]
+    3: [0, 1, 2, 3]
+    4: [0, 1, 2, 3]
+    5: [0, 1, 2, 3]
+    6: [0, 1, 2, 3]
+    7: [0, 1, 2, 3]
+    8: [0, 1, 2, 3]
+    9: [0, 1, 2, 3]
+    10: [0, 1, 2, 3]
+    11: [0, 1, 2, 3]
+
+  # 每个 channel 的语义。
+  #   "seq"    = 用于测序读码、spot finding、intensity extraction 的荧光通道。
+  #   "anchor" = 锚定/参考通道，通常用于实验结构或配准辅助，不作为条码颜色。
+  # 调参注意：channel_roles 必须和 round_structure 中出现的 channel 编号一致。
   channel_roles:
-    0: seq
-    1: seq
-    2: seq
-    3: anchor
+    0: "seq"
+    1: "seq"
+    2: "seq"
+    3: "anchor"
+
+
+# ==========================================
+# 2. Decoding Logic
+# ==========================================
+# 这一节描述“CSV 条码如何被解释成每轮颜色，以及物理读段如何拼回基因条码”。
+# 除非实验设计或 genes.csv 格式改变，否则不要随意修改 encoding_tables / topology。
 codebook:
-  gene_list: /gpfs/share/home/2201112433/labShare/2501111695/data/202512_mouse_testis_r1_leica/01_data/genes.csv
+  # 基因/条码 CSV 路径。
+  # 作用：Decoder 会读取该文件，将每个 gene 的条码编译成可匹配的颜色序列。
+  # 换数据集时通常必须改成对应的 genes.csv。
+  gene_list: "/gpfs/share/home/2201112433/labShare/2501111695/data/202512_mouse_testis_r1_leica/01_data/genes.csv"
+
+  # 码本中颜色通道编号的起点。
+  # 作用：把 genes.csv 中的颜色编号转换到 PyStar 内部 channel 编号。
+  # 常见取值：
+  #   1 = CSV 中颜色从 1 开始编号；
+  #   0 = CSV 中颜色已经是 0-based。
+  # 调错后表现：大量基因被系统性解码到错误 channel。
   channel_base_index: 1
+
+  # 碱基组合到颜色通道 ID 的映射表。
+  # 作用：topology.structure 中每个 segment 会指定 encoding_table，Decoder 用表把碱基对翻译成颜色。
+  # 注意：这里的值仍使用 CSV/实验定义的颜色编号，随后由 channel_base_index 统一转换。
   encoding_tables:
+    # 3-color tri 模式常规映射。
     standard_3color:
-      AT: 3
-      GT: 1
-      TT: 2
-      AG: 1
-      GG: 2
-      TG: 3
-      AA: 2
-      GA: 3
-      TA: 1
+      "AT": 3
+      "GT": 1
+      "TT": 2
+      "AG": 1
+      "GG": 2
+      "TG": 3
+      "AA": 2
+      "GA": 3
+      "TA": 1
+
+    # 4-color 模式常规映射。当前示例不默认使用，但保留给 4-color codebook。
     standard_4color:
-      AA: 1
-      CA: 2
-      GA: 3
-      TA: 4
-      AC: 2
-      CC: 1
-      GC: 4
-      TC: 3
-      AG: 3
-      CG: 4
-      GG: 1
-      TG: 2
-      AT: 4
-      CT: 3
-      GT: 2
-      TT: 1
+      "AA": 1
+      "CA": 2
+      "GA": 3
+      "TA": 4
+      "AC": 2
+      "CC": 1
+      "GC": 4
+      "TC": 3
+      "AG": 3
+      "CG": 4
+      "GG": 1
+      "TG": 2
+      "AT": 4
+      "CT": 3
+      "GT": 2
+      "TT": 1
+
+    # Leica/STATES omics tail 特殊映射。
+    # 作用：seqE 的 2-base segment 只用 GC/GT 区分状态。
     omics_special:
-      GC: 1
-      GT: 2
+      "GC": 1
+      "GT": 2
+
+  # --- 拓扑结构定义 (Tri Mode) ---
   topology:
-    func: reverse_string
+    # 条码拓扑变换函数。
+    # 作用：决定从 CSV 读到的条码在进入 segment 编译前是否需要反向/重排。
+    # 当前 Leica/STATES 示例使用 reverse_string；改错会导致全局基因 identity 系统性错位。
+    func: "reverse_string"
+
+    # 每个读段 segment 的结构定义。
+    # 字段含义：
+    #   id             = segment 名称，供 physical_order 引用。
+    #   length         = 该 segment 的碱基长度；必须和 csv_slice 覆盖长度一致。
+    #   rounds         = 该 segment 使用哪些 imaging rounds。
+    #   csv_slice      = 在 genes.csv 条码中的 1-based 闭区间切片 [start, end]。
+    #   anchor_base    = 每个 encoding unit 的锚定碱基；数量通常对应该 segment 的编码轮次。
+    #   encoding_table = 使用上方哪个 encoding table 把碱基组合映射到颜色。
     structure:
-    - id: seqF
-      length: 6
-      rounds:
-      - 6
-      - 7
-      - 8
-      - 9
-      - 10
-      csv_slice:
-      - 1
-      - 6
-      anchor_base:
-      - A
-      - A
-      encoding_table: standard_3color
-    - id: seqD
-      length: 6
-      rounds:
-      - 1
-      - 2
-      - 3
-      - 4
-      - 5
-      csv_slice:
-      - 7
-      - 12
-      anchor_base:
-      - G
-      - A
-      encoding_table: standard_3color
-    - id: seqE
-      length: 2
-      rounds:
-      - 11
-      csv_slice:
-      - 13
-      - 14
-      anchor_base:
-      - G
-      encoding_table: omics_special
-    physical_order:
-    - seqD
-    - seqF
-    - seqE
+      - id: "seqF"
+        length: 6
+        rounds: [6, 7, 8, 9, 10]
+        csv_slice: [1, 6]
+        anchor_base: ["A", "A"]
+        encoding_table: "standard_3color"
+
+      - id: "seqD"
+        length: 6
+        rounds: [1, 2, 3, 4, 5]
+        csv_slice: [7, 12]
+        anchor_base: ["G", "A"]
+        encoding_table: "standard_3color"
+
+      - id: "seqE"
+        length: 2
+        rounds: [11]
+        csv_slice: [13, 14]
+        anchor_base: ["G"]
+        encoding_table: "omics_special"
+
+    # 物理读段顺序。
+    # 作用：把多个 segment 按实验读出顺序拼回完整 barcode。
+    # 必须只引用 structure 中已有的 id。
+    physical_order: ["seqD", "seqF", "seqE"]
+
+
+# ==========================================
+# 3. Provider Runtime Configuration
+# ==========================================
+# 这一节只配置外部 provider 的运行入口，尤其是 MATLAB provider seam。
+# 默认 pipeline 仍使用 native provider；只有当 pipeline 某个 stage 写 provider: "matlab" 时，才会调用这里的 runtime_path/entrypoint。
 providers:
   matlab:
+    # 是否允许 MATLAB provider 被调用。
+    # true 只表示 runtime seam 可用；不代表默认 pipeline 会走 MATLAB。
     enabled: true
+
     preprocessing:
-      runtime_path: matlab_runtime/pystar_preprocessing
-      entrypoint: pystar_preprocess_entry
-      loader_input_format: uint8
-      loader_output_dtype: uint8
+      # MATLAB preprocessing runtime 目录和入口函数。
+      # runtime_path 相对仓库根目录；entrypoint 必须是 MATLAB path 中可调用的函数名。
+      runtime_path: "matlab_runtime/pystar_preprocessing"
+      entrypoint: "pystar_preprocess_entry"
+
+      # MATLAB 边界上的图像类型约定。
+      # loader_input_format 控制传给 MATLAB 前的输入类型；loader_output_dtype 控制取回后保存/继续处理的 dtype。
+      loader_input_format: "uint8"
+      loader_output_dtype: "uint8"
+
+      # MATLAB preprocessing 是否请求 GPU。
+      # 需要 MATLAB 侧代码、GPU 硬件和 license 同时支持；不确定时保持 false。
       use_gpu: false
+
+      # MATLAB morphology runtime 的默认参数。
+      # method="2d" 表示逐 Z slice 做 2D morphology；radius 控制结构元素半径；height 控制 h-maxima / reconstruction 类操作强度。
       morphology:
-        method: 2d
+        method: "2d"
         radius: 5
         height: 3
+
     registration:
-      runtime_path: matlab_runtime/pystar_registration
-      entrypoint: pystar_register_global_entry
+      # MATLAB registration runtime 目录和全局配准入口。
+      runtime_path: "matlab_runtime/pystar_registration"
+      entrypoint: "pystar_register_global_entry"
+
+      # MATLAB local registration 的方法到入口函数映射。
+      # 当前 MATLAB local provider 只支持 demons_3d。
       local_entrypoints:
-        demons_3d: pystar_register_local_demons_entry
-      volume_transfer_mode: temporary_tiff
-      input_volume_dtype: uint8
+        demons_3d: "pystar_register_local_demons_entry"
+
+      # Python <-> MATLAB 图像传输方式和输入 dtype。
+      # temporary_tiff = 通过临时 TIFF 文件交换体数据，慢一些但可追踪、可调试。
+      volume_transfer_mode: "temporary_tiff"
+      input_volume_dtype: "uint8"
       use_gpu: false
+
     spot_finding:
-      runtime_path: matlab_runtime/pystar_spotfinding
-      entrypoint: pystar_spotfind_entry
-      volume_transfer_mode: temporary_tiff
-      input_volume_dtype: uint8
+      # MATLAB spot-finding runtime。只有 pipeline.spot_finding.provider="matlab" 时使用。
+      runtime_path: "matlab_runtime/pystar_spotfinding"
+      entrypoint: "pystar_spotfind_entry"
+      volume_transfer_mode: "temporary_tiff"
+      input_volume_dtype: "uint8"
+
     extraction:
-      runtime_path: matlab_runtime/pystar_extraction
-      entrypoint: pystar_extract_entry
-      volume_transfer_mode: temporary_tiff
-      coords_transfer_mode: temporary_csv
-      input_volume_dtype: float32
+      # MATLAB extraction runtime。只有 pipeline.extraction.provider="matlab" 时使用。
+      runtime_path: "matlab_runtime/pystar_extraction"
+      entrypoint: "pystar_extract_entry"
+
+      # 图像和坐标传输方式。
+      # coords_transfer_mode="temporary_csv" 表示 spot 坐标先写临时 CSV，再由 MATLAB 读取。
+      volume_transfer_mode: "temporary_tiff"
+      coords_transfer_mode: "temporary_csv"
+      input_volume_dtype: "float32"
+
+
+# ==========================================
+# 4. Pipeline Parameters
+# ==========================================
+# 这一节是主要算法参数。调参时建议一次只改一个 stage，并保存对应 summary / QC 指标。
 pipeline:
-  scope_mode: full_fov
-  accelerator: cpu
+  # 处理范围模式。
+  #   full_fov    = 以完整 FOV 为单位处理，当前推荐默认。
+  #   tile_local  = 只处理 signal-selected tile，适合局部调试或旧实验路线。
+  # 影响：改变处理范围、输出数量和运行时间；正式比较时不要混用不同 scope_mode。
+  scope_mode: "full_fov"
+
+  # 计算加速器。
+  # 当前 schema 只接受 "cpu"。GPU 相关开关保留在个别算法/provider 子项中。
+  accelerator: "cpu"
+
+  # registration 位移场语义声明。
+  # 作用：告诉 extraction / QC 这些 transform field 表示什么，避免把 residual field 当 total field 使用。
   field_semantics:
-    representation: residual
-    composition: sequential_global_then_local
-    status: provisional
+    # representation:
+    #   residual = local field 只表示在 global shift 后的局部残差；当前参考语义。
+    #   total    = field 已包含完整全局+局部变换。
+    #   unknown  = 未声明；不建议用于正式结果。
+    representation: "residual"
+
+    # composition 描述 transform 的组合顺序。
+    # sequential_global_then_local = 先应用全局平移，再应用局部 refinement。
+    composition: "sequential_global_then_local"
+
+    # status 是语义成熟度记录。provisional 表示当前约定仍在 benchmark 中持续验证。
+    status: "provisional"
+
+  # ------------------------------------------
+  # Stage 0: Preprocessing (预处理)
+  # ------------------------------------------
   preprocessing:
+    # 是否执行预处理流水线。
+    # false 会跳过 clean image 生成；通常只用于已经有缓存 clean_data 的特殊调试。
     enable: true
+
+    # 有序预处理流水线。程序严格按 sequence 顺序执行，每一步输出作为下一步输入。
+    # 每个 step 的通用字段：
+    #   method   = 预处理方法名。
+    #   provider = "native" 或 "matlab"；使用 matlab 时需配置 providers.matlab.preprocessing。
+    #   params   = 该方法的参数字典；无参数时写 {}。
+    #
+    # 当前 native 可选 method 与 params：
+    #   none:
+    #     无操作，占位用；params: {}。
+    #   median_filter:
+    #     中值滤波，去椒盐噪声；params.kernel_size 为核大小，建议奇数，偶数会自动加 1，<3 等价跳过。
+    #   gaussian_blur:
+    #     高斯平滑，降低高频噪声但会变宽 spot；params.sigma 越大越平滑。
+    #   min_max_normalize:
+    #     把当前图像线性拉伸到 [0,1]；无参数；会改变全局动态范围。
+    #   clip_percentile:
+    #     用分位数截断极端暗/亮值；params.min_percentile / max_percentile 控制截断比例。
+    #   gamma_correction:
+    #     非线性亮度调整；params.gamma < 1 提亮暗部，> 1 压暗暗部，=1 不变。
+    #   histogram_match:
+    #     直方图匹配；params.scope="inter_round" 表示向参考 round 匹配，"intra_round" 表示同 round 内向参考 channel 匹配。
+    #   difference_of_gaussians:
+    #     DoG 带通滤波增强 spot；params.spot_sigma 是 spot 尺度，params.bg_sigma 是背景尺度。
+    #   clahe:
+    #     局部自适应直方图均衡；params.clip_limit 控制对比度限制，params.nbins 控制灰度 bins。
+    #   morpho_reconstruction_contrast:
+    #     morphology reconstruction 背景扣除/对比增强；params.radius 控制背景尺度，downsample_factor 控制背景估计降采样比例。
     sequence:
-    - method: none
-      provider: native
-      params: {}
-    - method: min_max_normalize
-      provider: native
-      params: {}
-    - method: histogram_match
-      provider: native
-      params:
-        scope: inter_round
-    - method: histogram_match
-      provider: native
-      params:
-        scope: intra_round
-    - method: morpho_reconstruction_contrast
-      provider: native
-      params:
-        radius: 5
-        downsample_factor: 0.25
+      # Step 0: 占位/基础去噪。
+      # 当前设为 none，表示保留原始输入给后续归一化步骤。
+      - method: "none"
+        provider: "native"
+        params: {}
+
+      # Step 1: 初始线性归一化。
+      # 作用：统一每个 volume 的强度范围，使后续 histogram / morphology 步骤工作在稳定的 [0,1] 域。
+      - method: "min_max_normalize"
+        provider: "native"
+        params: {}
+
+      # Step 2: round 间亮度校正。
+      # scope="inter_round"：把非参考 round 的强度分布向参考 round 对齐，减少 round-to-round illumination drift。
+      - method: "histogram_match"
+        provider: "native"
+        params:
+          scope: "inter_round"
+
+      # Step 3: channel 间亮度校正。
+      # scope="intra_round"：在同一 round 内校正 seq channel 间分布差异，减少颜色通道偏置。
+      - method: "histogram_match"
+        provider: "native"
+        params:
+          scope: "intra_round"
+
+      # Step 4: 背景扣除/对比度增强。
+      # radius 越大，估计的背景越平滑，保留的结构越偏向小 spot；过大会放大局部不均匀背景。
+      # downsample_factor 越小，背景估计越快、越粗；过小可能损失背景细节。
+      - method: "morpho_reconstruction_contrast"
+        provider: "native"
+        params:
+          radius: 5
+          downsample_factor: 0.25
+
+  # ------------------------------------------
+  # Stage 1: Registration (对齐)
+  # ------------------------------------------
   registration:
+    # 参考 round。所有其它 round 会对齐到该 round。
+    # 为保持 MATLAB/STATE parity，默认使用 round 1；换参考轮会改变所有 transform 和下游 extraction。
     reference_round: 1
+
+    # 构建 registration source image 的方式。
     source:
-      method: mip_all_channels
-      mip_channels:
-      - 0
-      - 1
-      - 2
+      # method 可选：
+      #   mip_all_channels = 对 mip_channels 指定的多个 channel 做 MIP/组合后配准，当前推荐。
+      #   single_channel   = 只用 single_channel_id 指定的一个 channel 配准；适合 anchor 很强的实验。
+      method: "mip_all_channels"
+
+      # mip_channels：用于构建 MIP 的 channel 列表。
+      # 当前使用 0/1/2 三个 seq channel；如果 anchor channel 更稳定，可改为对应 channel 或切换 single_channel。
+      mip_channels: [0, 1, 2]
+
+    # 全局刚性/平移配准。
     global:
+      # 当前 runtime contract 要求 global registration 启用。
       enabled: true
-      method: phase_corr_3d
-      provider: native
+
+      # method="phase_corr_3d"：3D phase correlation，估计 [dz, dy, dx] 全局位移。
+      method: "phase_corr_3d"
+
+      # provider：native 为 Python 实现；matlab 会调用 providers.matlab.registration.entrypoint。
+      provider: "native"
+
       params:
+        # downsample_factor：全局配准前 XY 降采样倍数。
+        # 1 = 不降采样，最稳但慢；>1 更快但可能降低小位移精度。Z 轴不会按该参数降采样。
         downsample_factor: 1
+
+        # use_gpu：当前 native phase_corr_3d 主要走 CPU；保持 false。
         use_gpu: false
+
+        # max_shift：允许的最大位移像素范数。
+        # 超过该值会提示配准可能不可靠；过小会误报，过大可能放过错误配准。
         max_shift: 200
+
+    # 局部非刚性 refinement。
     local:
+      # 是否启用 local registration。关闭会只使用 global shift，通常 spot-level parity 会下降。
       enabled: true
-      method: demons_3d
-      provider: native
+
+      # method 可选：
+      #   demons_3d     = 当前参考路径，3D demons-like 局部 refinement。
+      #   optical_flow  = 2D TV-L1 optical flow 路线，参数在 params.optical_flow。
+      #   bspline       = B-spline 网格形变路线，参数在 params.bspline。
+      # MATLAB local provider 当前只支持 demons_3d。
+      method: "demons_3d"
+
+      # provider：native 为 Python 实现；matlab 会调用 providers.matlab.registration.local_entrypoints。
+      provider: "native"
+
       params:
+        # bspline 参数。仅当 local.method="bspline" 时使用。
         bspline:
-          grid_spacing: 17
-          num_iter: 70
+          grid_spacing: 17  # 控制控制点网格间距；越小越灵活但更易过拟合、运行更慢
+          num_iter: 70      # 优化迭代次数；越大越慢，通常边际收益递减
+
+        # optical_flow 参数。仅当 local.method="optical_flow" 时使用。
         optical_flow:
-          coarse_scale: 0.12
-          blur_sigma: 1.9
-          attachment: 2.0
-          tightness: 0.45
-          num_warp: 5
-          num_iter: 10
-          tol: 0.0001
+          coarse_scale: 0.12 # 低分辨率估计尺度；越小越快但可能丢细节
+          blur_sigma: 1.9    # flow 前平滑强度；越大越抗噪但会抹掉局部结构
+          attachment: 2.0    # 数据项权重；越大越贴合图像强度差异
+          tightness: 0.45    # 平滑项强度；越大 flow 越平滑
+          num_warp: 5        # coarse-to-fine warp 次数
+          num_iter: 10       # 每层迭代次数
+          tol: 0.0001        # 收敛阈值；越小越严格、越慢
+
+        # demons_3d 参数。当前 local.method="demons_3d" 时使用。
         demons_3d:
-          num_iter: 50
-          smoothing_sigma: 1.0
+          num_iter: 50        # demons 迭代次数；当前值来自 MATLAB/STATE parity 参考
+          smoothing_sigma: 1.0 # 位移场平滑强度；越大越平滑，过大会压掉真实局部形变
+
+    # 配准安全门。
     guards:
+      # 全局配准相关性过低时跳过/拒绝后续不可靠 transform。
       skip_if_global_corr_below: 0.2
+
+      # true = 如果 local refinement 后相关性变差，则拒绝该 local field，避免“越修越坏”。
       reject_if_correlation_worse: true
-    save_displacement_fields: true
-    save_registered_images: false
+
+    # 输出控制。
+    save_displacement_fields: true  # 保存 .npy 位移场，供 extraction、复盘和调试使用；会增加磁盘占用
+    save_registered_images: false   # 保存配准后图像；对大数据集非常占空间，通常只在调试时开启
+
+  # ------------------------------------------
+  # Stage 2: Spot Finding (找点)
+  # ------------------------------------------
   spot_finding:
-    algorithm: peak_local_max
-    provider: native
+    # 找点算法。
+    # 可选：
+    #   peak_local_max = 当前推荐的 native Max3D regional-max 路线，适合 STATES/Leica parity。
+    #   spotiflow      = 深度学习 spot detector，依赖 spotiflow 包和模型。
+    #   blob_dog       = Difference-of-Gaussians blob detector，适合快速形状基线实验。
+    algorithm: "peak_local_max"
+
+    # 找点 provider。
+    # native = Python 实现；matlab = MATLAB spot-finding seam。
+    # 使用 matlab 时当前只支持 algorithm="peak_local_max"，并需要 providers.matlab.spot_finding 配好 runtime。
+    provider: "native"
+
+    # 在哪一轮上生成候选 spot。
+    # 当前参考为 round 1；更换会改变候选点集合和后续所有 extraction。
     reference_round: 1
-    method: max_intensity
+
+    # 多通道候选点强度聚合方式。
+    #   max_intensity = 取通道/局部最大响应，当前推荐。
+    #   rms           = 均方根聚合，可能更重视多通道共同信号。
+    method: "max_intensity"
+
+    # Spotiflow 参数。仅当 algorithm="spotiflow" 时使用。
     spotiflow:
-      model_name: smfish_3d
-      prob_thresh: 0.5
-      use_gpu: true
+      model_name: "smfish_3d" # 预训练模型名；需与 spotiflow 支持的模型一致
+      prob_thresh: 0.5        # spot 概率阈值；越高越保守、点数越少
+      use_gpu: true           # 是否请求 GPU 推理；无 GPU 或 CUDA 环境不稳定时改 false
+
+    # Difference of Gaussians 参数。仅当 algorithm="blob_dog" 时使用。
     blob_dog:
-      min_sigma:
-      - 0.5
-      - 1.0
-      - 1.0
-      max_sigma:
-      - 2.0
-      - 5.0
-      - 5.0
+      # min_sigma / max_sigma 可写单个数，也可写 [Z, Y, X] 三元列表。
+      # 数值定义 spot 尺度搜索范围；Z 通常小于 Y/X，因为 Z slice 更稀疏。
+      min_sigma: [0.5, 1.0, 1.0]
+      max_sigma: [2.0, 5.0, 5.0]
+
+      # DoG 响应阈值，不是原始图像强度百分比。
+      # 越高越保守；越低召回更多弱点但假阳性增加。
       threshold: 0.01
+
+      # 允许候选 blob 重叠的比例。
+      # 越小越倾向合并/去掉相邻 blob；越大保留更多相邻候选。
       overlap: 0.5
+
+    # Native Max3D 参数。当前 algorithm="peak_local_max" 时使用。
     peak_local_max:
+      # min_distance 当前保留在配置中，用于和旧实验配置保持结构一致；当前 Max3D regional-max 实现主要由连通域和阈值决定。
       min_distance: 2
-      threshold_rel: 0.05
+
+      # 相对强度阈值。
+      # uint8 图像中 0.1 等价于 >25.5；uint16 中等价于 >6553.5；float 图像中相对当前 volume max。
+      # 越高点数越少、假阳性更少；越低召回更多弱点但下游 decoded/background 会增加。
+      threshold_rel: 0.1
+
+      # 是否排除边界候选点。
+      # 当前 native Max3D regional-max 路线允许边界 plateau；该字段仍保留在配置中供 provider/旧路径读取。
       exclude_border: true
+
+  # ------------------------------------------
+  # Stage 3: Extraction (提取)
+  # ------------------------------------------
   extraction:
-    method: box_sum
-    provider: native
-    integration_box:
-    - 3
-    - 3
-    - 3
-    handle_out_of_bounds: pad_zero
-    transform_application_mode: image_warp
+    # 强度提取方法。
+    # 当前支持/推荐 box_sum：在每个 spot 周围固定窗口内积分各 round/channel 强度。
+    method: "box_sum"
+
+    # extraction provider。
+    # native = Python 实现；matlab = MATLAB extraction seam。MATLAB provider 当前只支持 method="box_sum"。
+    provider: "native"
+
+    # 积分窗口尺寸 [Z, Y, X]，单位 pixel。
+    # 当前 [3,3,3] 表示以 spot 为中心的小立方体积分。
+    # 过小会漏掉偏移/扩散信号；过大会混入邻近 spot 和背景。
+    integration_box: [3, 3, 3]
+
+    # spot 或 warp 后坐标落到图像外时的处理方式。
+    # pad_zero = 出界区域按 0 处理，避免 wrapping 造成假信号。
+    handle_out_of_bounds: "pad_zero"
+
+    # transform 应用方式。
+    #   image_warp          = 先把每轮图像 warp 到参考坐标，再在参考 spot 位置取强度；当前推荐。
+    #   coordinate_mapping  = 把 spot 坐标映射到每轮图像再取强度；更依赖 field 方向/插值语义。
+    transform_application_mode: "image_warp"
+
+  # ------------------------------------------
+  # Stage 4: Output (输出)
+  # ------------------------------------------
   output:
-    directory: /gpfs/share/home/2201112433/labShare/2501111695/data/202512_mouse_testis_r1_leica/02_pystar_output
+    # PyStar 输出根目录。
+    # 每个 FOV 会写入 Position{fov}/output_pystar/，其中包含 transforms、spots、extraction、decoded、qc_reports、clean_data。
+    directory: "/gpfs/share/home/2201112433/labShare/2501111695/data/202512_mouse_testis_r1_leica/02_pystar_output"
+
+    # 是否保存 QC 图像。
+    # 实际 QC 图输出还同时受 pipeline.qc.enable 控制；大数据集开启会增加运行时间和磁盘占用。
     save_qc_images: true
+
+  # ------------------------------------------
+  # Stage 5: QC
+  # ------------------------------------------
   qc:
+    # QC 总开关。
+    # true = 生成可用的 QC 报告/图；false = 跳过大部分 QC 输出以节省时间。
     enable: true
+
+    # Registration QC：随机抽取 ROI 叠加检查配准效果。
     alignment_check:
-      roi_size: 512
-      num_samples: 3
-      blend_colors:
-      - green
-      - magenta
+      roi_size: 512       # ROI 边长，单位 pixel；越大越能看全局，越小越利于局部细节
+      num_samples: 3      # 每个 FOV 抽样 ROI 数；越多越稳但输出更多图
+      blend_colors: ["green", "magenta"] # 配准前后/参考移动图叠加颜色
+
+    # 表达量/相关性 QC 图输出参数。
     correlation_plot:
-      dpi: 150
-      show_threshold: true
+      dpi: 150            # 输出图片分辨率；论文图可提高，常规 QC 保持 150 足够
+      show_threshold: true # 是否在图中显示参考阈值线/辅助线

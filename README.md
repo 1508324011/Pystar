@@ -1,20 +1,21 @@
 # PyStar
 
-PyStar 是一个面向空间转录组图像处理的 Python 管道，覆盖从原始显微镜图像到解码结果的主要处理链路。当前发布口径以 **Python-native PyStar 流程** 为主线；仓库中同时保留 MATLAB 兼容/提供者相关实现，用于持续开发与验证，但**不属于当前受支持的用户工作流**。
+PyStar 是一个面向空间转录组图像处理的 Python 管道，覆盖从原始显微镜图像到解码结果的主要处理链路。当前发布口径以 **Python-native PyStar 流程** 为主线；仓库中同时保留 MATLAB 兼容/提供者相关实现。MATLAB provider 现在可以通过 PyStar 调用，并在内部 benchmark 中接近 STATE，但仍处于测试阶段，不属于默认生产工作流。
 
 ## 当前支持状态
 
 ### 受支持
 - Python-native PyStar 预处理、配准、Spot finding、信号提取与解码流程
+- 当前推荐的 native spot finding baseline（`algorithm: peak_local_max`）
 - 本次同步纳入的非 MATLAB 运行时改进
 - 以 `config/experiment_config.yaml` 为示例入口、在本仓库内运行的 Python 管道
 
 ### 实验性 / 暂不支持
-- `provider='matlab'` 的运行时调用路径
-- MATLAB compatibility/provider 集成
-- MATLAB-backed 的生产工作流、对外承诺或发布级支持
+- `provider='matlab'` 的运行时调用路径（可以调用，但仍是 testing/experimental path）
+- MATLAB compatibility/provider 集成的生产化承诺
+- MATLAB-backed 的默认生产工作流、对外承诺或发布级支持
 
-> MATLAB 相关代码和 `matlab_runtime/` 资源保留在仓库中，目的是让开发与验证工作保持可见；它们仍处于主动测试阶段，不应被视为当前 release-ready 能力。
+> MATLAB 相关代码和 `matlab_runtime/` 资源保留在仓库中，目的是让开发与验证工作保持可见。它们可以被 PyStar provider seam 调用，但仍处于主动测试阶段，不应被视为当前 release-ready 能力。
 
 ## 安装
 
@@ -40,9 +41,11 @@ pixi run --manifest-path env/pixi.toml -e pystar python -c "import pystar; print
 ### 1. 准备配置文件
 
 - 示例配置：`config/experiment_config.yaml`
+- 配置说明：`config/README.md`
 - 当前示例配置默认走 **Python-native** 主线（`provider: native`）
 - 示例配置里的 `dataset.raw_data_path`、`codebook.gene_list` 和 `pipeline.output.directory` 仍是集群上的站点路径；在你自己的环境中运行前，请先改成可访问的本地/集群路径
-- 若你手动启用 MATLAB provider，请将其视为实验功能，而不是受支持路径
+- 当前示例使用 `pipeline.spot_finding.algorithm: peak_local_max`，参考阈值为 `threshold_rel: 0.1`
+- 若你手动启用 MATLAB provider，请将其视为测试功能，而不是默认生产路径
 
 ### 2. 运行完整单个 FOV 流程
 
@@ -149,6 +152,7 @@ repo-root/
 - `sitecustomize.py`
 
 这些内容用于**开发、验证和未来兼容性工作**。当前发布说明下：
+- 它们可以通过 PyStar provider seam 被调用
 - 它们不是默认路径
 - 它们不是生产承诺
 - 它们失败时应显式报错，而不是静默回退成受支持路径

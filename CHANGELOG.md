@@ -2,6 +2,14 @@
 
 This file tracks notable updates to `PyStar`.
 
+## 2026-04-29
+
+### Native Max3D and configuration refresh
+
+- Synced the current PyStar runtime modules from `pystar-next`, including the native Max3D regional-max spot-finding baseline behind the existing `algorithm: peak_local_max` compatibility token.
+- Refreshed `config/experiment_config.yaml` so the pipeline section follows the current Exp2-derived Python-native reference parameters while preserving the existing example layout for dataset, codebook, round structure, and site paths.
+- Added `config/README.md` with parameter explanations for the example config and clarified that MATLAB provider seams can be invoked through PyStar but remain testing/experimental rather than the default production workflow.
+
 ## 2026-04-21
 
 ### Python-native release prep

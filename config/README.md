@@ -1,0 +1,93 @@
+# PyStar 配置说明
+
+`experiment_config.yaml` 是当前发布仓库的示例入口。它采用当前开发工作区的可读版式：用分段标题组织模块、用行内列表表示短参数、并在关键参数旁直接写清楚可修改项和含义。`pipeline` 段已经同步到当前最接近 MATLAB/STATE 行为的 Python-native 参考参数。
+
+运行前通常只需要先改三类路径：
+
+- `dataset.raw_data_path`：原始 TIFF 数据根目录。
+- `codebook.gene_list`：基因表/码本 CSV。
+- `pipeline.output.directory`：PyStar 输出目录。
+
+## `dataset`
+
+- `raw_data_path`：原始输入根目录。所有原始图像路径都应从这里和 `filename_pattern` 推导，不要在代码里硬编码本地路径。
+- `filename_pattern`：每张图像的相对路径模板，支持 `{round}`、`{fov}`、`{ch}` 占位符。
+- `pixel_size_xy_nm` / `pixel_size_z_nm`：像素物理尺寸，用于记录显微镜几何信息。
+- `dimensions`：单个 FOV 的体数据尺寸，当前 Leica 示例为 `z=42`、`height=2048`、`width=2048`。
+- `io_chunk_size`：读写大图像时使用的 chunk 尺寸。
+- `fov_list`：要处理的 FOV 范围，例如 `1-324`。
+- `round_structure`：每轮可用 channel 列表。示例用 `1: [0, 1, 2, 3]` 这种逐轮展开写法，便于检查输入数据结构。
+- `channel_roles`：每个 channel 的角色，`seq` 表示测序 channel，`anchor` 表示 anchor channel。
+
+## `codebook`
+
+- `gene_list`：基因/条码 CSV 路径。
+- `channel_base_index`：码本中 channel 编码的起始编号。当前 Leica/STATE 相关数据使用 `1`。
+- `encoding_tables`：碱基组合到 channel 的映射表。
+- `topology.func`：条码拓扑变换函数，当前示例使用 `reverse_string`。
+- `topology.structure`：各条码片段的长度、轮次、CSV 切片、anchor base 和编码表。
+- `topology.physical_order`：物理读段顺序。
+
+## `providers`
+
+`providers.matlab` 记录 MATLAB provider seam 的 runtime 路径和入口函数。它用于开发验证和兼容性测试；默认 pipeline 仍使用 `provider: native`。
+
+如果手动启用 MATLAB provider，请把它视为实验功能。MATLAB provider 不做静默 fallback：MATLAB runtime 或 MATLAB Engine 不可用时应直接失败。
+
+## `pipeline`
+
+- `scope_mode: full_fov`：以完整 FOV 为处理单位，保持当前 Python-native 参考路径。
+- `accelerator: cpu`：默认 CPU。GPU 相关路径仍是实验性能力。
+- `field_semantics`：位移场语义记录。当前为 residual field，按 global 后 local 的顺序组合，状态仍标记为 provisional。
+
+### `pipeline.preprocessing`
+
+`sequence` 按顺序执行预处理步骤：
+
+- `none`：占位步骤，保持原始输入进入统一步骤链。
+- `min_max_normalize`：强度归一化。
+- `histogram_match` with `scope: inter_round`：跨 round 直方图匹配。
+- `histogram_match` with `scope: intra_round`：round 内 channel 直方图匹配。
+- `morpho_reconstruction_contrast`：形态学重建增强；当前参考参数为 `radius: 5`、`downsample_factor: 0.25`。
+
+默认每步 `provider: native`，对应纯 Python 实现。
+
+### `pipeline.registration`
+
+- `reference_round: 1`：配准参考 round。为保持 MATLAB/STATE parity，除非有新证据，不建议改动。
+- `source.method: mip_all_channels`：使用指定测序 channel 的 MIP 作为配准源。
+- `source.mip_channels`：参与 MIP 的 channel，当前为 `0, 1, 2`。
+- `global`：全局 3D phase correlation，当前 `provider: native`，`max_shift: 200`。
+- `local`：局部 `demons_3d` refinement，当前 `num_iter: 50`、`smoothing_sigma: 1.0`。
+- `guards.reject_if_correlation_worse: true`：局部 refinement 如果让相关性变差，应拒绝该 refinement。
+- `save_displacement_fields`：保存位移场，便于后续 signal extraction 和调试。
+- `save_registered_images`：是否保存 registered image；默认关闭以减少输出体积。
+
+### `pipeline.spot_finding`
+
+- `algorithm: peak_local_max`：当前推荐的 native spot finding 算法入口。
+- `provider: native`：默认走纯 Python spot finding。
+- `reference_round: 1`：spot finding 的参考 round。
+- `method: max_intensity`：按最大强度聚合候选点。
+- `peak_local_max.threshold_rel: 0.1`：当前参考阈值，与 MATLAB/STATE max3d 的 `intensity_threshold=0.1` 对齐。
+- `peak_local_max.min_distance: 2` 和 `exclude_border: true`：spot finding 的默认空间参数，通常先保持示例值。
+- `spotiflow` / `blob_dog`：备用算法参数，不是当前推荐参考路径。
+
+### `pipeline.extraction`
+
+- `method: box_sum`：以候选点附近 box 进行信号积分。
+- `provider: native`：默认走纯 Python extraction。
+- `integration_box: [3, 3, 3]`：积分窗口尺寸。
+- `handle_out_of_bounds: pad_zero`：边界外按 0 padding。
+- `transform_application_mode: image_warp`：使用图像 warp 后的体数据进行 extraction；这是当前参考路径。
+
+### `pipeline.output` 与 `pipeline.qc`
+
+- `output.directory`：输出根目录。
+- `output.save_qc_images`：是否保存 QC 图像。
+- `qc.enable`：是否启用 QC 输出。
+- `qc.alignment_check` / `qc.correlation_plot`：配准和相关性 QC 图的参数。
+
+## MATLAB provider 状态
+
+当前 PyStar 可以通过 MATLAB provider 调用 MATLAB-backed preprocessing/registration/spot finding/extraction seam；内部 benchmark 中，全 MATLAB-provider 路线已经能接近 STATE。这个能力仍处于测试阶段，不是默认生产路径，也不替代 Python-native 示例配置。
