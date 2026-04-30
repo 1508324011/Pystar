@@ -1,5 +1,6 @@
 # pystar/mining.py
 import json
+import time
 from typing import Any, Optional
 
 import numpy as np
@@ -24,6 +25,10 @@ from .io import (
     validate_scope_contract,
 )
 from .io import get_fov_output_structure
+from .matlab_engine_bootstrap import (
+    merge_matlab_session_lifecycle_summaries,
+    summarize_matlab_boundary_traces,
+)
 from .matlab_extraction import MATLABExtractionBackend
 # visualization 模块保留引用，按需导入即可
 
@@ -48,12 +53,29 @@ def _write_backend_metadata(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=True), encoding="utf-8")
 
 class SignalMiner:
+    """Extract per-round sequencing-channel intensities at detected spots.
+
+    Mining is the bridge between geometry and decoding. It reads reference-frame
+    spot coordinates from `spots/spots_fov_<id>.csv`, replays the registration
+    transform for every imaging round/channel, and writes an intensity tensor of
+    shape `(N_spots, N_rounds, N_seq_channels)` to `extraction/`.
+
+    All spot coordinates are `z, y, x` pixels in the reference round. Depending
+    on `pipeline.extraction.transform_application_mode`, PyStar either maps
+    those coordinates into the moving image (`coordinate_mapping`) or first
+    warps the moving image into reference space (`image_warp`) and then samples
+    the original coordinates. Native and MATLAB extraction providers share the
+    same transform and scope checks so provider differences isolate integration
+    semantics rather than contract handling.
+    """
+
     def __init__(self, config: ExperimentConfig):
         self.cfg = config
         self.loader = ImageLoader(config)
         self._matlab_backend: Optional[MATLABExtractionBackend] = None
 
     def close(self) -> None:
+        """Release the optional MATLAB extraction backend session."""
         if self._matlab_backend is None:
             return
         try:
@@ -226,6 +248,13 @@ class SignalMiner:
         round_id: int,
         channel_id: int,
     ) -> tuple[Any, Optional[dict[str, Any]]]:
+        """Extract one `(N_spots,)` intensity vector for one round/channel.
+
+        `img_vol` is a cleaned moving-round volume. `ref_coords` are already
+        filtered to any legal transform scope. The returned metadata is `None`
+        for native extraction and a MATLAB boundary/provenance record for MATLAB
+        extraction.
+        """
         expected_semantics = self._expected_field_semantics()
         provider = self.cfg.pipeline.extraction.provider
 
@@ -285,6 +314,14 @@ class SignalMiner:
         return result['intensities'], result.get('backend_metadata')
 
     def mine_fov(self, fov_id: int):
+        """Run signal extraction for every configured round/channel in one FOV.
+
+        The method validates transform release contracts before touching image
+        data, keeps tile-local coordinates inside the delivered region, and
+        leaves out-of-scope rows as zeros in the final tensor. That makes scope
+        effects explicit in the saved matrix instead of silently extrapolating
+        deformation fields.
+        """
         print(f"[{'='*20} Mining FOV {fov_id} {'='*20}]")
         base_dir = Path(self.cfg.pipeline.output.directory)
         paths = get_fov_output_structure(base_dir, fov_id)
@@ -379,8 +416,27 @@ class SignalMiner:
 
         # 4. Save
         out_name = paths["extraction"] / f"intensity_matrix_fov_{fov_id}.npy"
+        persistence_started = time.perf_counter()
         np.save(out_name, intensity_matrix)
         if extraction_provider == 'matlab' and backend_records:
+            boundary_traces = [
+                trace
+                for record in backend_records
+                if isinstance(record, dict)
+                for trace in [record.get("boundary_instrumentation")]
+                if isinstance(trace, dict)
+            ]
+            session_summaries = [
+                summary
+                for record in backend_records
+                if isinstance(record, dict)
+                for summary in [record.get("session_lifecycle_summary")]
+                if isinstance(summary, dict)
+            ]
+            boundary_summary = summarize_matlab_boundary_traces(boundary_traces) if boundary_traces else None
+            persistence_ms = round((time.perf_counter() - persistence_started) * 1000.0, 3)
+            if boundary_summary is not None:
+                boundary_summary["fov_canonical_persistence_ms"] = persistence_ms
             _write_backend_metadata(
                 paths["qc"] / f"extraction_backend_fov_{fov_id}.json",
                 {
@@ -389,6 +445,8 @@ class SignalMiner:
                     "fov_id": int(fov_id),
                     "transform_application_mode": transform_application_mode,
                     "records": backend_records,
+                    "boundary_instrumentation_summary": boundary_summary,
+                    "session_lifecycle_summary": merge_matlab_session_lifecycle_summaries(session_summaries) if session_summaries else None,
                 },
             )
         print(f" [Miner] Saved extraction matrix to {out_name.name} | Shape: {intensity_matrix.shape}")

@@ -1,24 +1,47 @@
+"""Composable rule helpers for spot and barcode filtering.
+
+Each rule receives a context dictionary built by ``Decoder.decode_fov`` and
+returns ``(keep_mask, penalty, details)``. Hard rules intersect their keep masks;
+soft rules contribute weighted penalties that can later be gated by
+``max_soft_penalty``. This module intentionally keeps rule functions small and
+stateless so new filter policies can be described in YAML without changing the
+decode loop.
+"""
+
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping
 
 import numpy as np
+import numpy.typing as npt
+
+
+BoolArray = npt.NDArray[np.bool_]
+FloatArray = npt.NDArray[np.float32]
 
 
 def _rule_value(rule: Any, key: str, default: Any) -> Any:
+    """Read a rule field from either a mapping or a Pydantic-style object."""
     if isinstance(rule, Mapping):
         return rule.get(key, default)
     return getattr(rule, key, default)
 
 
 def _rule_params(rule: Any) -> Dict[str, Any]:
+    """Return a plain dict of rule parameters, treating missing params as empty."""
     params = _rule_value(rule, "params", {})
     if params is None:
         return {}
     return dict(params)
 
 
-def rule_quality_mean_lt(context: Dict[str, Any], params: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+def rule_quality_mean_lt(context: Dict[str, Any], params: Dict[str, Any]) -> tuple[BoolArray, FloatArray, Dict[str, Any]]:
+    """Keep spots whose mean normalized base-call score is below threshold.
+
+    ``base_scores`` are tie/ambiguity scores from color calling, so lower is
+    better. Invalid spots are never rescued by this rule; they remain false in
+    the returned keep mask and carry zero soft penalty.
+    """
     base_scores = context["base_scores"]
     is_valid = context["is_valid"]
     threshold = float(params.get("threshold", context.get("quality_threshold", 0.5)))
@@ -44,7 +67,14 @@ def rule_quality_mean_lt(context: Dict[str, Any], params: Dict[str, Any]) -> Tup
     return keep, penalty, details
 
 
-def rule_channel_margin_mean_gt(context: Dict[str, Any], params: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+def rule_channel_margin_mean_gt(context: Dict[str, Any], params: Dict[str, Any]) -> tuple[BoolArray, FloatArray, Dict[str, Any]]:
+    """Keep spots with enough average separation between top two channels.
+
+    The rule measures the per-round margin between the brightest and second
+    brightest normalized sequencing channels, then averages over rounds. It is a
+    discriminability filter: low margin means the color call is weak even if the
+    brightest channel exists.
+    """
     norm_matrix = context["norm_matrix"]
     is_valid = context["is_valid"]
     threshold = float(params.get("threshold", 0.0))
@@ -78,7 +108,8 @@ def rule_channel_margin_mean_gt(context: Dict[str, Any], params: Dict[str, Any])
     return keep, penalty, details
 
 
-def rule_end_base_pattern(context: Dict[str, Any], params: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+def rule_end_base_pattern(context: Dict[str, Any], params: Dict[str, Any]) -> tuple[BoolArray, FloatArray, Dict[str, Any]]:
+    """Keep barcodes satisfying the topology-specific anchor/end-base pattern."""
     df = context["df"]
     validator = context["validator"]
 
@@ -92,7 +123,8 @@ def rule_end_base_pattern(context: Dict[str, Any], params: Dict[str, Any]) -> Tu
     return keep, penalty, details
 
 
-def rule_keep_all(context: Dict[str, Any], params: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+def rule_keep_all(context: Dict[str, Any], params: Dict[str, Any]) -> tuple[BoolArray, FloatArray, Dict[str, Any]]:
+    """Pass-through rule used for debugging or explicit no-filter stages."""
     n_items = int(context["n_items"])
     keep = np.ones(n_items, dtype=bool)
     penalty = np.zeros(n_items, dtype=np.float32)
@@ -113,6 +145,7 @@ BARCODE_RULES = {
 
 
 def default_rules(quality_threshold: float) -> List[Dict[str, Any]]:
+    """Build the default hard filters matching the legacy decode gate."""
     return [
         {
             "name": "quality_mean_lt",
@@ -140,7 +173,14 @@ def apply_rule_pipeline(
     rules: List[Any],
     context: Dict[str, Any],
     max_soft_penalty: float | None,
-) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
+) -> tuple[BoolArray, FloatArray, List[Dict[str, Any]]]:
+    """Apply enabled rules for one decode stage and return masks plus reports.
+
+    ``stage`` selects either spot-level rules, which run before barcode strings
+    are trusted, or barcode-level rules, which run on assembled barcodes. Unknown
+    rule names fail loudly because silently skipping a requested filter would
+    change decoded output semantics.
+    """
     if stage == "spot":
         registry = SPOT_RULES
     elif stage == "barcode":

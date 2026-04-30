@@ -1,13 +1,20 @@
 import json
+import time
 import numpy as np
 import pandas as pd
 import tifffile
 from pathlib import Path
 from typing import Any, Optional, cast
+from numpy.typing import NDArray
 from scipy import ndimage
-from skimage.feature import peak_local_max, blob_dog
+from skimage.feature import blob_dog
+from skimage.morphology import local_maxima
 from .io import ImageLoader
 from .io import get_fov_output_structure, get_matlab_stage_contract
+from .matlab_engine_bootstrap import (
+    merge_matlab_session_lifecycle_summaries,
+    summarize_matlab_boundary_traces,
+)
 from .matlab_spot_finding import MATLABSpotFindingBackend
 from .visualization import inspect_spots_interactive
 
@@ -31,7 +38,76 @@ def _json_safe(value: Any) -> Any:
 def _write_backend_metadata(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=True), encoding="utf-8")
 
+def _empty_spots_dataframe() -> pd.DataFrame:
+    """Return an empty spot table with the canonical numeric columns."""
+    return pd.DataFrame({
+        'z': pd.Series(dtype=np.float32),
+        'y': pd.Series(dtype=np.float32),
+        'x': pd.Series(dtype=np.float32),
+        'intensity': pd.Series(dtype=np.float32),
+    })
+
+
+def _threshold_reference_value(vol_3d: NDArray[np.generic]) -> float:
+    """Choose the intensity scale used by relative Max3D thresholds.
+
+    Integer images use the physical dtype ceiling so `threshold_rel=0.1` means
+    25.5 for uint8 and 6553.5 for uint16. Floating images use their observed
+    maximum, which keeps notebook experiments and normalized arrays usable
+    without forcing a dtype conversion.
+    """
+    if vol_3d.dtype == np.uint8:
+        return 255.0
+    if vol_3d.dtype == np.uint16:
+        return 65535.0
+    return float(vol_3d.max())
+
+
+def _detect_max3d_regional_maxima(vol_3d: NDArray[np.generic], threshold_rel: float) -> pd.DataFrame:
+    """Detect native Max3D spots as 26-connected regional maxima.
+
+    The detector returns one spot per connected plateau rather than one spot per
+    bright voxel. The plateau is summarized by a geometric centroid in `z, y, x`
+    pixel coordinates and by the maximum voxel intensity inside that plateau.
+    This mirrors the STATE/MATLAB max3d interpretation closely enough for the
+    Python-native baseline while preserving PyStar's canonical spot table schema.
+    """
+    abs_thresh = threshold_rel * _threshold_reference_value(vol_3d)
+    regional_max_mask = np.asarray(local_maxima(vol_3d, connectivity=3, allow_borders=True), dtype=bool)
+    threshold_mask = np.asarray(np.greater(vol_3d, abs_thresh), dtype=bool)
+    mask = regional_max_mask & threshold_mask
+    structure = np.ones((3, 3, 3), dtype=bool)
+    labeled, n_spots = cast(tuple[object, int], ndimage.label(mask, structure=structure))
+
+    if n_spots == 0:
+        return _empty_spots_dataframe()
+
+    indices = np.arange(1, n_spots + 1)
+    geometric_centroids = ndimage.center_of_mass(mask.astype(np.uint8), labeled, indices)
+    max_intensities = ndimage.maximum(vol_3d, labeled, indices)
+
+    coords = np.asarray(geometric_centroids, dtype=np.float32)
+    df = pd.DataFrame({'z': coords[:, 0], 'y': coords[:, 1], 'x': coords[:, 2]})
+    df['intensity'] = np.asarray(max_intensities, dtype=np.float32)
+    return df
+
+
 class SpotFinder:
+    """Convert cleaned reference-round images into candidate spot coordinates.
+
+    `SpotFinder` reads one clean 3D TIFF per sequencing channel from the
+    canonical `clean_data/` directory and writes `spots/spots_fov_<id>.csv`.
+    Spot coordinates are always `z, y, x` pixel coordinates in the reference
+    round frame. The output also carries `channel`, `fov`, and `algo` columns so
+    downstream extraction and QC can recover how each coordinate was produced.
+
+    The `provider` switch is the boundary between Python-native detection and
+    MATLAB-backed detection. Native algorithms run in this class; MATLAB mode
+    delegates the image volume to `MATLABSpotFindingBackend` and then normalizes
+    the returned table into the same PyStar schema. No provider silently falls
+    back to another implementation.
+    """
+
     def __init__(self, config):
         self.cfg = config
         self.spot_cfg = config.pipeline.spot_finding
@@ -42,6 +118,7 @@ class SpotFinder:
         self._matlab_backend: Optional[MATLABSpotFindingBackend] = None
 
     def close(self) -> None:
+        """Release the optional MATLAB backend session owned by this finder."""
         if self._matlab_backend is None:
             return
         try:
@@ -76,8 +153,13 @@ class SpotFinder:
 
     def find_spots_in_fov(self, fov_id: int):
         """
-        主入口：把图像变成坐标。
-        直接读取 clean_data 里的单独通道文件进行寻点。
+        Detect all sequencing-channel spots for one FOV.
+
+        The method reads the configured reference round from `clean_data/`, runs
+        the selected detector independently on each sequencing channel, injects
+        provenance columns, and persists the merged result to the canonical
+        spots CSV. Missing clean channel files are skipped loudly at the channel
+        level; a FOV with no detected channel data returns an empty table.
         """
         base_dir = Path(self.cfg.pipeline.output.directory)
         paths = get_fov_output_structure(base_dir, fov_id)
@@ -153,6 +235,20 @@ class SpotFinder:
         # 4. 合并结果
         if not all_spots_dfs:
             if self.spot_cfg.provider == "matlab" and backend_records:
+                boundary_traces = [
+                    trace
+                    for record in backend_records
+                    if isinstance(record, dict)
+                    for trace in [record.get("boundary_instrumentation")]
+                    if isinstance(trace, dict)
+                ]
+                session_summaries = [
+                    summary
+                    for record in backend_records
+                    if isinstance(record, dict)
+                    for summary in [record.get("session_lifecycle_summary")]
+                    if isinstance(summary, dict)
+                ]
                 _write_backend_metadata(
                     paths["qc"] / f"spot_finding_backend_fov_{fov_id}.json",
                     {
@@ -162,6 +258,8 @@ class SpotFinder:
                         "reference_round": int(ref_round),
                         "algorithm": final_algo,
                         "channel_results": backend_records,
+                        "boundary_instrumentation_summary": summarize_matlab_boundary_traces(boundary_traces) if boundary_traces else None,
+                        "session_lifecycle_summary": merge_matlab_session_lifecycle_summaries(session_summaries) if session_summaries else None,
                     },
                 )
             print(" [SpotFinding] No spots found in any channel!")
@@ -175,8 +273,27 @@ class SpotFinder:
 
         # 固化结果
         out_csv = paths["spots"] / f"spots_fov_{fov_id}.csv"
+        persistence_started = time.perf_counter()
         df.to_csv(out_csv, index=False)
         if self.spot_cfg.provider == "matlab" and backend_records:
+            boundary_traces = [
+                trace
+                for record in backend_records
+                if isinstance(record, dict)
+                for trace in [record.get("boundary_instrumentation")]
+                if isinstance(trace, dict)
+            ]
+            session_summaries = [
+                summary
+                for record in backend_records
+                if isinstance(record, dict)
+                for summary in [record.get("session_lifecycle_summary")]
+                if isinstance(summary, dict)
+            ]
+            boundary_summary = summarize_matlab_boundary_traces(boundary_traces) if boundary_traces else None
+            persistence_ms = round((time.perf_counter() - persistence_started) * 1000.0, 3)
+            if boundary_summary is not None:
+                boundary_summary["fov_canonical_persistence_ms"] = persistence_ms
             _write_backend_metadata(
                 paths["qc"] / f"spot_finding_backend_fov_{fov_id}.json",
                 {
@@ -186,6 +303,8 @@ class SpotFinder:
                     "reference_round": int(ref_round),
                     "algorithm": final_algo,
                     "channel_results": backend_records,
+                    "boundary_instrumentation_summary": boundary_summary,
+                    "session_lifecycle_summary": merge_matlab_session_lifecycle_summaries(session_summaries) if session_summaries else None,
                 },
             )
         print(f" [SpotFinding] Finished. Total: {len(df)} spots. Saved to {out_csv.name}")
@@ -210,7 +329,7 @@ class SpotFinder:
         return df
 
     def _run_spotiflow(self, vol_3d):
-        """Spotiflow 挖掘逻辑：精准回归。"""
+        """Run Spotiflow on one 3D volume and normalize its coordinate table."""
         model = self._get_spotiflow_model()
         params = self.spot_cfg.spotiflow
         
@@ -243,7 +362,7 @@ class SpotFinder:
         return df
 
     def _run_blob_dog(self, vol_3d):
-        """DoG 挖掘逻辑：数学形状匹配。"""
+        """Run Difference-of-Gaussians blob detection on one 3D volume."""
         params = self.spot_cfg.blob_dog
         blobs = blob_dog(
             vol_3d,
@@ -264,60 +383,19 @@ class SpotFinder:
         return df
 
     def _run_peak_local_max(self, vol_3d):
-        """Max3D 挖掘逻辑：快速但粗糙。"""
+        """Run the native Max3D regional-maxima baseline on one 3D volume."""
         params = self.spot_cfg.peak_local_max
-    
-        # 1. 极大值检测（布尔掩码，内存占用 = 原图的 1/8）
-        footprint = np.ones((3, 3, 3), dtype=bool)
-        max_filtered = ndimage.maximum_filter(
-            vol_3d, 
-            footprint=footprint, 
-            mode='constant',
-            cval=0  # 边界外视为 0，避免边界效应
-        )
-        is_max = (vol_3d == max_filtered)
-        
-        # 2. 阈值
-        if vol_3d.dtype in [np.uint8, np.uint16]:
-            dtype_max = 255 if vol_3d.dtype == np.uint8 else 65535
-        else:
-            dtype_max = vol_3d.max()
-        
-        abs_thresh = params.threshold_rel * dtype_max
-        mask = is_max & (vol_3d > abs_thresh)
-        
-        # 3. 快速连通性分析
-        labeled, n_spots = cast(tuple[object, int], ndimage.label(mask, structure=np.ones((3,3,3))))
-        
-        if n_spots == 0:
-            return pd.DataFrame({
-                'z': pd.Series(dtype=np.float32),
-                'y': pd.Series(dtype=np.float32),
-                'x': pd.Series(dtype=np.float32),
-                'intensity': pd.Series(dtype=np.float32),
-            })
-        
-        # 4. 向量化批量计算（比循环快 10-100 倍）
-        indices = np.arange(1, n_spots + 1)
-        
-        # 一次性计算所有质心和强度
-        centroids = ndimage.center_of_mass(vol_3d, labeled, indices)
-        max_intensities = ndimage.maximum(vol_3d, labeled, indices)
-        
-        # 5. 快速构造（避免列表推导）
-        coords = np.array(centroids)
-        df = pd.DataFrame({'z': coords[:, 0], 'y': coords[:, 1], 'x': coords[:, 2]})
-        df['intensity'] = max_intensities
-        
-        return df
+        return _detect_max3d_regional_maxima(vol_3d, params.threshold_rel)
         
 
     
 def _run_algo_on_channels(vol, run_fn):
     """
-    [Internal Helper] 
-    通用包装器：处理维度的统一逻辑。
-    让所有算法自动支持 3D (Single) 和 4D (Multi-channel) 输入。
+    Run a notebook helper on either a single 3D volume or a channel stack.
+
+    Input may be `(z, y, x)` or `(channel, z, y, x)`. The returned table always
+    includes a `channel` column, even for single-volume input, so ad-hoc
+    notebooks have the same shape as pipeline spot tables.
     """
     # 1. 维度归一化
     if vol.ndim == 3:
@@ -349,24 +427,27 @@ def _run_algo_on_channels(vol, run_fn):
 
 def detect_spots_max3d(vol_3d, threshold=0.05, min_dist=3):
     """
-    这是一个轻量级的辅助函数，专门在 Notebook 里做实验用的。
-    不用读文件，直接传内存里的数组就行。
+    Notebook helper for native Max3D regional-maxima detection.
+
+    Pass an in-memory `(z, y, x)` volume or `(channel, z, y, x)` stack and get a
+    `z, y, x, channel` table back. `min_dist` is kept as a historical call
+    parameter; the current Max3D implementation uses 26-connected regional
+    maxima and therefore does not suppress neighboring plateaus by distance.
     """
+    _ = min_dist
+
     def _logic(vol_3d):
-        coords = peak_local_max(
-            vol_3d,
-            min_distance=min_dist,
-            threshold_rel=threshold,
-            exclude_border=True
-        )
-        return pd.DataFrame({'z': coords[:, 0], 'y': coords[:, 1], 'x': coords[:, 2]})
+        df = _detect_max3d_regional_maxima(vol_3d, threshold)
+        return df[['z', 'y', 'x']]
 
     return _run_algo_on_channels(vol_3d, _logic)
 
 def detect_spots_blob_dog(vol_3d, min_sigma=(0.5, 0.5, 0.5), max_sigma=3, threshold=0.05, overlap=0.5):
     """
-    这是一个轻量级的辅助函数，专门在 Notebook 里做实验用的。
-    不用读文件，直接传内存里的数组就行。
+    Notebook helper for DoG spot detection on a volume or channel stack.
+
+    Sigma values are passed straight to `blob_dog`; anisotropic 3D sigmas may be
+    supplied as three-element tuples when z resolution differs from xy.
     """
     def _logic(vol_3d):
         blobs = blob_dog(
@@ -389,8 +470,11 @@ def detect_spots_blob_dog(vol_3d, min_sigma=(0.5, 0.5, 0.5), max_sigma=3, thresh
 
 def detect_spots_spotiflow(vol_3d, model_name="general", prob_thresh=0.5, use_gpu=True):
     """
-    这是一个轻量级的辅助函数，专门在 Notebook 里做实验用的。
-    不用读文件，直接传内存里的数组就行。
+    Notebook helper for running a Spotiflow pretrained model.
+
+    This helper loads the model immediately and is intended for interactive
+    experiments, not for pipeline-scale batch execution. The pipeline class
+    lazy-loads the model instead.
     """
     try:
         from spotiflow.model import Spotiflow  # pyright: ignore[reportMissingImports]

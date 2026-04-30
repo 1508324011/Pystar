@@ -1,12 +1,18 @@
 # pystar/decoding.py
-import numpy as np
-import pandas as pd
 from pathlib import Path
-from typing import Dict, Tuple, Callable
+from typing import Any, Callable, Dict, Tuple, cast
+
+import numpy as np
+import numpy.typing as npt
+import pandas as pd
 from tqdm import tqdm
 
 from .io import get_fov_output_structure
 from .infrastructure import ExperimentConfig
+
+
+NDArrayAny = npt.NDArray[Any]
+BoolArray = npt.NDArray[np.bool_]
 
 def softmax(x, axis=2, temperature=1.0):
     """
@@ -19,7 +25,7 @@ def softmax(x, axis=2, temperature=1.0):
     e_x = np.exp((x - np.max(x, axis=axis, keepdims=True)) / temperature)
     return e_x / e_x.sum(axis=axis, keepdims=True)
 
-def compatible_base_calling(norm_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def compatible_base_calling(norm_matrix: NDArrayAny) -> tuple[NDArrayAny, NDArrayAny, BoolArray]:
     """
     1. 找到每个round的max值
     2. 检测平局：如果有多个channel值相等，标记为-1和Inf
@@ -54,14 +60,14 @@ def compatible_base_calling(norm_matrix: np.ndarray) -> Tuple[np.ndarray, np.nda
     
     # 3. 计算read_indices
     #  maxColors(i,j) = m(1); 或 -1 如果平局
-    read_indices = np.argmax(norm_matrix, axis=2)  # (N, R)
+    read_indices = np.asarray(np.argmax(norm_matrix, axis=2), dtype=np.int32)  # (N, R)
     read_indices[has_tie] = -1  # 平局标记为-1
     
     # 4. 计算base_scores（负对数）
     #  baseScores(i,j) = -log(currMax);
     with np.errstate(divide='ignore', invalid='ignore'):  
         # 忽略log(0)和log(nan)的警告
-        base_scores = -np.log(max_vals)  # (N, R)
+        base_scores = np.asarray(-np.log(max_vals), dtype=np.float32)  # (N, R)
     
     # 平局的地方设为Inf
     #  baseScores(i,j) = Inf;
@@ -72,15 +78,15 @@ def compatible_base_calling(norm_matrix: np.ndarray) -> Tuple[np.ndarray, np.nda
     
     # 5. 全局有效性检查
     #  if ~any(isinf(baseScores(i, :)))
-    is_valid = ~np.any(np.isinf(base_scores), axis=1)  # (N,)
+    is_valid = np.asarray(~np.any(np.isinf(base_scores), axis=1), dtype=bool)  # (N,)
     
     return read_indices, base_scores, is_valid
 
 
 def compatible_quality_filter(
-    base_scores: np.ndarray, 
+    base_scores: NDArrayAny,
     threshold: float = 0.5
-) -> np.ndarray:
+) -> BoolArray:
     """
     belowScoreThresh = mean(allScores, 2) < 0.5;
     toKeep = belowScoreThresh & finiteScores;
@@ -106,12 +112,29 @@ def compatible_quality_filter(
     
     # Matlab逻辑：mean(score) < threshold 才保留
     # 因为score越小越好（-log的特性）
-    pass_filter = mean_scores < threshold
+    pass_filter = np.asarray(mean_scores < threshold, dtype=bool)
     
     return pass_filter
 
 
 class Decoder:
+    """Turn extracted per-round intensities into gene calls.
+
+    The decoder consumes two artifacts from earlier stages: the spot table
+    (`spots_fov_<id>.csv`) and the intensity tensor
+    (`intensity_matrix_fov_<id>.npy`). The tensor shape is
+    `(N_spots, N_rounds, N_seq_channels)`, where the spot axis is aligned with
+    the rows of the spot table. Coordinates and channel provenance are carried
+    through from the spot table unchanged.
+
+    Codebook handling is deliberately forward-simulated: configured gene
+    sequences are transformed into expected color barcodes, then observed color
+    calls are matched to those barcodes. The final decoded CSV may contain
+    `background` rows when the active gate keeps pattern-valid reads that are
+    not in the codebook; callers comparing against STATE goodPoints should
+    filter those rows when they need gene-only counts.
+    """
+
     def __init__(self, config: ExperimentConfig):
         self.cfg = config
         self.output_dir = Path(self.cfg.pipeline.output.directory)
@@ -121,10 +144,17 @@ class Decoder:
         self.gene_map, self.barcode_map = self._compile_codebook()
         self.reverse_lookups = self._build_reverse_lookups()
         
-    def _compile_codebook(self) -> Tuple[Dict[str, str], pd.DataFrame]:
+    def _compile_codebook(self) -> tuple[dict[str, str], pd.DataFrame]:
         """
-        [Critical Logic] Forward Simulation.
-        不反推碱基，而是把基因表的碱基序列(ACTG)直接翻译成期望的颜色序列(0123)。
+        Compile gene sequences into expected color barcodes.
+
+        This is the critical forward-simulation step. PyStar does not infer the
+        codebook by reversing the observed reads; it takes each gene sequence,
+        applies the configured topology transform, slices the sequence according
+        to `BlueprintSegment.csv_slice`, encodes each segment with its declared
+        color table, and concatenates segments in `physical_order`. Config
+        slices are 1-based inclusive and become Python's 0-based half-open
+        ranges inside this method.
         """
         codebook_cfg = self.cfg.codebook
         gene_list_path = Path(codebook_cfg.gene_list)
@@ -136,10 +166,10 @@ class Decoder:
         # 1. 读取基因表 (假设没有 header，或者根据实际情况修改)
         # 通常 genes.csv 结构是: GeneName, Sequence
         try:
-            df_genes = pd.read_csv(gene_list_path, header=None, names=['gene', 'seq'])
+            df_genes = cast(pd.DataFrame, pd.read_csv(gene_list_path, header=None, names=['gene', 'seq']))
         except Exception:
             # 兼容带有 header 的情况
-            df_genes = pd.read_csv(gene_list_path)
+            df_genes = cast(pd.DataFrame, pd.read_csv(gene_list_path))
             if 'gene' not in df_genes.columns: # fallback
                 df_genes.columns = ['gene', 'seq']
         
@@ -219,7 +249,7 @@ class Decoder:
         
         # 6. Checks & Output
         # 过滤掉生成失败的
-        valid_df = df_genes[df_genes['barcode'] != "ERROR_LEN"].copy()
+        valid_df = cast(pd.DataFrame, df_genes[df_genes['barcode'] != "ERROR_LEN"].copy())
         if len(valid_df) < len(df_genes):
             print(f" [Warning] {len(df_genes) - len(valid_df)} genes failed barcode generation (Check sequence lengths).")
 
@@ -237,8 +267,13 @@ class Decoder:
 
     def _create_encoder(self, mapping: Dict[str, int], base_idx: int) -> Callable[[str], str]:
         """
-        工厂函数：生成一个这就编码字符串的函数。
-        支持 Sliding Window (Window=2) 和 Direct Map (Window=Length)。
+        Build a sequence-to-color encoder for one configured table.
+
+        Two cases are supported by the same closure: a direct lookup when the
+        sequence length equals the table key length, and a sliding-window lookup
+        for standard two-base encodings. Color indices are normalized by
+        `base_idx` so the emitted barcode characters match Python argmax channel
+        indices (`0`, `1`, `2`, ...).
         """
         # 探测 Window Size
         keys = list(mapping.keys())
@@ -424,13 +459,14 @@ class Decoder:
     
     def _validate_end_bases(self, barcode: str) -> bool:
         """
-        验证单个barcode是否符合end bases规则
+        Validate one observed color barcode against configured anchor bases.
         
-        1. 按照topology将barcode切分成segments
-        2. 对每个segment：
-           a. 用anchor_base[0]作为起始碱基解码颜色序列
-           b. 检查解码后的序列最后一个碱基是否等于anchor_base[1]
-        3. 所有segments都通过验证才返回True
+        The barcode is split by topology segment length in physical round order.
+        For each segment that declares `anchor_base`, the first anchor base is
+        used as the start base for reverse decoding and the decoded end base is
+        compared with the second anchor base. Segments without anchors are
+        ignored. Every anchored segment must pass for the read to be pattern
+        valid.
         
         Parameters:
         -----------
@@ -491,6 +527,15 @@ class Decoder:
         return box[0] * box[1] * box[2]
 
     def decode_fov(self, fov_id: int):
+        """Decode one FOV and persist canonical decoded CSV artifacts.
+
+        The method performs channel-wise L2 normalization per round, calls the
+        brightest sequencing channel as the color, rejects ties/invalid reads,
+        applies the MATLAB-like mean quality threshold, constructs barcodes,
+        evaluates topology/end-base validity, maps barcodes to genes, and then
+        applies the configured gating mode. Two CSVs are written: the active-gate
+        output used downstream and a pre-pattern-check diagnostic table.
+        """
         print(f"[{'='*20} Decoding FOV {fov_id} {'='*20}]")
         
         base_dir = Path(self.cfg.pipeline.output.directory)
@@ -598,16 +643,17 @@ class Decoder:
         df_res['intensity'] = np.max(np.max(valid_raw_matrix, axis=2), axis=1)
         
         print(" -> Validating end bases pattern...")
-        
+
         gating_mode = self.cfg.pipeline.decoding.gating_mode
         print(f" -> Applying gating mode: {gating_mode}")
 
         # 应用验证函数到每个barcode
         pattern_valid = df_res['barcode'].apply(self._validate_end_bases)
-        in_codebook = df_res['barcode'].isin(self.gene_map)
 
         n_pattern_fail = (~pattern_valid).sum()
         pattern_fail_rate = n_pattern_fail / len(df_res) if len(df_res) > 0 else 0
+
+        in_codebook = df_res['barcode'].isin(self.gene_map)
         n_codebook = int(in_codebook.sum())
         codebook_rate = n_codebook / len(df_res) if len(df_res) > 0 else 0
 
@@ -616,11 +662,11 @@ class Decoder:
 
         # Gene mapping
         df_res['gene'] = df_res['barcode'].map(self.gene_map).fillna('background')
+
         df_res['pattern_valid'] = pattern_valid.values
         df_res['in_codebook'] = in_codebook.values
         df_res['gating_mode'] = gating_mode
 
-        # 过滤规则：默认保持当前 pattern-first 行为；实验模式下改成 legacy membership-first
         if gating_mode == 'legacy_membership_first':
             final_keep_mask = in_codebook
             print("   Using legacy membership-first gate: keeping all in-codebook reads after quality filter")
@@ -656,7 +702,7 @@ class Decoder:
         n_mapped = (df_res_true['gene'] != 'background').sum()
         mapping_rate_quality = n_mapped / len(df_res) if len(df_res) > 0 else 0
         mapping_rate_pattern = n_mapped / len(df_res_true) if len(df_res_true) > 0 else 0
-
+        
         print(f"\n [Mapping Results]")
         print(f"   Spots after quality filter: {len(df_res)}")
         print(f"   Spots after active gate:    {len(df_res_true)}")
@@ -686,7 +732,7 @@ class Decoder:
 
 if __name__ == "__main__":
     from pystar.infrastructure import load_config
-    cfg = load_config("config/experiment_config.yaml")
+    cfg = load_config("experiment_config.yaml")
     decoder = Decoder(cfg)
     try:
         decoder.decode_fov(1)
