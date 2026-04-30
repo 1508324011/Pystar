@@ -1,3 +1,13 @@
+"""Coordinate replay and signal extraction helpers.
+
+All public functions in this module use NumPy image coordinates in `z, y, x`
+order. Spot coordinates are expressed in the reference-round frame unless a
+function name explicitly says it maps them into a moving-round image. Transform
+payloads are the dictionaries persisted by `RegistrationEngine`; their
+`_semantics` and `_scope` metadata are treated as part of the runtime contract,
+not optional decoration.
+"""
+
 from collections.abc import Mapping
 from typing import cast
 
@@ -60,6 +70,26 @@ def validate_field_semantics(
     transform_data: TransformData,
     expected_field_semantics: Mapping[str, str] | None,
 ) -> dict[str, object]:
+    """Compare persisted transform semantics with the caller's expectation.
+
+    Parameters
+    ----------
+    transform_data:
+        Per-round transform dictionary loaded from the transform manifest. The
+        `_semantics` member, when present, declares field representation and
+        composition.
+    expected_field_semantics:
+        The semantics requested by the pipeline config. `None` means the caller
+        only wants the actual payload normalized, not enforced.
+
+    Returns
+    -------
+    dict
+        A small validation report containing `valid`, normalized `expected`,
+        normalized `actual`, and the list of mismatched semantic axes. Only
+        `representation` and `composition` are enforced because `status` is
+        provenance, not geometry.
+    """
     actual_payload = None if transform_data is None else transform_data.get("_semantics")
     actual = _normalize_field_semantics_payload(
         actual_payload,
@@ -169,7 +199,7 @@ def _map_coordinates_float32(
             mode=mode,
             cval=cval,
             prefilter=prefilter,
-        )
+    )
     return cast(FloatArray, np.asarray(mapped, dtype=np.float32))
 
 
@@ -195,6 +225,12 @@ def _broadcast_coordinate_views_3d(
     ]
 
 
+def _shape_3d(shape: tuple[int, ...], *, field_name: str) -> tuple[int, int, int]:
+    if len(shape) != 3:
+        raise ValueError(f"{field_name} must be 3D, got shape {shape}")
+    return (int(shape[0]), int(shape[1]), int(shape[2]))
+
+
 def _coerce_int_tuple(
     value: object,
     *,
@@ -215,6 +251,15 @@ def _coerce_int_tuple(
 
 
 def get_transform_scope(transform_data: TransformData) -> dict[str, object] | None:
+    """Return normalized spatial coverage metadata for a transform.
+
+    `None` means the transform does not declare a scope and is treated like a
+    full-FOV artifact by older callers. A returned scope has `coverage_mode`
+    (`full_fov` or `tile_local`), `region_origin_zyx`, `region_shape_zyx`, and
+    `full_volume_shape_zyx`. Tile-local scopes also contain `tile_grid_shape_yx`
+    and `tile_index` so extraction can reject coordinates outside the delivered
+    deformation field instead of extrapolating silently.
+    """
     if transform_data is None:
         return None
 
@@ -300,6 +345,12 @@ def coords_within_transform_scope(
     ref_coords: FloatArray,
     transform_data: TransformData,
 ) -> npt.NDArray[np.bool_]:
+    """Mask reference-frame coordinates that lie inside a transform scope.
+
+    Coordinates are compared against half-open intervals in `z, y, x` order:
+    `[origin, origin + shape)`. Full-FOV transforms accept every coordinate.
+    Tile-local transforms only accept spots inside the persisted tile region.
+    """
     scope = get_transform_scope(transform_data)
     if scope is None or scope["coverage_mode"] == "full_fov":
         return np.ones(len(ref_coords), dtype=bool)
@@ -354,6 +405,19 @@ def map_spot_coordinates(
     transform_data: TransformData,
     expected_field_semantics: Mapping[str, str] | None = None,
 ) -> FloatArray:
+    """Map reference-frame spot coordinates into a moving-round image.
+
+    This is the legacy/diagnostic `coordinate_mapping` replay path. Input and
+    output arrays have shape `(N, 3)` in `z, y, x` order. The first operation is
+    `mapped -= global_shift_3d`, because a spot observed at reference position
+    `p_ref` is sampled from moving image position `p_ref - shift`. Optional
+    `flow_2d` or `flow_3d` residual fields are then sampled at the mapped
+    coordinate and added component-wise.
+
+    The function fails loudly when field semantics disagree with the pipeline
+    contract, when a transform still contains unresolved sidecar descriptors,
+    or when tile-local scope metadata does not cover every requested spot.
+    """
     if transform_data is None:
         return ref_coords.astype(np.float32)
 
@@ -457,6 +521,14 @@ def map_spot_coordinates(
 
 
 def extract_box_sum_integer(img_vol: FloatArray, coords: FloatArray, box_size: tuple[int, int, int] = (1, 3, 3)) -> FloatArray:
+    """Sum a centered integer box around each coordinate.
+
+    Coordinates are rounded to the nearest voxel before summation. `box_size` is
+    `(z, y, x)` and uses integer half-widths (`size // 2`), so `(1, 3, 3)` sums
+    one z-plane and a 3x3 XY patch. Samples outside the image bounds contribute
+    zero; they are not renormalized by the number of in-bounds voxels. This
+    matches the fail-simple box-sum semantics used by the pipeline miners.
+    """
     d, h, w = img_vol.shape
     bz, by, bx = box_size
     rz, ry, rx = bz // 2, by // 2, bx // 2
@@ -491,6 +563,20 @@ def warp_volume_to_reference(
     transform_data: TransformData,
     expected_field_semantics: Mapping[str, str] | None = None,
 ) -> FloatArray:
+    """Warp one moving-round volume into reference-round coordinates.
+
+    The returned volume has the same `z, y, x` shape as `img_vol`, but its
+    pixels are sampled as if the moving round had been registered to the
+    reference round. The implementation uses inverse sampling: reference grid
+    coordinates are shifted by `-global_shift_3d`, then optional 3D residual
+    fields are applied before interpolation. Non-reference rounds in
+    `image_warp` mode require a materialized `flow_3d`; 2D flow is rejected
+    because it cannot define a full volumetric warp.
+
+    Tile-local transforms are allowed only when `_scope` precisely describes
+    the covered subvolume. In that mode only the scoped region is locally
+    deformed and stitched back into the full warped volume.
+    """
     data: dict[str, object] = {} if transform_data is None else dict(transform_data)
     _raise_if_field_semantics_mismatch(
         data,
@@ -511,11 +597,12 @@ def warp_volume_to_reference(
             'coordinate_mapping is the legacy diagnostic path for non-3D transforms'
         )
 
-    z_coords, y_coords, x_coords = _sparse_coordinate_bases_3d(img_vol.shape)
+    img_shape = _shape_3d(img_vol.shape, field_name='img_vol')
+    z_coords, y_coords, x_coords = _sparse_coordinate_bases_3d(img_shape)
     warped = _map_coordinates_float32(
         img_vol,
         _broadcast_coordinate_views_3d(
-            img_vol.shape,
+            img_shape,
             z_coords - global_shift[0],
             y_coords - global_shift[1],
             x_coords - global_shift[2],
@@ -541,14 +628,15 @@ def warp_volume_to_reference(
         if flow_arr.shape[1:] != (dz, dy, dx):
             raise ValueError(
                 f"tile_local flow_3d shape {flow_arr.shape[1:]} does not match persisted scope region {(dz, dy, dx)}"
-        )
+            )
         z1, y1, x1 = z0 + dz, y0 + dy, x0 + dx
         warped_region = warped[z0:z1, y0:y1, x0:x1]
-        local_z, local_y, local_x = _sparse_coordinate_bases_3d(warped_region.shape)
+        warped_region_shape = _shape_3d(warped_region.shape, field_name='tile_local warped region')
+        local_z, local_y, local_x = _sparse_coordinate_bases_3d(warped_region_shape)
         warped_local = _map_coordinates_float32(
             warped_region,
             _broadcast_coordinate_views_3d(
-                warped_region.shape,
+                warped_region_shape,
                 local_z + flow_arr[0],
                 local_y + flow_arr[1],
                 local_x + flow_arr[2],
@@ -568,11 +656,12 @@ def warp_volume_to_reference(
             'persist explicit _scope metadata for tile_local artifacts'
         )
 
-    z_coords, y_coords, x_coords = _sparse_coordinate_bases_3d(warped.shape)
+    warped_shape = _shape_3d(warped.shape, field_name='warped image volume')
+    z_coords, y_coords, x_coords = _sparse_coordinate_bases_3d(warped_shape)
     return _map_coordinates_float32(
         warped,
         _broadcast_coordinate_views_3d(
-            warped.shape,
+            warped_shape,
             z_coords + flow_arr[0],
             y_coords + flow_arr[1],
             x_coords + flow_arr[2],
@@ -592,6 +681,15 @@ def extract_signal_volume(
     transform_application_mode: str = 'coordinate_mapping',
     expected_field_semantics: Mapping[str, str] | None = None,
 ) -> FloatArray:
+    """Extract one intensity vector for one round/channel volume.
+
+    `ref_coords` are always reference-round `z, y, x` spot coordinates. In
+    `coordinate_mapping` mode they are first mapped into the moving image and
+    summed there. In `image_warp` mode the whole moving volume is registered to
+    reference space first, then the original reference coordinates are summed.
+    Both paths share the same box-sum implementation so differences between
+    them isolate transform-application semantics rather than integration logic.
+    """
     data: dict[str, object] = {} if transform_data is None else dict(transform_data)
     scope = _require_coords_within_scope(
         ref_coords,

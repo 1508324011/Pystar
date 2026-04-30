@@ -66,6 +66,16 @@ def parse_range_string(s: Union[str, int, List[int]]) -> List[int]:
 # --- Pydantic Models (数据校验) ---
 
 class DatasetConfig(BaseModel):
+    """Raw image input contract for one experiment.
+
+    This model describes how PyStar discovers raw TIFF stacks before any
+    pipeline stage runs. `filename_pattern` is formatted with `round`, `fov`
+    and `ch`; `round_structure` states which physical channels exist in each
+    imaging round; `channel_roles` declares which channels are sequencing
+    signal versus auxiliary channels. Runtime code must derive all raw input
+    paths from these fields, never from hard-coded local paths.
+    """
+
     raw_data_path: Path
     filename_pattern: str
     pixel_size_xy_nm: float
@@ -97,6 +107,15 @@ class DatasetConfig(BaseModel):
         return self
 
 class BlueprintSegment(BaseModel):
+    """One logical barcode segment in the codebook topology.
+
+    A segment maps a slice of the gene-list sequence (`csv_slice`, 1-based
+    inclusive in the YAML) to one or more physical imaging rounds. The encoder
+    named by `encoding_table` converts bases in that slice into color/channel
+    indices. `anchor_base`, when present, provides start/end bases used by the
+    decoder to validate barcode pattern semantics.
+    """
+
     id: str
     rounds: List[int]       # 物理轮次，如 [1, 2, 3, 4, 5]
     csv_slice: List[int]    # CSV 里的切片 [Start, End] (1-based physical index recommended for config, logic handles conversion)
@@ -106,11 +125,28 @@ class BlueprintSegment(BaseModel):
     
     
 class TopologyConfig(BaseModel):
+    """Barcode assembly blueprint shared by codebook compilation and decoding.
+
+    `structure` defines each named segment; `physical_order` says how those
+    segments are concatenated to match the round order emitted by extraction.
+    `func` is a global sequence transform applied before segment slicing, for
+    example `reverse_string` for data whose gene-list sequence orientation is
+    opposite to imaging order.
+    """
+
     func: str = "none" # "reverse_string" etc.
     structure: List[BlueprintSegment]
     physical_order: List[str] # 决定最终 barcode 拼接的顺序
 
 class CodebookConfig(BaseModel):
+    """Codebook and color-encoding configuration.
+
+    `gene_list` points to the gene/sequence CSV. `encoding_tables` map base
+    pairs or short motifs to color-channel IDs. `channel_base_index` tells
+    PyStar whether the table is authored with 0-based or 1-based channel
+    numbers; runtime decoding normalizes to Python 0-based color indices.
+    """
+
     gene_list: Path
     channel_base_index: int  # 用户填 0 或 1
     encoding_tables: Dict[str, Dict[str, int]]
@@ -190,6 +226,13 @@ class PreprocessingConfig(BaseModel):
 
 
 class MatlabMorphologyConfig(BaseModel):
+    """MATLAB morphology parameters for MATLAB-backed preprocessing.
+
+    These values are forwarded to the repo-local MATLAB preprocessing runtime.
+    They only affect preprocessing steps that explicitly select
+    `provider: matlab`; native preprocessing ignores this section.
+    """
+
     method: Literal["2d", "2d_thres", "3d"] = "2d"
     radius: int = Field(default=2, gt=0)
     height: int = Field(default=3, gt=0)
@@ -198,6 +241,14 @@ class MatlabMorphologyConfig(BaseModel):
 
 
 class MatlabPreprocessingProviderConfig(BaseModel):
+    """Boundary contract for MATLAB-backed preprocessing.
+
+    `runtime_path` must stay inside the PyStar repository and point to the
+    MATLAB functions shipped with this package. The dtype/loader fields record
+    how arrays cross the Python/MATLAB boundary so that benchmark runs can be
+    reproduced and audited.
+    """
+
     runtime_path: Path = Path("matlab_runtime/pystar_preprocessing")
     entrypoint: str = "pystar_preprocess_entry"
     loader_input_format: Literal["uint8"] = "uint8"
@@ -215,6 +266,14 @@ class MatlabPreprocessingProviderConfig(BaseModel):
 
 
 class MatlabRegistrationProviderConfig(BaseModel):
+    """Boundary contract for MATLAB-backed registration.
+
+    Global and local registration use separate MATLAB entrypoints. The current
+    local MATLAB seam is intentionally narrow: it supports the `demons_3d`
+    path used for MATLAB parity experiments and records transfer/dtype choices
+    explicitly instead of hiding them behind fallback behavior.
+    """
+
     runtime_path: Path = Path("matlab_runtime/pystar_registration")
     entrypoint: str = "pystar_register_global_entry"
     local_entrypoints: Dict[str, str] = Field(
@@ -244,6 +303,14 @@ class MatlabRegistrationProviderConfig(BaseModel):
 
 
 class MatlabSpotFindingProviderConfig(BaseModel):
+    """Boundary contract for MATLAB-backed spot finding.
+
+    The MATLAB runtime receives one clean 3D channel volume at a time and
+    returns canonical `z, y, x, intensity` spot rows. The Python side keeps the
+    output schema identical to native spot finding, while backend metadata
+    records the MATLAB entrypoint and transfer mode.
+    """
+
     runtime_path: Path = Path("matlab_runtime/pystar_spotfinding")
     entrypoint: str = "pystar_spotfind_entry"
     volume_transfer_mode: Literal["temporary_tiff"] = "temporary_tiff"
@@ -259,6 +326,14 @@ class MatlabSpotFindingProviderConfig(BaseModel):
 
 
 class MatlabExtractionProviderConfig(BaseModel):
+    """Boundary contract for MATLAB-backed signal extraction.
+
+    Extraction sends registered or moving image volumes plus coordinate CSVs to
+    MATLAB and expects one intensity vector back. The contract is deliberately
+    explicit because small dtype/coordinate differences directly affect gene
+    calls downstream.
+    """
+
     runtime_path: Path = Path("matlab_runtime/pystar_extraction")
     entrypoint: str = "pystar_extract_entry"
     volume_transfer_mode: Literal["temporary_tiff"] = "temporary_tiff"
@@ -275,6 +350,14 @@ class MatlabExtractionProviderConfig(BaseModel):
 
 
 class MatlabProviderConfig(BaseModel):
+    """Top-level switch and runtime sections for all MATLAB provider seams.
+
+    Setting `enabled: true` does not force MATLAB execution by itself. A stage
+    must also select `provider: matlab`. This separation lets a single config
+    document both native and MATLAB-capable environments without silently
+    changing which stages run through MATLAB.
+    """
+
     enabled: bool = True
     preprocessing: MatlabPreprocessingProviderConfig = Field(default_factory=MatlabPreprocessingProviderConfig)
     registration: MatlabRegistrationProviderConfig = Field(default_factory=MatlabRegistrationProviderConfig)
@@ -285,11 +368,15 @@ class MatlabProviderConfig(BaseModel):
 
 
 class ProvidersConfig(BaseModel):
+    """External runtime provider configuration namespace."""
+
     matlab: MatlabProviderConfig = Field(default_factory=MatlabProviderConfig)
 
     model_config = ConfigDict(frozen=True, extra='forbid')
 
 class BsplineConfig(BaseModel):
+    """Native B-spline local-registration tuning parameters."""
+
     grid_spacing: int = 50  # 控制点间距，单位像素
     num_iter: int = 50      # 优化迭代次数
     model_config = ConfigDict(frozen=True)
@@ -400,6 +487,13 @@ class FieldSemanticsConfig(BaseModel):
 
 
 class RegistrationInputConfig(BaseModel):
+    """Select which clean channels form the registration volume.
+
+    `mip_all_channels` builds a max-intensity projection over selected channel
+    IDs for each round. `single_channel` uses one channel directly. The choice
+    changes registration evidence, not downstream decoding channels.
+    """
+
     method: Literal["mip_all_channels", "single_channel"] = "mip_all_channels"
     single_channel_id: Optional[int] = None
     mip_channels: Optional[List[int]] = None
@@ -416,6 +510,8 @@ class RegistrationInputConfig(BaseModel):
 
 
 class GlobalRegistrationParams(BaseModel):
+    """Parameters for phase-correlation global 3D shift estimation."""
+
     use_gpu: bool = False
     downsample_factor: int = 4
     max_shift: int = 200
@@ -424,6 +520,13 @@ class GlobalRegistrationParams(BaseModel):
 
 
 class GlobalRegistrationStageConfig(BaseModel):
+    """Global registration stage configuration.
+
+    The current runtime requires global registration to stay enabled. It
+    estimates a coarse `[dz, dy, dx]` shift from each moving round to the
+    reference round before any optional local deformation is computed.
+    """
+
     enabled: bool = True
     method: Literal["phase_corr_3d"] = "phase_corr_3d"
     provider: Literal["native", "matlab"] = "native"
@@ -449,6 +552,8 @@ class GlobalRegistrationStageConfig(BaseModel):
 
 
 class LocalRegistrationParams(BaseModel):
+    """Container for all local-registration method parameter blocks."""
+
     bspline: BsplineConfig = Field(default_factory=BsplineConfig)
     optical_flow: OpticalFlowConfig = Field(default_factory=OpticalFlowConfig)
     demons_3d: Demons3DConfig = Field(default_factory=Demons3DConfig)
@@ -457,6 +562,13 @@ class LocalRegistrationParams(BaseModel):
 
 
 class LocalRegistrationStageConfig(BaseModel):
+    """Optional local registration stage configuration.
+
+    Local registration refines the global shift with a dense deformation field.
+    Native mode can select optical flow, B-spline or 3D Demons; MATLAB mode is
+    restricted to the Demons path used for parity validation.
+    """
+
     enabled: bool = False
     method: Literal["optical_flow", "bspline", "demons_3d"] = "optical_flow"
     provider: Literal["native", "matlab"] = "native"
@@ -484,12 +596,23 @@ class LocalRegistrationStageConfig(BaseModel):
 
 
 class RegistrationGuardsConfig(BaseModel):
+    """Safety thresholds for accepting registration results."""
+
     skip_if_global_corr_below: float = 0.2
     reject_if_correlation_worse: bool = True
 
     model_config = ConfigDict(frozen=True, extra='forbid')
 
 class RegistrationConfig(BaseModel):
+    """Full registration configuration used by `RegistrationEngine`.
+
+    Registration writes a per-round transform bundle under `transforms/`.
+    The bundle contains global shifts, optional local fields, and explicit
+    `_semantics`/`_scope` metadata consumed later by extraction. Keeping these
+    semantics in config prevents coordinate-mapping and image-warp code from
+    silently interpreting the same field in different ways.
+    """
+
     reference_round: int
     source: RegistrationInputConfig = Field(default_factory=RegistrationInputConfig)
     global_stage: GlobalRegistrationStageConfig = Field(default_factory=GlobalRegistrationStageConfig, alias="global")
@@ -570,12 +693,16 @@ class RegistrationConfig(BaseModel):
     model_config = ConfigDict(extra='ignore', populate_by_name=True)
 
 class SpotiflowConfig(BaseModel):
+    """Spotiflow model and probability threshold parameters."""
+
     model_name: str = "general"
     prob_thresh: float = 0.5
     use_gpu: bool = True
     model_config = ConfigDict(frozen=True)
 
 class BlobDogConfig(BaseModel):
+    """Difference-of-Gaussians blob detector parameters."""
+
     min_sigma: Union[List[float], float] = Field(default_factory=lambda: [0.5, 0.5, 0.5])
     max_sigma: Union[List[float], float] = Field(default_factory=lambda: [2.0, 5.0, 5.0])
     threshold: float = 0.05
@@ -607,14 +734,30 @@ class BlobDogConfig(BaseModel):
     model_config = {"frozen": True} # 保持实用主义，配置一旦生成就不该被后面的人乱改
 
 class PeakLocalMaxConfig(BaseModel):
+    """Native Max3D regional-maxima threshold parameters.
+
+    The `peak_local_max` algorithm name is the public config value for PyStar's
+    native Max3D detector. The current implementation detects 26-connected
+    regional maxima and collapses each plateau to a centroid; `threshold_rel`
+    is interpreted relative to the image dtype range.
+    """
+
     min_distance: int = 3
     threshold_rel: float = 0.05
     exclude_border: bool = True
     model_config = ConfigDict(frozen=True)
 
 class SpotFindingConfig(BaseModel):
+    """Spot-finding stage configuration.
+
+    The stage consumes clean reference-round sequencing channels and writes
+    `spots_fov_<id>.csv` with reference-frame `z, y, x` coordinates. Native and
+    MATLAB providers share the same output schema so that extraction and
+    decoding do not need provider-specific branches.
+    """
+
     # 核心开关
-    algorithm: str = "peak_local_max"  # 默认值
+    algorithm: Literal["spotiflow", "blob_dog", "peak_local_max"] = "peak_local_max"  # 默认值
     provider: Literal["native", "matlab"] = "native"
     
     # 通用参数
@@ -647,6 +790,15 @@ class SpotFindingConfig(BaseModel):
     model_config = ConfigDict(extra='ignore')
     
 class ExtractionConfig(BaseModel):
+    """Signal extraction configuration.
+
+    Extraction converts spot coordinates into an intensity matrix with shape
+    `(N_spots, N_rounds, N_seq_channels)`. `image_warp` first registers each
+    moving volume into reference-frame pixels and then sums fixed boxes;
+    `coordinate_mapping` maps spot coordinates into each moving image and is
+    retained as a diagnostic/legacy path.
+    """
+
     method: str = "box_sum"
     provider: Literal["native", "matlab"] = "native"
     integration_box: List[int] = [1, 3, 3]
@@ -669,6 +821,8 @@ class ExtractionConfig(BaseModel):
         return self
 
 class DecodingRuleConfig(BaseModel):
+    """One optional post-calling rule in the decoding rule pipeline."""
+
     name: str
     stage: Literal["spot", "barcode"]
     enabled: bool = True
@@ -677,6 +831,8 @@ class DecodingRuleConfig(BaseModel):
     params: Dict[str, Any] = Field(default_factory=dict)
 
 class WeightedRescueConfig(BaseModel):
+    """Experimental weighted-nearest-codebook rescue parameters."""
+
     enable: bool = False
     target: Literal["background", "all"] = "background"
     max_weighted_distance: float = 1.5
@@ -684,6 +840,8 @@ class WeightedRescueConfig(BaseModel):
     round_weights: Optional[List[float]] = None
 
 class DecodingConfig(BaseModel):
+    """Barcode decoding and gating configuration."""
+
     quality_threshold: float = 0.5
     gating_mode: Literal["pattern_first", "legacy_membership_first"] = "pattern_first"
     max_soft_penalty: Optional[float] = None
@@ -692,14 +850,26 @@ class DecodingConfig(BaseModel):
     weighted_rescue: WeightedRescueConfig = Field(default_factory=WeightedRescueConfig)
 
 class OutputConfig(BaseModel):
+    """Canonical output root and QC-image switch."""
+
     directory: str
     save_qc_images: bool = True
 
 class QCConfig(BaseModel):
+    """Global QC-report switch."""
+
     enable: bool = True
 
 
 class PipelineConfig(BaseModel):
+    """All runnable pipeline-stage configuration.
+
+    This model is the contract between the YAML file and runtime stages. It
+    keeps preprocessing, registration, spot finding, extraction and decoding in
+    one immutable object, and exposes small helper methods for provider-mode
+    decisions used by validation and MATLAB boundary checks.
+    """
+
     scope_mode: Literal["full_fov", "tile_local"] = "full_fov"
     accelerator: Literal["cpu"] = "cpu"
     field_semantics: FieldSemanticsConfig = Field(default_factory=FieldSemanticsConfig)
@@ -736,9 +906,9 @@ class PipelineConfig(BaseModel):
     def qc_images_enabled(self) -> bool:
         """Backward-compatible effective switch for QC image generation.
 
-        `pipeline.qc.enable` is treated as the semantic master switch, while
-        `pipeline.output.save_qc_images` remains the legacy output-level guard.
-        QC image generation is enabled only when both are true.
+        `pipeline.qc.enable` remains the semantic master switch, while
+        `pipeline.output.save_qc_images` keeps acting as the legacy output-level
+        guard. QC image generation is enabled only when both are true.
         """
         return bool(self.qc.enable) and bool(self.output.save_qc_images)
 
@@ -783,6 +953,13 @@ def _matlab_registration_local_entrypoint_for_method(
     return providers.matlab.registration.local_entrypoints.get(method)
 
 class ExperimentConfig(BaseModel):
+    """Validated experiment configuration returned by `load_config`.
+
+    The object is the single source of truth passed to all runtime stages. It
+    stores the parsed YAML plus non-serialized provenance (`config_source_path`
+    and `config_sha256`) so reports can identify exactly which config was used.
+    """
+
     dataset: DatasetConfig
     codebook: CodebookConfig
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
@@ -922,7 +1099,7 @@ if __name__ == "__main__":
     print("Testing config loader...")
     try:
         # 尝试
-        config = load_config("config/experiment_config.yaml")
+        config = load_config("experiment_config.yaml")
         
         print(" SUCCESS! Config loaded and validated.")
         print("-" * 40)

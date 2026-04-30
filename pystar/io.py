@@ -57,6 +57,12 @@ EXECUTION_ENVELOPE_ALLOWED_VALUES = {
     "accelerator": {"cpu"},
 }
 
+MATLAB_STAGE_SUPPORT_STATUSES = {"debug_only", "not_selected"}
+MATLAB_STAGE_REQUIRED_PROMOTION_BLOCKERS = (
+    "representative_benchmark_recovery_pending",
+    "production_verification_pending",
+)
+
 LOCAL_ACCEPTANCE_MODE = "correlation_diagnostic_only"
 FINAL_CORR_METRIC = "selected_transform_mip_corr"
 
@@ -172,8 +178,8 @@ def _validate_matlab_stage_contracts(stage_contracts: Any) -> None:
     if not isinstance(stage_contracts, Mapping):
         raise ValueError("Provenance requested intent matlab_stage_contracts must be a mapping when present")
 
-    required_stages = set(MATLAB_STAGE_CONFIG_SURFACES)
-    missing_stages = required_stages.difference(stage_contracts.keys())
+    required_stages = tuple(MATLAB_STAGE_CONFIG_SURFACES)
+    missing_stages = set(required_stages).difference(stage_contracts.keys())
     if missing_stages:
         raise ValueError(
             "Provenance requested intent matlab_stage_contracts is missing stages: "
@@ -189,6 +195,12 @@ def _validate_matlab_stage_contracts(stage_contracts: Any) -> None:
             raise ValueError(f"matlab_stage_contracts.{stage_name}.declared_intent must be a non-empty string")
         if not isinstance(contract.get("matlab_requested"), bool):
             raise ValueError(f"matlab_stage_contracts.{stage_name}.matlab_requested must be a boolean")
+        current_support_status = contract.get("current_support_status")
+        if current_support_status not in MATLAB_STAGE_SUPPORT_STATUSES:
+            raise ValueError(
+                f"matlab_stage_contracts.{stage_name}.current_support_status must be one of "
+                f"{sorted(MATLAB_STAGE_SUPPORT_STATUSES)}, got {current_support_status!r}"
+            )
         if contract.get("artifact_owner") != "python_pystar":
             raise ValueError(f"matlab_stage_contracts.{stage_name}.artifact_owner must be 'python_pystar'")
         if contract.get("failure_contract") != "fail_loud_no_fallback":
@@ -196,20 +208,59 @@ def _validate_matlab_stage_contracts(stage_contracts: Any) -> None:
                 f"matlab_stage_contracts.{stage_name}.failure_contract must be 'fail_loud_no_fallback'"
             )
         config_surface = contract.get("config_surface")
-        if not isinstance(config_surface, list) or not all(isinstance(item, str) and item for item in config_surface):
+        if (
+            not isinstance(config_surface, list)
+            or not config_surface
+            or not all(isinstance(item, str) and item for item in config_surface)
+        ):
             raise ValueError(
                 f"matlab_stage_contracts.{stage_name}.config_surface must be a non-empty string list"
             )
         artifacts = contract.get("python_owned_artifacts")
-        if not isinstance(artifacts, list) or not all(isinstance(item, str) and item for item in artifacts):
+        if (
+            not isinstance(artifacts, list)
+            or not artifacts
+            or not all(isinstance(item, str) and item for item in artifacts)
+        ):
             raise ValueError(
                 f"matlab_stage_contracts.{stage_name}.python_owned_artifacts must be a non-empty string list"
             )
         promotion_blockers = contract.get("promotion_blockers")
-        if not isinstance(promotion_blockers, list) or not all(isinstance(item, str) for item in promotion_blockers):
+        if (
+            not isinstance(promotion_blockers, list)
+            or not all(isinstance(item, str) and item for item in promotion_blockers)
+        ):
             raise ValueError(
                 f"matlab_stage_contracts.{stage_name}.promotion_blockers must be a string list"
             )
+
+        matlab_requested = bool(contract.get("matlab_requested"))
+        if matlab_requested:
+            if current_support_status != "debug_only":
+                raise ValueError(
+                    f"matlab_stage_contracts.{stage_name}.current_support_status must stay 'debug_only' "
+                    "while the MATLAB provider seam remains benchmark-blocked"
+                )
+            missing_blockers = [
+                blocker
+                for blocker in MATLAB_STAGE_REQUIRED_PROMOTION_BLOCKERS
+                if blocker not in promotion_blockers
+            ]
+            if missing_blockers:
+                raise ValueError(
+                    f"matlab_stage_contracts.{stage_name}.promotion_blockers is missing required blockers: "
+                    f"{missing_blockers}"
+                )
+        else:
+            if current_support_status != "not_selected":
+                raise ValueError(
+                    f"matlab_stage_contracts.{stage_name}.current_support_status must be 'not_selected' "
+                    "when the MATLAB seam is not requested"
+                )
+            if promotion_blockers:
+                raise ValueError(
+                    f"matlab_stage_contracts.{stage_name}.promotion_blockers must be empty when matlab_requested=false"
+                )
 
 
 def build_matlab_stage_contracts_from_config(config: ExperimentConfig) -> Dict[str, Dict[str, Any]]:
@@ -1948,6 +1999,60 @@ def build_provenance_summary_markdown(
         lines.append(f"| Runtime Path | {_format_scalar(registration_backend_details.get('runtime_path'))} |")
         lines.append(f"| Runtime Manifest | {_format_scalar(registration_backend_details.get('runtime_manifest'))} |")
         lines.append(f"| Entry Point | {_format_scalar(registration_backend_details.get('entrypoint'))} |")
+        boundary_summary = registration_backend_details.get("boundary_instrumentation_summary")
+        if isinstance(boundary_summary, Mapping):
+            aggregate_seam_costs = boundary_summary.get("aggregate_seam_costs_ms")
+            session_lifecycle_summary = boundary_summary.get("session_lifecycle_summary")
+            lines.extend(["", "### Registration Boundary Instrumentation", "| Field | Value |", "|-------|-------|"])
+            lines.append(f"| Call Count | {_format_scalar(boundary_summary.get('call_count'))} |")
+            lines.append(f"| Engine Reused Calls | {_format_scalar(boundary_summary.get('engine_reused_calls'))} |")
+            lines.append(f"| Total Boundary Duration (ms) | {_format_scalar(boundary_summary.get('total_duration_ms'))} |")
+            if isinstance(aggregate_seam_costs, Mapping):
+                for field_name in (
+                    "engine_bootstrap_ms",
+                    "runtime_file_validation_ms",
+                    "input_staging_ms",
+                    "matlab_call_ms",
+                    "result_validation_ms",
+                    "canonical_persistence_ms",
+                    "teardown_ms",
+                ):
+                    lines.append(
+                        f"| {field_name} | {_format_scalar(aggregate_seam_costs.get(field_name))} |"
+                    )
+            if isinstance(session_lifecycle_summary, Mapping):
+                aggregate_counts = session_lifecycle_summary.get("aggregate_counts")
+                aggregate_timing_ms = session_lifecycle_summary.get("aggregate_timing_ms")
+                lines.extend(["", "### Registration Session Lifecycle", "| Field | Value |", "|-------|-------|"])
+                lines.append(f"| Session Count | {_format_scalar(session_lifecycle_summary.get('session_count'))} |")
+                lines.append(f"| Sessions With Bootstrap | {_format_scalar(session_lifecycle_summary.get('sessions_with_bootstrap'))} |")
+                lines.append(f"| Sessions With Reuse | {_format_scalar(session_lifecycle_summary.get('sessions_with_reuse'))} |")
+                lines.append(
+                    f"| Sessions With Teardown Warning | {_format_scalar(session_lifecycle_summary.get('sessions_with_teardown_warning'))} |"
+                )
+                if isinstance(aggregate_counts, Mapping):
+                    for field_name in (
+                        "engine_bootstrap_count",
+                        "engine_reuse_count",
+                        "runtime_file_validation_count",
+                        "runtime_file_validation_reuse_count",
+                        "addpath_call_count",
+                        "teardown_count",
+                        "teardown_warning_count",
+                    ):
+                        lines.append(f"| {field_name} | {_format_scalar(aggregate_counts.get(field_name))} |")
+                if isinstance(aggregate_timing_ms, Mapping):
+                    for field_name in (
+                        "configure_environment_ms",
+                        "engine_module_import_ms",
+                        "factory_resolution_ms",
+                        "runtime_file_validation_ms",
+                        "start_matlab_ms",
+                        "addpath_ms",
+                        "engine_bootstrap_ms",
+                        "teardown_ms",
+                    ):
+                        lines.append(f"| {field_name} | {_format_scalar(aggregate_timing_ms.get(field_name))} |")
 
     declared_capabilities = _require_value(
         registration_profile.get("declared_transform_capabilities"),
@@ -2016,20 +2121,33 @@ def build_provenance_summary_markdown(
 
     matlab_stage_contracts = requested_intent.get("matlab_stage_contracts")
     if isinstance(matlab_stage_contracts, Mapping) and matlab_stage_contracts:
-        lines.extend(["", "### MATLAB Stage Contracts", "| Stage | Declared Intent | MATLAB Requested | Support Status | Python-Owned Artifacts |", "|-------|-----------------|------------------|----------------|------------------------|"])
+        lines.extend([
+            "",
+            "### MATLAB Stage Contracts",
+            "| Stage | Declared Intent | MATLAB Requested | Support Status | Failure Contract | Promotion Blockers | Python-Owned Artifacts |",
+            "|-------|-----------------|------------------|----------------|------------------|--------------------|------------------------|",
+        ])
         for stage_name in ("preprocessing", "registration", "spot_finding", "extraction"):
             contract = matlab_stage_contracts.get(stage_name)
             if not isinstance(contract, Mapping):
                 continue
             lines.append(
-                "| {stage} | {intent} | {requested} | {status} | {artifacts} |".format(
+                "| {stage} | {intent} | {requested} | {status} | {failure_contract} | {promotion_blockers} | {artifacts} |".format(
                     stage=stage_name,
                     intent=_format_scalar(contract.get("declared_intent")),
                     requested=_format_scalar(contract.get("matlab_requested")),
                     status=_format_scalar(contract.get("current_support_status")),
+                    failure_contract=_format_scalar(contract.get("failure_contract")),
+                    promotion_blockers=_format_scalar(contract.get("promotion_blockers")),
                     artifacts=_format_scalar(contract.get("python_owned_artifacts")),
                 )
             )
+        lines.extend([
+            "",
+            "### MATLAB Stage Contract Note",
+            "- These rows describe stage-promotion / support state, not bundle-level transform legality.",
+            "- A bundle-level `Release Status = valid` does not promote any MATLAB-requested stage beyond `debug_only`; promotion still requires representative benchmark recovery and production verification.",
+        ])
 
     lines.extend([
         "",
@@ -2131,10 +2249,11 @@ def persist_flow_3d_sidecar(
     flow_3d: NDArray[Any],
 ) -> Dict[str, Any]:
     """
-    将单个 round 的 dense `flow_3d` 立即写成 sidecar，并返回 manifest descriptor。
+    Persist one dense round-level `flow_3d` sidecar immediately and return the
+    manifest descriptor.
 
-    这个 helper 用于 registration 过程中“每轮即写即释放”的内存优化，也可被
-    `save_transform_manifest()` 复用，保证 sidecar 命名与描述符格式一致。
+    This supports the lower-peak-memory registration path where each round's
+    3D flow can be written and released before the full manifest is finalized.
     """
     _ = get_fov_output_structure(base_dir, fov_id)
     transforms_dir = get_transform_manifest_path(base_dir, fov_id).parent
@@ -2175,10 +2294,6 @@ def save_transform_manifest(
     主 manifest 仍保持 `transforms_fov_{fov_id}.npy` 这一既有入口，
     每个 round 的 `flow_3d` 字段在磁盘上存为 sidecar 描述符，
     由下游 loader 再物化回 ndarray。
-
-    兼容两种输入：
-    - `flow_3d` 仍是内存中的 ndarray（旧路径）
-    - `flow_3d` 已经是 sidecar descriptor（registration 每轮即写即释放的新路径）
     
     Parameters
     ----------
@@ -2351,12 +2466,7 @@ def materialize_round_transform_entry(
     round_id: int,
     transform_data: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    """Materialize a single round transform entry from persisted manifest metadata.
-
-    This is used by extraction/mining paths that want to keep the manifest in a
-    descriptor-only form and hydrate `flow_3d` just-in-time for the current
-    round, instead of restoring every round-level sidecar into RAM up front.
-    """
+    """Materialize one round transform entry from persisted manifest metadata."""
     manifest_path = get_transform_manifest_path(base_dir, fov_id)
     transforms_dir = manifest_path.parent
 
@@ -2395,7 +2505,7 @@ def load_transform_manifest(
     hydrate_flow_3d: bool = True,
 ) -> Dict[Any, Any]:
     """
-    加载 transform manifest；默认会把 round-level `flow_3d` sidecar 物化回 ndarray。
+    加载 transform manifest；默认把 round-level `flow_3d` sidecar 物化回 ndarray。
     
     Parameters
     ----------
@@ -2407,17 +2517,16 @@ def load_transform_manifest(
         If True, include provenance in returned dict under key '_provenance'.
         If False (default), provenance is validated but not returned (backward compatibility).
     hydrate_flow_3d : bool
-        If True (default), eagerly materialize persisted round-level `flow_3d`
-        sidecars back into ndarrays. If False, preserve validated sidecar
-        descriptors in the returned manifest so callers can hydrate each round
-        on demand.
+        If True (default), eagerly materialize persisted `flow_3d` sidecars.
+        If False, keep validated sidecar descriptors so callers can hydrate one
+        round at a time.
         
     Returns
     -------
     dict
         Transform data. If load_provenance=True, includes '_provenance' key.
         When ``hydrate_flow_3d=False``, non-reference rounds may keep
-        descriptor-style `flow_3d` payloads instead of dense ndarrays.
+        descriptor-style `flow_3d` payloads.
     """
     manifest_path = get_transform_manifest_path(base_dir, fov_id)
     if not manifest_path.exists():
@@ -2486,6 +2595,17 @@ def load_transform_manifest(
     return materialized
 
 class ImageLoader:
+    """Load raw and cleaned image volumes under the PyStar path contract.
+
+    Raw images are resolved from ``dataset.raw_data_path`` and
+    ``dataset.filename_pattern``. Clean images are resolved from the canonical
+    per-FOV output tree created by ``get_fov_output_structure``. The public
+    ``load_fov`` method returns a lazy xarray volume with dimensions
+    ``(round, channel, z, y, x)`` and physical coordinates in nanometers; missing
+    channels declared absent from a round are represented as zero volumes so that
+    downstream stages see a rectangular tensor.
+    """
+
     def __init__(self, config: ExperimentConfig):
         self.cfg = config
         self.raw_path = self.cfg.dataset.raw_data_path
@@ -2494,7 +2614,13 @@ class ImageLoader:
         
     def _get_path(self, fov: int, round_id: int, channel_id: int) -> Path:
         """
-        定位文件路径。
+        Resolve one raw TIFF path from the YAML filename pattern.
+
+        ``filename_pattern`` receives ``round``, ``fov`` and ``ch`` placeholders.
+        The loader tries both zero-padded and plain channel strings because Leica
+        exports are not always consistent across experiments. Missing or
+        ambiguous matches fail loudly; raw input paths must come from the config,
+        not from hard-coded local overrides.
         """
         # 尝试两种补零格式：ch00 (常见) 和 ch0 (偶尔见)
         # 这是一个实用的 hack，避免因为文件名格式不对就崩溃
@@ -2529,20 +2655,21 @@ class ImageLoader:
         return candidates[0]
 
     def get_clean_path(self, fov_id: int, round_id: int, channel_id: int) -> Path:
-        """获取 Clean Data 的路径"""
+        """Return the canonical clean-image path for one FOV/round/channel."""
         base_dir = Path(self.cfg.pipeline.output.directory)
         paths = get_fov_output_structure(base_dir, fov_id)
         clean_dir = paths["cleaned"]
         return clean_dir / f"clean_fov_{fov_id}_round_{round_id}_ch_{channel_id}.tif"
 
     def load_clean_image(self, fov_id: int, round_id: int, channel_id: int) -> NDArray[Any]:
-        """直接读取处理好的 Clean Tiff"""
+        """Read a preprocessed clean 3-D TIFF from the PyStar output tree."""
         path = self.get_clean_path(fov_id, round_id, channel_id)
         if not path.exists():
             raise FileNotFoundError(f"Clean image not found: {path}. Run preprocessing first!")
         return tifffile.imread(path)
 
     def _lazy_load_tiff(self, path: Path) -> da.Array:
+        """Create a Dask array for one raw 3-D TIFF without loading pixels now."""
         # 使用 delayed 读取，不立即加载进内存
         def loader(p):
             return tifffile.imread(p).squeeze()
@@ -2564,7 +2691,14 @@ class ImageLoader:
 
     def load_fov(self, fov_id: int) -> xr.DataArray:
         """
-        加载单个 FOV，处理缺失通道，对齐维度。
+        Load one FOV as a lazy rectangular ``round/channel/z/y/x`` array.
+
+        The dataset config may declare that different rounds have different
+        channel sets. Valid channels are loaded lazily from disk; unavailable
+        channels are zero-padded so registration/preprocessing can index by the
+        global channel list without special cases. Coordinate arrays are physical
+        distances in nanometers, while pixel-level algorithms downstream still
+        use integer ``z, y, x`` indices.
         """
         rounds_cfg = self.cfg.dataset.round_structure
         all_rounds = sorted(rounds_cfg.keys())
