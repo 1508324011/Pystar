@@ -722,6 +722,11 @@ class Decoder:
         out_path = paths["decoded"] / f"decoded_fov_{fov_id}.csv"
         df_res_true.to_csv(out_path, index=False)
         print(f" [Decoder] Saved decoded list to {out_path.name}")
+
+        goodreads_path = paths["decoded"] / f"decoded_fov_{fov_id}_goodreads.csv"
+        df_goodreads = df_res_true[df_res_true['gene'] != 'background'].copy()
+        df_goodreads.to_csv(goodreads_path, index=False)
+        print(f" [Decoder] Saved decoded good reads to {goodreads_path.name} ({len(df_goodreads)} rows)")
         
         df_res.to_csv(
             paths["decoded"] / f"decoded_fov_{fov_id}_pre_pattern_check.csv", 
