@@ -1,10 +1,22 @@
+"""MATLAB-backed registration boundary for PyStar.
+
+The Python registration engine can delegate global phase-correlation and local
+3D Demons registration to repo-local MATLAB entrypoints.  This module stages
+cleaned 3D volumes, passes explicit JSON plans, validates MATLAB metadata, and
+normalizes shifts/flows into PyStar's transform schema: `global_shift_3d` in
+`z, y, x` order and local `flow_3d` as `(component, z, y, x)` residual fields
+after the global shift.  MATLAB outputs are accepted only when their declared
+coordinate order and semantics match the PyStar contract.
+"""
+
 from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 import tifffile
@@ -12,7 +24,15 @@ from numpy.typing import NDArray
 from scipy.io import loadmat
 
 from .infrastructure import ExperimentConfig
-from .matlab_engine_bootstrap import close_matlab_engine_best_effort, load_matlab_engine_module
+from .matlab_engine_bootstrap import (
+    MATLABSessionCapsule,
+    create_matlab_boundary_trace,
+    finalize_matlab_boundary_trace,
+    load_matlab_engine_factory,
+    record_matlab_boundary_phase,
+    snapshot_matlab_session_lifecycle,
+    summarize_matlab_boundary_traces,
+)
 
 
 MATLAB_REGISTRATION_RUNTIME_MANIFEST_NAME = "runtime_manifest.json"
@@ -35,6 +55,14 @@ def _build_common_registration_plan(
     volume_shape_zyx: tuple[int, int, int],
     compute_tile: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    """Build the shared MATLAB registration plan fields for global/local calls.
+
+    The plan describes both the staged subvolume (`volume_shape_zyx`) and the
+    scope of that subvolume in the full FOV (`scope_*`).  Tile-local registration
+    adds `compute_tile_*` fields so MATLAB can report fields that PyStar can later
+    stitch and annotate with exact write-region metadata.
+    """
+
     matlab_cfg = config.providers.matlab.registration
 
     if matlab_cfg.volume_transfer_mode != "temporary_tiff":
@@ -84,6 +112,8 @@ def build_matlab_registration_plan(
     scope_descriptor: Mapping[str, Any],
     volume_shape_zyx: tuple[int, int, int],
 ) -> Dict[str, Any]:
+    """Build the JSON plan for MATLAB global registration of one round."""
+
     return _build_common_registration_plan(
         config,
         fov_id=fov_id,
@@ -104,6 +134,13 @@ def build_matlab_local_registration_plan(
     volume_shape_zyx: tuple[int, int, int],
     compute_tile: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    """Build the JSON plan for MATLAB local 3D Demons registration.
+
+    MATLAB local registration is intentionally limited to `demons_3d` here.  The
+    plan declares that the rigid global shift has already been applied and that
+    the returned flow should be interpreted as a residual displacement field.
+    """
+
     reg_cfg = config.pipeline.registration
     if reg_cfg.local_method != "demons_3d":
         raise ValueError(
@@ -153,6 +190,8 @@ def _format_exception_message(prefix: str, exc: Exception) -> str:
 
 
 def resolve_matlab_registration_runtime_path(config: ExperimentConfig) -> Path:
+    """Resolve the configured MATLAB registration runtime directory."""
+
     matlab_cfg = config.providers.matlab.registration
 
     runtime_path = matlab_cfg.runtime_path
@@ -162,6 +201,8 @@ def resolve_matlab_registration_runtime_path(config: ExperimentConfig) -> Path:
 
 
 def load_matlab_registration_runtime_manifest(runtime_dir: Path) -> Dict[str, Any]:
+    """Load and validate the MATLAB registration runtime manifest."""
+
     manifest_path = runtime_dir / MATLAB_REGISTRATION_RUNTIME_MANIFEST_NAME
     if not manifest_path.exists():
         raise FileNotFoundError(
@@ -238,17 +279,32 @@ def _validate_runtime_entrypoint_contract(
 
 
 def _load_matlab_engine_factory() -> Callable[[], Any]:
-    matlab_engine = load_matlab_engine_module(
+    factory, _factory_metrics = load_matlab_engine_factory(
         consumer="registration global/local provider='matlab'",
     )
+    return factory
 
-    start_matlab = getattr(matlab_engine, "start_matlab", None)
-    if start_matlab is None or not callable(start_matlab):
-        raise RuntimeError("Imported 'matlab.engine' module does not expose callable start_matlab()")
-    return start_matlab
+
+def _write_staged_volume_tiff(volume_path: Path, volume: Any) -> None:
+    staged_volume = np.asarray(volume)
+    if staged_volume.ndim != 3:
+        raise ValueError(f"MATLAB registration expects a 3D staged volume, got ndim={staged_volume.ndim}")
+
+    with tifffile.TiffWriter(volume_path) as writer:
+        for plane in staged_volume:
+            writer.write(np.asarray(plane), photometric="minisblack", metadata=None)
 
 
 class MATLABRegistrationBackend:
+    """Execute MATLAB registration entrypoints under PyStar's transform contract.
+
+    The backend owns a MATLAB session capsule and validates all runtime files.
+    Global calls return rigid shifts normalized to `z, y, x`; local calls return
+    residual 3D flow fields normalized to `(dz, dy, dx)` component order and
+    `(component, z, y, x)` array layout.  Boundary metadata is kept so downstream
+    reports can distinguish algorithm cost from MATLAB session/bootstrap cost.
+    """
+
     def __init__(
         self,
         config: ExperimentConfig,
@@ -272,59 +328,50 @@ class MATLABRegistrationBackend:
                 "providers.matlab.registration.local_entrypoints['demons_3d'] must match the repo-local MATLAB runtime manifest. "
                 f"Config local entrypoint={self.local_entrypoint!r}, manifest local entrypoint={manifest_local_entrypoint!r}"
             )
-        self._engine: Any = None
+        self._session_capsule = MATLABSessionCapsule(
+            consumer="registration provider='matlab'",
+            runtime_dir=self.runtime_dir,
+            entrypoint=self.entrypoint,
+            engine_factory=engine_factory,
+            engine_factory_consumer="registration global/local provider='matlab'",
+            startup_failure_prefix="Failed to start MATLAB Engine for registration provider='matlab'",
+            addpath_failure_prefix="Failed to add MATLAB registration runtime path",
+        )
+
+    @property
+    def _engine(self) -> Any:
+        return self._session_capsule.engine
+
+    @property
+    def _session_lifecycle(self) -> dict[str, Any]:
+        return self._session_capsule.session_lifecycle
+
+    @property
+    def _session_lifecycle_summary(self) -> dict[str, Any] | None:
+        return self._session_capsule.summarize_session_lifecycle()
 
     def close(self) -> None:
-        if self._engine is None:
-            return
-        try:
-            close_matlab_engine_best_effort(
-                self._engine,
-                consumer="registration provider='matlab'",
-            )
-        finally:
-            self._engine = None
+        """Close the owned MATLAB Engine session if one was started."""
+
+        self._session_capsule.close()
 
     def _ensure_engine(self) -> Any:
-        if self._engine is not None:
-            return self._engine
+        return self._session_capsule.ensure_engine()
 
-        factory = self.engine_factory or _load_matlab_engine_factory()
-        try:
-            engine = factory()
-        except Exception as exc:  # pragma: no cover - exact engine exception type depends on MATLAB install
-            raise RuntimeError(
-                _format_exception_message(
-                    "Failed to start MATLAB Engine for registration provider='matlab'",
-                    exc,
-                )
-            ) from exc
-
-        try:
-            engine.addpath(str(self.runtime_dir), nargout=0)
-        except Exception as exc:  # pragma: no cover - exact engine exception type depends on MATLAB install
-            try:
-                engine.quit()
-            except Exception:
-                pass
-            raise RuntimeError(
-                _format_exception_message(
-                    f"Failed to add MATLAB registration runtime path: {self.runtime_dir}",
-                    exc,
-                )
-            ) from exc
-
-        self._engine = engine
-        return engine
+    def _consume_last_engine_acquire(self) -> dict[str, Any]:
+        return self._session_capsule.consume_last_engine_acquire()
 
     def _resolve_entrypoint_callable(self, entrypoint_name: str) -> Any:
-        engine = self._ensure_engine()
-        try:
-            return getattr(engine, entrypoint_name)
-        except AttributeError as exc:
-            raise RuntimeError(
-                f"MATLAB runtime path {self.runtime_dir} does not expose entrypoint '{entrypoint_name}'"
-            ) from exc
+        return self._session_capsule.resolve_callable(entrypoint_name)
+
+    def _resolve_runtime_file_records(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        return self._session_capsule.validate_runtime_files(self._collect_runtime_file_records)
+
+    def _runtime_file_records_for_provenance(self) -> list[dict[str, Any]]:
+        cached_records = self._session_capsule.peek_runtime_file_records()
+        if cached_records is not None:
+            return cached_records
+        return self._collect_runtime_file_records()
 
     def _collect_runtime_file_records(self) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
@@ -637,9 +684,25 @@ class MATLABRegistrationBackend:
             "runtime_path": str(self.runtime_dir),
             "runtime_manifest": str(self.runtime_dir / MATLAB_REGISTRATION_RUNTIME_MANIFEST_NAME),
             "entrypoint": self.entrypoint,
-            "runtime_files": self._collect_runtime_file_records(),
+            "runtime_files": self._runtime_file_records_for_provenance(),
             "round_results": normalized_round_results,
+            "session_lifecycle": snapshot_matlab_session_lifecycle(self._session_lifecycle),
+            "session_lifecycle_summary": self._session_lifecycle_summary,
         }
+        boundary_traces: list[Mapping[str, Any]] = []
+        for result_mapping in normalized_round_results.values():
+            if not isinstance(result_mapping, Mapping):
+                continue
+            boundary_trace = result_mapping.get("boundary_instrumentation")
+            if isinstance(boundary_trace, Mapping):
+                boundary_traces.append(boundary_trace)
+            local_flow = result_mapping.get("local_flow")
+            if isinstance(local_flow, Mapping):
+                local_boundary_trace = local_flow.get("boundary_instrumentation")
+                if isinstance(local_boundary_trace, Mapping):
+                    boundary_traces.append(local_boundary_trace)
+        if boundary_traces:
+            trace["boundary_instrumentation_summary"] = summarize_matlab_boundary_traces(boundary_traces)
         if self.local_entrypoint:
             trace["local_entrypoint"] = self.local_entrypoint
         if matlab_version is not None:
@@ -656,6 +719,18 @@ class MATLABRegistrationBackend:
         reference_round: int,
         scope_descriptor: Mapping[str, Any],
     ) -> Dict[str, Any]:
+        boundary_trace = create_matlab_boundary_trace(
+            stage_name="matlab_registration_global",
+            runtime_dir=self.runtime_dir,
+            entrypoint=self.entrypoint,
+            session=self._session_lifecycle,
+            call_scope={
+                "fov_id": int(fov_id),
+                "round_id": int(round_id),
+                "reference_round": int(reference_round),
+                "coverage_mode": scope_descriptor.get("coverage_mode"),
+            },
+        )
         ref_volume = self._normalize_input_volume(reference_volume)
         mov_volume = self._normalize_input_volume(moving_volume)
         request_payload = build_matlab_registration_plan(
@@ -667,15 +742,56 @@ class MATLABRegistrationBackend:
             volume_shape_zyx=(int(ref_volume.shape[0]), int(ref_volume.shape[1]), int(ref_volume.shape[2])),
         )
 
+        runtime_validation_started = time.perf_counter()
+        runtime_files, runtime_validation_details = self._resolve_runtime_file_records()
+        record_matlab_boundary_phase(
+            boundary_trace,
+            phase_name="runtime_file_validation",
+            duration_ms=round((time.perf_counter() - runtime_validation_started) * 1000.0, 3),
+            seam_cost_key="runtime_file_validation_ms",
+            details={
+                "runtime_file_count": len(runtime_files),
+                **runtime_validation_details,
+            },
+        )
+
         matlab_callable = self._resolve_entrypoint_callable(self.entrypoint)
+        engine_acquire = self._consume_last_engine_acquire()
+        session_bootstrap = engine_acquire.get("session_bootstrap")
+        if isinstance(session_bootstrap, Mapping):
+            engine_bootstrap_ms_value = session_bootstrap.get("engine_bootstrap_ms")
+            engine_bootstrap_ms = (
+                float(engine_bootstrap_ms_value)
+                if isinstance(engine_bootstrap_ms_value, (int, float))
+                else 0.0
+            )
+            record_matlab_boundary_phase(
+                boundary_trace,
+                phase_name="engine_bootstrap",
+                duration_ms=engine_bootstrap_ms,
+                seam_cost_key="engine_bootstrap_ms",
+                details=session_bootstrap,
+            )
 
         with TemporaryDirectory(prefix=f"pystar_matlab_registration_fov{fov_id}_round{round_id}_") as tmpdir:
             tmpdir_path = Path(tmpdir)
             ref_path = tmpdir_path / f"reference_round_{reference_round}.tif"
             moving_path = tmpdir_path / f"moving_round_{round_id}.tif"
-            tifffile.imwrite(ref_path, ref_volume)
-            tifffile.imwrite(moving_path, mov_volume)
+            input_staging_started = time.perf_counter()
+            _write_staged_volume_tiff(ref_path, ref_volume)
+            _write_staged_volume_tiff(moving_path, mov_volume)
+            record_matlab_boundary_phase(
+                boundary_trace,
+                phase_name="input_staging",
+                duration_ms=round((time.perf_counter() - input_staging_started) * 1000.0, 3),
+                seam_cost_key="input_staging_ms",
+                details={
+                    "staged_inputs": [ref_path.name, moving_path.name],
+                    "volume_shape_zyx": [int(ref_volume.shape[0]), int(ref_volume.shape[1]), int(ref_volume.shape[2])],
+                },
+            )
 
+            matlab_call_started = time.perf_counter()
             try:
                 metadata_json = matlab_callable(
                     str(ref_path),
@@ -690,12 +806,20 @@ class MATLABRegistrationBackend:
                         exc,
                     )
                 ) from exc
+            record_matlab_boundary_phase(
+                boundary_trace,
+                phase_name="matlab_call",
+                duration_ms=round((time.perf_counter() - matlab_call_started) * 1000.0, 3),
+                seam_cost_key="matlab_call_ms",
+                details={"request_volume_shape_zyx": request_payload.get("volume_shape_zyx")},
+            )
 
         if not isinstance(metadata_json, str):
             raise ValueError(
                 f"MATLAB registration entrypoint '{self.entrypoint}' must return a JSON string metadata payload"
             )
 
+        result_validation_started = time.perf_counter()
         try:
             metadata = json.loads(metadata_json)
         except json.JSONDecodeError as exc:
@@ -715,6 +839,21 @@ class MATLABRegistrationBackend:
         )
         global_shift_3d = self._normalize_global_shift_zyx(metadata)
         global_corr = float(metadata["global_corr"])
+        record_matlab_boundary_phase(
+            boundary_trace,
+            phase_name="result_validation",
+            duration_ms=round((time.perf_counter() - result_validation_started) * 1000.0, 3),
+            seam_cost_key="result_validation_ms",
+            details={
+                "reported_step_count": len(metadata.get("steps", [])) if isinstance(metadata.get("steps"), list) else 0,
+                "global_corr": global_corr,
+            },
+        )
+        finalized_boundary_trace = finalize_matlab_boundary_trace(
+            boundary_trace,
+            session=self._session_lifecycle,
+            engine_reused_this_call=bool(engine_acquire.get("engine_reused_this_call", False)),
+        )
 
         return {
             "global_shift_3d": global_shift_3d,
@@ -729,6 +868,7 @@ class MATLABRegistrationBackend:
                     "entrypoint": self.entrypoint,
                 },
                 "request": request_payload,
+                "runtime_files": runtime_files,
                 "matlab_metadata": metadata,
                 "normalized_result": {
                     "global_shift_3d": [
@@ -738,6 +878,9 @@ class MATLABRegistrationBackend:
                     ],
                     "global_corr": global_corr,
                 },
+                "boundary_instrumentation": finalized_boundary_trace,
+                "session_lifecycle": snapshot_matlab_session_lifecycle(self._session_lifecycle),
+                "session_lifecycle_summary": self._session_lifecycle_summary,
             },
         }
 
@@ -757,6 +900,20 @@ class MATLABRegistrationBackend:
                 "MATLAB registration runtime manifest does not declare local_entrypoint required for local demons kernel"
             )
 
+        boundary_trace = create_matlab_boundary_trace(
+            stage_name="matlab_registration_local",
+            runtime_dir=self.runtime_dir,
+            entrypoint=self.local_entrypoint,
+            session=self._session_lifecycle,
+            call_scope={
+                "fov_id": int(fov_id),
+                "round_id": int(round_id),
+                "reference_round": int(reference_round),
+                "coverage_mode": scope_descriptor.get("coverage_mode"),
+                "compute_tile_index": None if compute_tile is None else compute_tile.get("tile_index"),
+            },
+        )
+
         ref_volume = self._normalize_input_volume(reference_volume)
         mov_volume = self._normalize_input_volume(moving_volume)
         request_payload = build_matlab_local_registration_plan(
@@ -769,17 +926,59 @@ class MATLABRegistrationBackend:
             compute_tile=compute_tile,
         )
 
+        runtime_validation_started = time.perf_counter()
+        runtime_files, runtime_validation_details = self._resolve_runtime_file_records()
+        record_matlab_boundary_phase(
+            boundary_trace,
+            phase_name="runtime_file_validation",
+            duration_ms=round((time.perf_counter() - runtime_validation_started) * 1000.0, 3),
+            seam_cost_key="runtime_file_validation_ms",
+            details={
+                "runtime_file_count": len(runtime_files),
+                **runtime_validation_details,
+            },
+        )
+
         matlab_callable = self._resolve_entrypoint_callable(self.local_entrypoint)
+        engine_acquire = self._consume_last_engine_acquire()
+        session_bootstrap = engine_acquire.get("session_bootstrap")
+        if isinstance(session_bootstrap, Mapping):
+            engine_bootstrap_ms_value = session_bootstrap.get("engine_bootstrap_ms")
+            engine_bootstrap_ms = (
+                float(engine_bootstrap_ms_value)
+                if isinstance(engine_bootstrap_ms_value, (int, float))
+                else 0.0
+            )
+            record_matlab_boundary_phase(
+                boundary_trace,
+                phase_name="engine_bootstrap",
+                duration_ms=engine_bootstrap_ms,
+                seam_cost_key="engine_bootstrap_ms",
+                details=session_bootstrap,
+            )
 
         with TemporaryDirectory(prefix=f"pystar_matlab_local_registration_fov{fov_id}_round{round_id}_") as tmpdir:
             tmpdir_path = Path(tmpdir)
             ref_path = tmpdir_path / f"reference_round_{reference_round}.tif"
             moving_path = tmpdir_path / f"moving_round_{round_id}.tif"
             flow_output_path = tmpdir_path / f"local_flow_round_{round_id}.mat"
-            tifffile.imwrite(ref_path, ref_volume)
-            tifffile.imwrite(moving_path, mov_volume)
+            input_staging_started = time.perf_counter()
+            _write_staged_volume_tiff(ref_path, ref_volume)
+            _write_staged_volume_tiff(moving_path, mov_volume)
             request_payload["flow_output_path"] = str(flow_output_path)
+            record_matlab_boundary_phase(
+                boundary_trace,
+                phase_name="input_staging",
+                duration_ms=round((time.perf_counter() - input_staging_started) * 1000.0, 3),
+                seam_cost_key="input_staging_ms",
+                details={
+                    "staged_inputs": [ref_path.name, moving_path.name],
+                    "flow_output_name": flow_output_path.name,
+                    "volume_shape_zyx": [int(ref_volume.shape[0]), int(ref_volume.shape[1]), int(ref_volume.shape[2])],
+                },
+            )
 
+            matlab_call_started = time.perf_counter()
             try:
                 metadata_json = matlab_callable(
                     str(ref_path),
@@ -794,12 +993,23 @@ class MATLABRegistrationBackend:
                         exc,
                     )
                 ) from exc
+            record_matlab_boundary_phase(
+                boundary_trace,
+                phase_name="matlab_call",
+                duration_ms=round((time.perf_counter() - matlab_call_started) * 1000.0, 3),
+                seam_cost_key="matlab_call_ms",
+                details={
+                    "request_volume_shape_zyx": request_payload.get("volume_shape_zyx"),
+                    "compute_tile_index": None if compute_tile is None else compute_tile.get("tile_index"),
+                },
+            )
 
             if not isinstance(metadata_json, str):
                 raise ValueError(
                     f"MATLAB local registration entrypoint '{self.local_entrypoint}' must return a JSON string metadata payload"
                 )
 
+            result_validation_started = time.perf_counter()
             try:
                 metadata = json.loads(metadata_json)
             except json.JSONDecodeError as exc:
@@ -824,6 +1034,22 @@ class MATLABRegistrationBackend:
                 metadata,
                 round_id=round_id,
             )
+            record_matlab_boundary_phase(
+                boundary_trace,
+                phase_name="result_validation",
+                duration_ms=round((time.perf_counter() - result_validation_started) * 1000.0, 3),
+                seam_cost_key="result_validation_ms",
+                details={
+                    "reported_step_count": len(metadata.get("steps", [])) if isinstance(metadata.get("steps"), list) else 0,
+                    "flow_shape": [int(value) for value in flow_3d.shape],
+                },
+            )
+
+        finalized_boundary_trace = finalize_matlab_boundary_trace(
+            boundary_trace,
+            session=self._session_lifecycle,
+            engine_reused_this_call=bool(engine_acquire.get("engine_reused_this_call", False)),
+        )
 
         return {
             "flow_3d": flow_3d,
@@ -836,12 +1062,16 @@ class MATLABRegistrationBackend:
                     "entrypoint": self.local_entrypoint,
                 },
                 "request": request_payload,
+                "runtime_files": runtime_files,
                 "matlab_metadata": metadata,
                 "normalized_result": {
                     "flow_3d_shape": [int(value) for value in flow_3d.shape],
                     "flow_3d_dtype": str(flow_3d.dtype),
                     "mean_abs_displacement": float(np.abs(flow_3d).mean()),
                 },
+                "boundary_instrumentation": finalized_boundary_trace,
+                "session_lifecycle": snapshot_matlab_session_lifecycle(self._session_lifecycle),
+                "session_lifecycle_summary": self._session_lifecycle_summary,
             },
         }
 

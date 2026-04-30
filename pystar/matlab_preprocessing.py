@@ -1,3 +1,14 @@
+"""MATLAB-backed preprocessing boundary for PyStar.
+
+Native preprocessing atoms are the default execution path.  When a preprocessing
+step explicitly selects `provider: matlab`, this module converts the selected
+step sequence into a small JSON plan, calls the repo-local MATLAB runtime, and
+validates that MATLAB wrote the same canonical `clean_data/` TIFF artifacts that
+the native sanitizer would produce.  The handoff is intentionally explicit:
+unsupported preprocessing methods fail before MATLAB starts, and MATLAB errors
+are never hidden behind a native fallback.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -18,7 +29,14 @@ from .io import (
     get_fov_output_structure,
     get_matlab_stage_contract,
 )
-from .matlab_engine_bootstrap import close_matlab_engine_best_effort, load_matlab_engine_module
+from .matlab_engine_bootstrap import (
+    MATLABSessionCapsule,
+    create_matlab_boundary_trace,
+    finalize_matlab_boundary_trace,
+    load_matlab_engine_factory,
+    record_matlab_boundary_phase,
+    snapshot_matlab_session_lifecycle,
+)
 
 
 PREPROCESSING_PROVENANCE_VERSION = "1.0"
@@ -48,6 +66,15 @@ def _repo_root() -> Path:
 
 
 def write_preprocessing_provenance(base_dir: Path, fov_id: int, provenance: Mapping[str, Any]) -> Path:
+    """Persist preprocessing provenance and the MATLAB-stage support contract.
+
+    The provenance file is the downstream audit record for `clean_data/`: it says
+    which provider path ran, which runtime files were used, and whether MATLAB was
+    requested.  When the caller did not already include a stage contract, this
+    helper derives one from the provider/backend fields so reports can still show
+    the current support status and fail-loud boundary.
+    """
+
     paths = get_fov_output_structure(base_dir, fov_id)
     output_path = paths["qc"] / "preprocessing_provenance.yaml"
     temp_path = output_path.with_suffix(".yaml.tmp")
@@ -96,6 +123,8 @@ def write_preprocessing_provenance(base_dir: Path, fov_id: int, provenance: Mapp
 
 
 def resolve_matlab_runtime_path(config: ExperimentConfig) -> Path:
+    """Resolve the configured MATLAB preprocessing runtime inside the repo tree."""
+
     matlab_cfg = config.providers.matlab.preprocessing
 
     runtime_path = matlab_cfg.runtime_path
@@ -105,6 +134,8 @@ def resolve_matlab_runtime_path(config: ExperimentConfig) -> Path:
 
 
 def load_matlab_runtime_manifest(runtime_dir: Path) -> Dict[str, Any]:
+    """Load and validate the preprocessing MATLAB runtime manifest."""
+
     manifest_path = runtime_dir / MATLAB_RUNTIME_MANIFEST_NAME
     if not manifest_path.exists():
         raise FileNotFoundError(
@@ -234,6 +265,16 @@ def build_matlab_preprocessing_plan(
     filename_pattern: Optional[str] = None,
     input_sub_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Convert selected preprocessing steps into a MATLAB execution plan.
+
+    Only the MATLAB-runtime subset is supported here: `none`,
+    `min_max_normalize`, `histogram_match`, and
+    `morpho_reconstruction_contrast`.  The plan also freezes the selected rounds,
+    sequencing channels, Leica-style raw filename pattern, expected z-depth, and
+    output dtype so MATLAB can produce the exact canonical clean-image handoff
+    that downstream PyStar stages consume.
+    """
+
     matlab_cfg = config.providers.matlab.preprocessing
     active_sequence = list(sequence) if sequence is not None else [
         step for step in config.pipeline.preprocessing.sequence if getattr(step, "provider", "native") == "matlab"
@@ -335,17 +376,22 @@ def build_matlab_preprocessing_plan(
 
 
 def _load_matlab_engine_factory() -> Callable[[], Any]:
-    matlab_engine = load_matlab_engine_module(
+    factory, _factory_metrics = load_matlab_engine_factory(
         consumer="preprocessing step provider='matlab'",
     )
-
-    start_matlab = getattr(matlab_engine, "start_matlab", None)
-    if start_matlab is None or not callable(start_matlab):
-        raise RuntimeError("Imported 'matlab.engine' module does not expose callable start_matlab()")
-    return start_matlab
+    return factory
 
 
 class MATLABPreprocessingBackend:
+    """Run MATLAB preprocessing and validate the canonical clean-image handoff.
+
+    The backend owns one MATLAB Engine session capsule, validates the runtime
+    manifest and entrypoint, stages an explicit plan, and checks every reported
+    clean TIFF for filename, dtype, dimensionality, and z-depth.  The returned
+    provenance includes boundary timings and MATLAB metadata; the image artifacts
+    themselves remain Python-owned under the normal PyStar output schema.
+    """
+
     def __init__(
         self,
         config: ExperimentConfig,
@@ -358,59 +404,44 @@ class MATLABPreprocessingBackend:
         self.runtime_manifest = load_matlab_runtime_manifest(self.runtime_dir)
         self.entrypoint = config.providers.matlab.preprocessing.entrypoint
         _validate_runtime_entrypoint_contract(self.runtime_manifest, self.entrypoint)
-        self._engine: Any = None
+        self._session_capsule = MATLABSessionCapsule(
+            consumer="preprocessing provider='matlab'",
+            runtime_dir=self.runtime_dir,
+            entrypoint=self.entrypoint,
+            engine_factory=engine_factory,
+            engine_factory_consumer="preprocessing step provider='matlab'",
+            startup_failure_prefix="Failed to start MATLAB Engine for preprocessing provider='matlab'",
+            addpath_failure_prefix="Failed to add MATLAB preprocessing runtime path",
+        )
+
+    @property
+    def _engine(self) -> Any:
+        return self._session_capsule.engine
+
+    @property
+    def _session_lifecycle(self) -> dict[str, Any]:
+        return self._session_capsule.session_lifecycle
+
+    @property
+    def _session_lifecycle_summary(self) -> dict[str, Any] | None:
+        return self._session_capsule.summarize_session_lifecycle()
 
     def close(self) -> None:
-        if self._engine is None:
-            return
-        try:
-            close_matlab_engine_best_effort(
-                self._engine,
-                consumer="preprocessing provider='matlab'",
-            )
-        finally:
-            self._engine = None
+        """Close the owned MATLAB Engine session if it was started."""
+
+        self._session_capsule.close()
 
     def _ensure_engine(self) -> Any:
-        if self._engine is not None:
-            return self._engine
+        return self._session_capsule.ensure_engine()
 
-        factory = self.engine_factory or _load_matlab_engine_factory()
-        try:
-            engine = factory()
-        except Exception as exc:  # pragma: no cover - exact engine exception type depends on MATLAB install
-            raise RuntimeError(
-                _format_exception_message(
-                    "Failed to start MATLAB Engine for preprocessing provider='matlab'",
-                    exc,
-                )
-            ) from exc
-
-        try:
-            engine.addpath(str(self.runtime_dir), nargout=0)
-        except Exception as exc:  # pragma: no cover - exact engine exception type depends on MATLAB install
-            try:
-                engine.quit()
-            except Exception:
-                pass
-            raise RuntimeError(
-                _format_exception_message(
-                    f"Failed to add MATLAB preprocessing runtime path: {self.runtime_dir}",
-                    exc,
-                    )
-                ) from exc
-
-        self._engine = engine
-        return engine
+    def _consume_last_engine_acquire(self) -> dict[str, Any]:
+        return self._session_capsule.consume_last_engine_acquire()
 
     def _resolve_callable(self) -> Any:
-        engine = self._ensure_engine()
-        try:
-            return getattr(engine, self.entrypoint)
-        except AttributeError as exc:
-            raise RuntimeError(
-                f"MATLAB runtime path {self.runtime_dir} does not expose entrypoint '{self.entrypoint}'"
-            ) from exc
+        return self._session_capsule.resolve_callable()
+
+    def _resolve_runtime_file_records(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        return self._session_capsule.validate_runtime_files(self._collect_runtime_file_records)
 
     def _collect_runtime_file_records(self) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
@@ -546,6 +577,26 @@ class MATLABPreprocessingBackend:
         input_sub_dir: Optional[str] = None,
         segment_label: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Execute one MATLAB preprocessing segment for a FOV.
+
+        `sequence` may be a subset of the global preprocessing sequence when the
+        native sanitizer splits mixed-provider execution into segments.  Optional
+        `input_root` and `input_filename_pattern` allow a later MATLAB segment to
+        consume intermediate native outputs while still writing the final clean
+        images into the canonical `clean_data/` layout.
+        """
+
+        boundary_trace = create_matlab_boundary_trace(
+            stage_name="matlab_preprocessing",
+            runtime_dir=self.runtime_dir,
+            entrypoint=self.entrypoint,
+            session=self._session_lifecycle,
+            call_scope={
+                "fov_id": int(fov_id),
+                "target_rounds": None if target_rounds is None else [int(round_id) for round_id in target_rounds],
+                "segment_label": segment_label,
+            },
+        )
         plan = build_matlab_preprocessing_plan(
             self.config,
             fov_id,
@@ -554,7 +605,18 @@ class MATLABPreprocessingBackend:
             filename_pattern=input_filename_pattern,
             input_sub_dir=input_sub_dir,
         )
-        runtime_files = self._collect_runtime_file_records()
+        runtime_validation_started = time.perf_counter()
+        runtime_files, runtime_validation_details = self._resolve_runtime_file_records()
+        record_matlab_boundary_phase(
+            boundary_trace,
+            phase_name="runtime_file_validation",
+            duration_ms=round((time.perf_counter() - runtime_validation_started) * 1000.0, 3),
+            seam_cost_key="runtime_file_validation_ms",
+            details={
+                "runtime_file_count": len(runtime_files),
+                **runtime_validation_details,
+            },
+        )
 
         if output_dir is None:
             base_dir = Path(self.config.pipeline.output.directory)
@@ -570,10 +632,27 @@ class MATLABPreprocessingBackend:
         plan_for_matlab["input_root"] = str(resolved_input_root)
 
         matlab_callable = self._resolve_callable()
+        engine_acquire = self._consume_last_engine_acquire()
+        session_bootstrap = engine_acquire.get("session_bootstrap")
+        if isinstance(session_bootstrap, Mapping):
+            engine_bootstrap_ms_value = session_bootstrap.get("engine_bootstrap_ms")
+            engine_bootstrap_ms = (
+                float(engine_bootstrap_ms_value)
+                if isinstance(engine_bootstrap_ms_value, (int, float))
+                else 0.0
+            )
+            record_matlab_boundary_phase(
+                boundary_trace,
+                phase_name="engine_bootstrap",
+                duration_ms=engine_bootstrap_ms,
+                seam_cost_key="engine_bootstrap_ms",
+                details=session_bootstrap,
+            )
         config_json = json.dumps(plan_for_matlab, sort_keys=True)
         started_at = _iso_utc_now()
         start_time = time.perf_counter()
 
+        matlab_call_started = time.perf_counter()
         try:
             metadata_json = matlab_callable(
                 str(resolved_input_root),
@@ -589,6 +668,16 @@ class MATLABPreprocessingBackend:
                     exc,
                 )
             ) from exc
+        record_matlab_boundary_phase(
+            boundary_trace,
+            phase_name="matlab_call",
+            duration_ms=round((time.perf_counter() - matlab_call_started) * 1000.0, 3),
+            seam_cost_key="matlab_call_ms",
+            details={
+                "selected_round_count": len(plan["round_ids"]),
+                "selected_channel_count": len(plan["seq_channels"]),
+            },
+        )
 
         finished_at = _iso_utc_now()
         duration_ms = round((time.perf_counter() - start_time) * 1000.0, 3)
@@ -598,6 +687,7 @@ class MATLABPreprocessingBackend:
                 f"MATLAB preprocessing entrypoint '{self.entrypoint}' must return a JSON string metadata payload"
             )
 
+        result_validation_started = time.perf_counter()
         try:
             metadata = json.loads(metadata_json)
         except json.JSONDecodeError as exc:
@@ -610,6 +700,21 @@ class MATLABPreprocessingBackend:
         if not isinstance(metadata, dict):
             raise ValueError("MATLAB preprocessing metadata payload must decode to a JSON object")
         self._validate_result_metadata(metadata, clean_output_dir, plan)
+        record_matlab_boundary_phase(
+            boundary_trace,
+            phase_name="result_validation",
+            duration_ms=round((time.perf_counter() - result_validation_started) * 1000.0, 3),
+            seam_cost_key="result_validation_ms",
+            details={
+                "output_file_count": len(metadata.get("output_files", [])) if isinstance(metadata.get("output_files"), list) else 0,
+                "step_count": len(metadata.get("steps", [])) if isinstance(metadata.get("steps"), list) else 0,
+            },
+        )
+        finalized_boundary_trace = finalize_matlab_boundary_trace(
+            boundary_trace,
+            session=self._session_lifecycle,
+            engine_reused_this_call=bool(engine_acquire.get("engine_reused_this_call", False)),
+        )
 
         return {
             "version": PREPROCESSING_PROVENANCE_VERSION,
@@ -647,7 +752,12 @@ class MATLABPreprocessingBackend:
             "raw_sequence": plan["raw_sequence"],
             "matlab_files": runtime_files,
             "matlab_metadata": metadata,
+            "boundary_instrumentation": finalized_boundary_trace,
+            "session_lifecycle": snapshot_matlab_session_lifecycle(self._session_lifecycle),
+            "session_lifecycle_summary": self._session_lifecycle_summary,
         }
 
     def preprocess_fov(self, fov_id: int, target_rounds: Optional[list[int]] = None) -> Dict[str, Any]:
+        """Preprocess one FOV entirely through the MATLAB provider path."""
+
         return self.execute_sequence(fov_id, target_rounds=target_rounds)
