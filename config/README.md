@@ -48,7 +48,7 @@
 - `min_max_normalize`：强度归一化。
 - `histogram_match` with `scope: inter_round`：跨 round 直方图匹配。
 - `histogram_match` with `scope: intra_round`：round 内 channel 直方图匹配。
-- `morpho_reconstruction_contrast`：形态学重建增强；当前参考参数为 `radius: 5`、`downsample_factor: 0.25`。
+- `morpho_reconstruction_contrast`：形态学重建增强；当前参考参数为 `radius: 6`、`downsample_factor: 0.25`。
 
 默认每步 `provider: native`，对应纯 Python 实现。
 

@@ -211,7 +211,7 @@ providers:
       # method="2d" 表示逐 Z slice 做 2D morphology；radius 控制结构元素半径；height 控制 h-maxima / reconstruction 类操作强度。
       morphology:
         method: "2d"
-        radius: 5
+        radius: 6
         height: 3
 
     registration:
@@ -348,7 +348,7 @@ pipeline:
       - method: "morpho_reconstruction_contrast"
         provider: "native"
         params:
-          radius: 5
+          radius: 6
           downsample_factor: 0.25
 
   # ------------------------------------------
