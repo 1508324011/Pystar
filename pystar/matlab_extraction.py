@@ -1,7 +1,19 @@
+"""MATLAB-backed signal extraction boundary for PyStar.
+
+This module stages a cleaned 3D volume and a `z, y, x` coordinate table for the
+repo-local MATLAB extraction runtime.  MATLAB computes the same per-spot box-sum
+contract that the native extractor uses, then PyStar validates the returned
+metadata and converts the result into the one-dimensional intensity vector
+consumed by `SignalMiner`.  The boundary is explicit and fail-loud: runtime
+files, output ordering, output length, and staging paths are all checked before
+any intensities are accepted.
+"""
+
 from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Callable, Dict, Mapping, Optional
@@ -11,7 +23,14 @@ import pandas as pd
 import tifffile
 
 from .infrastructure import ExperimentConfig
-from .matlab_engine_bootstrap import close_matlab_engine_best_effort, load_matlab_engine_module
+from .matlab_engine_bootstrap import (
+    MATLABSessionCapsule,
+    create_matlab_boundary_trace,
+    finalize_matlab_boundary_trace,
+    load_matlab_engine_factory,
+    record_matlab_boundary_phase,
+    snapshot_matlab_session_lifecycle,
+)
 
 
 MATLAB_EXTRACTION_RUNTIME_MANIFEST_NAME = "runtime_manifest.json"
@@ -42,6 +61,8 @@ def _format_exception_message(prefix: str, exc: Exception) -> str:
 
 
 def resolve_matlab_extraction_runtime_path(config: ExperimentConfig) -> Path:
+    """Resolve and validate the repo-local MATLAB extraction runtime path."""
+
     runtime_path = config.providers.matlab.extraction.runtime_path
     if not runtime_path.is_absolute():
         runtime_path = _repo_root() / runtime_path
@@ -58,6 +79,8 @@ def resolve_matlab_extraction_runtime_path(config: ExperimentConfig) -> Path:
 
 
 def load_matlab_extraction_runtime_manifest(runtime_dir: Path) -> Dict[str, Any]:
+    """Load the MATLAB extraction runtime manifest and validate its schema."""
+
     manifest_path = runtime_dir / MATLAB_EXTRACTION_RUNTIME_MANIFEST_NAME
     if not manifest_path.exists():
         raise FileNotFoundError(
@@ -132,6 +155,15 @@ def build_matlab_extraction_plan(
     box_size: tuple[int, int, int],
     transform_application_mode: str,
 ) -> Dict[str, Any]:
+    """Build the JSON-serializable execution plan for one MATLAB extraction call.
+
+    `volume_shape_zyx`, `box_size_zyx`, and `n_spots` are repeated in the MATLAB
+    metadata contract so PyStar can reject stale or truncated outputs.  The
+    `transform_application_mode` is recorded because callers may pass either a
+    moving-round volume with mapped coordinates or a reference-frame warped
+    volume with original reference coordinates.
+    """
+
     matlab_cfg = config.providers.matlab.extraction
     return {
         "fov_id": int(fov_id),
@@ -149,14 +181,10 @@ def build_matlab_extraction_plan(
 
 
 def _load_matlab_engine_factory() -> Callable[[], Any]:
-    matlab_engine = load_matlab_engine_module(
+    factory, _factory_metrics = load_matlab_engine_factory(
         consumer="extraction.provider='matlab'",
     )
-
-    start_matlab = getattr(matlab_engine, "start_matlab", None)
-    if start_matlab is None or not callable(start_matlab):
-        raise RuntimeError("Imported 'matlab.engine' module does not expose callable start_matlab()")
-    return start_matlab
+    return factory
 
 
 def _write_staged_volume_tiff(volume_path: Path, volume: Any) -> None:
@@ -170,6 +198,14 @@ def _write_staged_volume_tiff(volume_path: Path, volume: Any) -> None:
 
 
 class MATLABExtractionBackend:
+    """Execute MATLAB box-sum extraction under PyStar's provider contract.
+
+    A backend instance owns the MATLAB session, runtime manifest validation, and
+    per-call boundary instrumentation.  The public `extract_intensities` method
+    accepts a 3D volume plus an `(N, 3)` coordinate matrix in `z, y, x` order and
+    returns an `(N,)` float32 intensity vector in the same spot order.
+    """
+
     def __init__(
         self,
         config: ExperimentConfig,
@@ -182,59 +218,44 @@ class MATLABExtractionBackend:
         self.runtime_manifest = load_matlab_extraction_runtime_manifest(self.runtime_dir)
         self.entrypoint = config.providers.matlab.extraction.entrypoint
         _validate_runtime_entrypoint_contract(self.runtime_manifest, self.entrypoint)
-        self._engine: Any = None
+        self._session_capsule = MATLABSessionCapsule(
+            consumer="extraction.provider='matlab'",
+            runtime_dir=self.runtime_dir,
+            entrypoint=self.entrypoint,
+            engine_factory=engine_factory,
+            engine_factory_consumer="extraction.provider='matlab'",
+            startup_failure_prefix="Failed to start MATLAB Engine for extraction.provider='matlab'",
+            addpath_failure_prefix="Failed to add MATLAB extraction runtime path",
+        )
+
+    @property
+    def _engine(self) -> Any:
+        return self._session_capsule.engine
+
+    @property
+    def _session_lifecycle(self) -> dict[str, Any]:
+        return self._session_capsule.session_lifecycle
+
+    @property
+    def _session_lifecycle_summary(self) -> dict[str, Any] | None:
+        return self._session_capsule.summarize_session_lifecycle()
 
     def close(self) -> None:
-        if self._engine is None:
-            return
-        try:
-            close_matlab_engine_best_effort(
-                self._engine,
-                consumer="extraction.provider='matlab'",
-            )
-        finally:
-            self._engine = None
+        """Close the owned MATLAB Engine session if one was started."""
+
+        self._session_capsule.close()
 
     def _ensure_engine(self) -> Any:
-        if self._engine is not None:
-            return self._engine
+        return self._session_capsule.ensure_engine()
 
-        factory = self.engine_factory or _load_matlab_engine_factory()
-        try:
-            engine = factory()
-        except Exception as exc:  # pragma: no cover
-            raise RuntimeError(
-                _format_exception_message(
-                    "Failed to start MATLAB Engine for extraction.provider='matlab'",
-                    exc,
-                )
-            ) from exc
-
-        try:
-            engine.addpath(str(self.runtime_dir), nargout=0)
-        except Exception as exc:  # pragma: no cover
-            try:
-                engine.quit()
-            except Exception:
-                pass
-            raise RuntimeError(
-                _format_exception_message(
-                    f"Failed to add MATLAB extraction runtime path: {self.runtime_dir}",
-                    exc,
-                )
-            ) from exc
-
-        self._engine = engine
-        return engine
+    def _consume_last_engine_acquire(self) -> dict[str, Any]:
+        return self._session_capsule.consume_last_engine_acquire()
 
     def _resolve_callable(self) -> Any:
-        engine = self._ensure_engine()
-        try:
-            return getattr(engine, self.entrypoint)
-        except AttributeError as exc:
-            raise RuntimeError(
-                f"MATLAB runtime path {self.runtime_dir} does not expose entrypoint '{self.entrypoint}'"
-            ) from exc
+        return self._session_capsule.resolve_callable()
+
+    def _resolve_runtime_file_records(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        return self._session_capsule.validate_runtime_files(self._collect_runtime_file_records)
 
     def _collect_runtime_file_records(self) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
@@ -365,6 +386,28 @@ class MATLABExtractionBackend:
         box_size: tuple[int, int, int],
         transform_application_mode: str,
     ) -> Dict[str, Any]:
+        """Extract one channel/round intensity vector through MATLAB.
+
+        `coords_zyx` must already be expressed in the coordinate frame expected
+        by `transform_application_mode`: moving-image coordinates for
+        `coordinate_mapping`, or reference-frame coordinates when the volume has
+        already been image-warped.  The returned dictionary contains the ordered
+        intensity vector and boundary metadata; output `spot_index` must match
+        `0..N-1` exactly so row order stays aligned with `spots_fov_<id>.csv`.
+        """
+
+        boundary_trace = create_matlab_boundary_trace(
+            stage_name="matlab_extraction",
+            runtime_dir=self.runtime_dir,
+            entrypoint=self.entrypoint,
+            session=self._session_lifecycle,
+            call_scope={
+                "fov_id": int(fov_id),
+                "round_id": int(round_id),
+                "channel_id": int(channel_id),
+                "transform_application_mode": transform_application_mode,
+            },
+        )
         volume_for_matlab = self._normalize_input_volume(volume)
         coords = np.asarray(coords_zyx, dtype=np.float32)
         if coords.ndim != 2 or coords.shape[1] != 3:
@@ -380,12 +423,41 @@ class MATLABExtractionBackend:
             box_size=box_size,
             transform_application_mode=transform_application_mode,
         )
+        runtime_validation_started = time.perf_counter()
+        runtime_files, runtime_validation_details = self._resolve_runtime_file_records()
+        record_matlab_boundary_phase(
+            boundary_trace,
+            phase_name="runtime_file_validation",
+            duration_ms=round((time.perf_counter() - runtime_validation_started) * 1000.0, 3),
+            seam_cost_key="runtime_file_validation_ms",
+            details={
+                "runtime_file_count": len(runtime_files),
+                **runtime_validation_details,
+            },
+        )
         matlab_callable = self._resolve_callable()
+        engine_acquire = self._consume_last_engine_acquire()
+        session_bootstrap = engine_acquire.get("session_bootstrap")
+        if isinstance(session_bootstrap, Mapping):
+            engine_bootstrap_ms_value = session_bootstrap.get("engine_bootstrap_ms")
+            engine_bootstrap_ms = (
+                float(engine_bootstrap_ms_value)
+                if isinstance(engine_bootstrap_ms_value, (int, float))
+                else 0.0
+            )
+            record_matlab_boundary_phase(
+                boundary_trace,
+                phase_name="engine_bootstrap",
+                duration_ms=engine_bootstrap_ms,
+                seam_cost_key="engine_bootstrap_ms",
+                details=session_bootstrap,
+            )
 
         with TemporaryDirectory(prefix=f"pystar_matlab_extraction_fov{fov_id}_round{round_id}_ch{channel_id}_") as tmpdir:
             tmpdir_path = Path(tmpdir)
             volume_path = tmpdir_path / f"extraction_input_fov_{fov_id}_round_{round_id}_ch_{channel_id}.tif"
             coords_path = tmpdir_path / f"coords_fov_{fov_id}_round_{round_id}_ch_{channel_id}.csv"
+            input_staging_started = time.perf_counter()
             _write_staged_volume_tiff(volume_path, volume_for_matlab)
             pd.DataFrame(
                 {
@@ -395,7 +467,19 @@ class MATLABExtractionBackend:
                     "x": coords[:, 2],
                 }
             ).to_csv(coords_path, index=False)
+            record_matlab_boundary_phase(
+                boundary_trace,
+                phase_name="input_staging",
+                duration_ms=round((time.perf_counter() - input_staging_started) * 1000.0, 3),
+                seam_cost_key="input_staging_ms",
+                details={
+                    "staged_inputs": [volume_path.name, coords_path.name],
+                    "volume_shape_zyx": [int(volume_for_matlab.shape[0]), int(volume_for_matlab.shape[1]), int(volume_for_matlab.shape[2])],
+                    "spot_count": int(len(coords)),
+                },
+            )
 
+            matlab_call_started = time.perf_counter()
             try:
                 metadata_json = matlab_callable(
                     str(volume_path),
@@ -410,12 +494,23 @@ class MATLABExtractionBackend:
                         exc,
                     )
                 ) from exc
+            record_matlab_boundary_phase(
+                boundary_trace,
+                phase_name="matlab_call",
+                duration_ms=round((time.perf_counter() - matlab_call_started) * 1000.0, 3),
+                seam_cost_key="matlab_call_ms",
+                details={
+                    "volume_shape_zyx": plan.get("volume_shape_zyx"),
+                    "spot_count": int(len(coords)),
+                },
+            )
 
             if not isinstance(metadata_json, str):
                 raise ValueError(
                     f"MATLAB extraction entrypoint '{self.entrypoint}' must return a JSON string metadata payload"
                 )
 
+            result_validation_started = time.perf_counter()
             try:
                 metadata = json.loads(metadata_json)
             except json.JSONDecodeError as exc:
@@ -451,6 +546,22 @@ class MATLABExtractionBackend:
                 raise ValueError(
                     f"MATLAB extraction output length mismatch: expected {len(coords)}, got {len(intensities)}"
                 )
+            record_matlab_boundary_phase(
+                boundary_trace,
+                phase_name="result_validation",
+                duration_ms=round((time.perf_counter() - result_validation_started) * 1000.0, 3),
+                seam_cost_key="result_validation_ms",
+                details={
+                    "reported_step_count": len(metadata.get("steps", [])) if isinstance(metadata.get("steps"), list) else 0,
+                    "spot_count": int(len(intensities)),
+                },
+            )
+
+        finalized_boundary_trace = finalize_matlab_boundary_trace(
+            boundary_trace,
+            session=self._session_lifecycle,
+            engine_reused_this_call=bool(engine_acquire.get("engine_reused_this_call", False)),
+        )
 
         return {
             "intensities": intensities,
@@ -459,12 +570,15 @@ class MATLABExtractionBackend:
                 "runtime_path": str(self.runtime_dir),
                 "runtime_manifest": str(self.runtime_dir / MATLAB_EXTRACTION_RUNTIME_MANIFEST_NAME),
                 "entrypoint": self.entrypoint,
-                "runtime_files": self._collect_runtime_file_records(),
+                "runtime_files": runtime_files,
                 "matlab_metadata": metadata,
                 "normalized_result": {
                     "spot_count": int(len(intensities)),
                     "columns": list(output_df.columns),
                     "dtype": str(intensities.dtype),
                 },
+                "boundary_instrumentation": finalized_boundary_trace,
+                "session_lifecycle": snapshot_matlab_session_lifecycle(self._session_lifecycle),
+                "session_lifecycle_summary": self._session_lifecycle_summary,
             },
         }
