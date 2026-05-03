@@ -10,6 +10,7 @@ from typing import List, Optional, Dict, Any, cast
 from datetime import datetime, timezone
 from numpy.typing import NDArray
 from .infrastructure import ExperimentConfig
+from .runtime_artifacts import TransformManifest
 
 
 FLOW_3D_SIDECAR_STORAGE = "round_level_sidecar_npy"
@@ -2263,6 +2264,11 @@ def persist_flow_3d_sidecar(
         raise ValueError(
             f"flow_3d for round {round_id} must be 4D [3, Z, Y, X], got shape {flow_3d_arr.shape}"
         )
+    if flow_3d_arr.shape[0] != 3:
+        raise ValueError(
+            f"flow_3d for round {round_id} first dimension must contain 3 displacement components, "
+            f"got shape {flow_3d_arr.shape}"
+        )
 
     sidecar_name = get_flow_3d_sidecar_filename(fov_id, round_id)
     sidecar_path = transforms_dir / sidecar_name
@@ -2280,6 +2286,17 @@ def persist_flow_3d_sidecar(
         "shape": list(flow_3d_arr.shape),
         "dtype": str(flow_3d_arr.dtype),
     }
+
+
+def _is_direct_sidecar_filename(sidecar_rel: str) -> bool:
+    sidecar_rel_path = Path(sidecar_rel)
+    return (
+        sidecar_rel not in {".", ".."}
+        and not sidecar_rel_path.is_absolute()
+        and sidecar_rel_path.parent == Path('.')
+        and "/" not in sidecar_rel
+        and "\\" not in sidecar_rel
+    )
 
 
 def save_transform_manifest(
@@ -2307,6 +2324,9 @@ def save_transform_manifest(
         Execution envelope provenance data. If provided, will be validated
         and stored under key '_provenance' in the manifest.
     """
+    manifest_model = TransformManifest.from_legacy(transforms, fov_id=fov_id)
+    transforms = cast(Dict[Any, Any], manifest_model.to_legacy())
+
     if provenance is not None:
         provenance = copy.deepcopy(provenance)
         _backfill_requested_intent_diagnostic_defaults(provenance)
@@ -2319,6 +2339,7 @@ def save_transform_manifest(
 
     manifest_payload: Dict[Any, Any] = {}
     referenced_sidecars: set[Path] = set()
+    sidecar_payloads: Dict[Path, NDArray[Any]] = {}
 
     for round_key, transform_data in transforms.items():
         if not _is_round_transform_entry(transform_data):
@@ -2350,15 +2371,12 @@ def save_transform_manifest(
                     f"flow_3d manifest for round {round_id} is missing a valid sidecar path"
                 )
 
-            sidecar_rel_path = Path(sidecar_rel)
-            if sidecar_rel_path.is_absolute():
-                raise ValueError(f"flow_3d sidecar path must stay relative to transforms/: {sidecar_rel}")
-            if sidecar_rel_path.parent != Path('.'):
+            if not _is_direct_sidecar_filename(sidecar_rel):
                 raise ValueError(
                     f"flow_3d sidecar path must be a direct filename under transforms/: {sidecar_rel}"
                 )
 
-            sidecar_path = transforms_dir / sidecar_rel_path
+            sidecar_path = transforms_dir / sidecar_rel
             if not sidecar_path.exists():
                 raise FileNotFoundError(
                     f"flow_3d sidecar referenced by transform manifest is missing: {sidecar_path}"
@@ -2374,8 +2392,27 @@ def save_transform_manifest(
             manifest_payload[round_id] = round_payload
             continue
 
-        descriptor = persist_flow_3d_sidecar(base_dir, fov_id, round_id, np.asarray(flow_3d))
-        referenced_sidecars.add(transforms_dir / cast(str, descriptor["path"]))
+        flow_3d_arr = np.asarray(flow_3d)
+        if flow_3d_arr.ndim != 4:
+            raise ValueError(
+                f"flow_3d for round {round_id} must be 4D [3, Z, Y, X], got shape {flow_3d_arr.shape}"
+            )
+        if flow_3d_arr.shape[0] != 3:
+            raise ValueError(
+                f"flow_3d for round {round_id} first dimension must contain 3 displacement components, "
+                f"got shape {flow_3d_arr.shape}"
+            )
+
+        sidecar_name = get_flow_3d_sidecar_filename(fov_id, round_id)
+        sidecar_path = transforms_dir / sidecar_name
+        descriptor = {
+            "storage": FLOW_3D_SIDECAR_STORAGE,
+            "path": sidecar_name,
+            "shape": list(flow_3d_arr.shape),
+            "dtype": str(flow_3d_arr.dtype),
+        }
+        referenced_sidecars.add(sidecar_path)
+        sidecar_payloads[sidecar_path] = flow_3d_arr
         round_payload["flow_3d"] = descriptor
         manifest_payload[round_id] = round_payload
 
@@ -2386,9 +2423,26 @@ def save_transform_manifest(
         manifest_payload["_provenance"] = provenance
         manifest_payload["_contract"] = provenance["release_contract"]
 
+    manifest_payload = cast(
+        Dict[Any, Any],
+        TransformManifest.from_legacy(
+            manifest_payload,
+            fov_id=fov_id,
+            validate_release_contract=provenance is not None,
+        ).to_legacy(),
+    )
+
     summary_markdown = None
     if provenance is not None:
         summary_markdown = build_provenance_summary_markdown(fov_id, manifest_payload, provenance)
+
+    for sidecar_path, flow_3d_arr in sidecar_payloads.items():
+        temp_path = sidecar_path.with_suffix(f"{sidecar_path.suffix}.tmp")
+        if temp_path.exists():
+            temp_path.unlink()
+        with temp_path.open("wb") as handle:
+            np.save(handle, flow_3d_arr, allow_pickle=False)
+        temp_path.replace(sidecar_path)
 
     for stale_path in transforms_dir.glob(f"transforms_fov_{fov_id}_round_*_flow_3d.npy"):
         if stale_path not in referenced_sidecars:
@@ -2414,15 +2468,12 @@ def _validate_flow_3d_sidecar_descriptor(
     if not isinstance(sidecar_rel, str) or not sidecar_rel:
         raise ValueError(f"flow_3d manifest for round {round_key} is missing a valid sidecar path")
 
-    sidecar_rel_path = Path(sidecar_rel)
-    if sidecar_rel_path.is_absolute():
-        raise ValueError(f"flow_3d sidecar path must stay relative to transforms/: {sidecar_rel}")
-    if sidecar_rel_path.parent != Path('.'):
+    if not _is_direct_sidecar_filename(sidecar_rel):
         raise ValueError(
             f"flow_3d sidecar path must be a direct filename under transforms/: {sidecar_rel}"
         )
 
-    sidecar_path = transforms_dir / sidecar_rel_path
+    sidecar_path = transforms_dir / sidecar_rel
     if not sidecar_path.exists():
         raise FileNotFoundError(
             f"flow_3d sidecar referenced by transform manifest is missing: {sidecar_path}"
@@ -2440,6 +2491,11 @@ def _load_flow_3d_sidecar_array(
     flow_3d_arr = np.load(sidecar_path, allow_pickle=False)
     if flow_3d_arr.ndim != 4:
         raise ValueError(f"flow_3d sidecar for round {round_key} must be 4D, got shape {flow_3d_arr.shape}")
+    if flow_3d_arr.shape[0] != 3:
+        raise ValueError(
+            f"flow_3d sidecar for round {round_key} first dimension must contain 3 displacement components, "
+            f"got shape {flow_3d_arr.shape}"
+        )
 
     expected_shape = descriptor.get("shape")
     if expected_shape is not None and not isinstance(expected_shape, (list, tuple)):
@@ -2535,6 +2591,9 @@ def load_transform_manifest(
     transforms = np.load(manifest_path, allow_pickle=True).item()
     if not isinstance(transforms, dict):
         raise ValueError(f"Transform manifest is malformed: expected dict payload, got {type(transforms)}")
+
+    manifest_model = TransformManifest.from_legacy(transforms, fov_id=fov_id)
+    transforms = cast(Dict[Any, Any], manifest_model.to_legacy())
 
     provenance = transforms.get("_provenance")
     if provenance is not None:
