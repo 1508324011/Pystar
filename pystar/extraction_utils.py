@@ -15,20 +15,22 @@ import numpy as np
 import numpy.typing as npt
 from scipy.ndimage import map_coordinates
 
+from .runtime_artifacts import FieldSemantics, ScopeMetadata
+
 
 FloatArray = npt.NDArray[np.float32]
 TransformData = Mapping[str, object] | None
-FIELD_SEMANTICS_REPRESENTATIONS = {"residual", "total", "unknown"}
-FIELD_SEMANTICS_COMPOSITIONS = {"sequential_global_then_local", "independent", "unknown"}
-FIELD_SEMANTICS_STATUSES = {"settled", "provisional", "unknown"}
-SCOPE_COVERAGE_MODES = {"full_fov", "tile_local"}
 
 
 def _unknown_field_semantics() -> dict[str, str]:
+    return _field_semantics_public_payload(FieldSemantics.unknown())
+
+
+def _field_semantics_public_payload(semantics: FieldSemantics) -> dict[str, str]:
     return {
-        "representation": "unknown",
-        "composition": "unknown",
-        "status": "unknown",
+        "representation": semantics.representation,
+        "composition": semantics.composition,
+        "status": semantics.status,
     }
 
 
@@ -37,33 +39,8 @@ def _normalize_field_semantics_payload(
     *,
     field_name: str,
 ) -> dict[str, str]:
-    if payload is None:
-        return _unknown_field_semantics()
-    if not isinstance(payload, Mapping):
-        raise ValueError(f"{field_name} must be a mapping")
-
-    representation = payload.get("representation", "unknown")
-    composition = payload.get("composition", "unknown")
-    status = payload.get("status", "unknown")
-
-    if representation not in FIELD_SEMANTICS_REPRESENTATIONS:
-        raise ValueError(
-            f"{field_name}.representation must be one of {sorted(FIELD_SEMANTICS_REPRESENTATIONS)}, got {representation!r}"
-        )
-    if composition not in FIELD_SEMANTICS_COMPOSITIONS:
-        raise ValueError(
-            f"{field_name}.composition must be one of {sorted(FIELD_SEMANTICS_COMPOSITIONS)}, got {composition!r}"
-        )
-    if status not in FIELD_SEMANTICS_STATUSES:
-        raise ValueError(
-            f"{field_name}.status must be one of {sorted(FIELD_SEMANTICS_STATUSES)}, got {status!r}"
-        )
-
-    return {
-        "representation": str(representation),
-        "composition": str(composition),
-        "status": str(status),
-    }
+    semantics = FieldSemantics.from_legacy(payload, field_name=field_name)
+    return _field_semantics_public_payload(semantics)
 
 
 def validate_field_semantics(
@@ -199,7 +176,7 @@ def _map_coordinates_float32(
             mode=mode,
             cval=cval,
             prefilter=prefilter,
-    )
+        )
     return cast(FloatArray, np.asarray(mapped, dtype=np.float32))
 
 
@@ -231,25 +208,6 @@ def _shape_3d(shape: tuple[int, ...], *, field_name: str) -> tuple[int, int, int
     return (int(shape[0]), int(shape[1]), int(shape[2]))
 
 
-def _coerce_int_tuple(
-    value: object,
-    *,
-    field_name: str,
-    expected_length: int,
-) -> tuple[int, ...]:
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{field_name} must be a list/tuple of {expected_length} integers")
-    if len(value) != expected_length:
-        raise ValueError(f"{field_name} must contain {expected_length} integers")
-
-    coerced: list[int] = []
-    for item in value:
-        if not isinstance(item, (int, np.integer)):
-            raise ValueError(f"{field_name} entries must be integers, got {item!r}")
-        coerced.append(int(item))
-    return tuple(coerced)
-
-
 def get_transform_scope(transform_data: TransformData) -> dict[str, object] | None:
     """Return normalized spatial coverage metadata for a transform.
 
@@ -266,78 +224,16 @@ def get_transform_scope(transform_data: TransformData) -> dict[str, object] | No
     payload = transform_data.get("_scope")
     if payload is None:
         return None
-    if not isinstance(payload, Mapping):
-        raise ValueError("transform _scope must be a mapping")
-
-    coverage_mode = payload.get("coverage_mode")
-    if coverage_mode not in SCOPE_COVERAGE_MODES:
-        raise ValueError(
-            f"transform _scope.coverage_mode must be one of {sorted(SCOPE_COVERAGE_MODES)}, got {coverage_mode!r}"
-        )
-
-    region_origin_zyx = _coerce_int_tuple(
-        payload.get("region_origin_zyx"),
-        field_name="transform _scope.region_origin_zyx",
-        expected_length=3,
-    )
-    region_shape_zyx = _coerce_int_tuple(
-        payload.get("region_shape_zyx"),
-        field_name="transform _scope.region_shape_zyx",
-        expected_length=3,
-    )
-    full_volume_shape_zyx = _coerce_int_tuple(
-        payload.get("full_volume_shape_zyx"),
-        field_name="transform _scope.full_volume_shape_zyx",
-        expected_length=3,
-    )
-
-    if any(value < 0 for value in region_origin_zyx):
-        raise ValueError("transform _scope.region_origin_zyx must contain non-negative integers")
-    if any(value <= 0 for value in region_shape_zyx):
-        raise ValueError("transform _scope.region_shape_zyx must contain positive integers")
-    if any(value <= 0 for value in full_volume_shape_zyx):
-        raise ValueError("transform _scope.full_volume_shape_zyx must contain positive integers")
-
-    for origin, size, full_size, axis_name in zip(
-        region_origin_zyx,
-        region_shape_zyx,
-        full_volume_shape_zyx,
-        ("z", "y", "x"),
-    ):
-        if origin + size > full_size:
-            raise ValueError(
-                f"transform _scope {axis_name}-axis region exceeds full volume bounds: "
-                f"origin={origin}, size={size}, full={full_size}"
-            )
-
+    scope = ScopeMetadata.from_legacy(payload, field_name="transform _scope")
     normalized: dict[str, object] = {
-        "coverage_mode": str(coverage_mode),
-        "region_origin_zyx": region_origin_zyx,
-        "region_shape_zyx": region_shape_zyx,
-        "full_volume_shape_zyx": full_volume_shape_zyx,
+        "coverage_mode": scope.coverage_mode,
+        "region_origin_zyx": scope.region_origin_zyx,
+        "region_shape_zyx": scope.region_shape_zyx,
+        "full_volume_shape_zyx": scope.full_volume_shape_zyx,
     }
-
-    tile_grid_shape_yx = payload.get("tile_grid_shape_yx")
-    tile_index = payload.get("tile_index")
-    if coverage_mode == "tile_local":
-        tile_grid_shape = _coerce_int_tuple(
-            tile_grid_shape_yx,
-            field_name="transform _scope.tile_grid_shape_yx",
-            expected_length=2,
-        )
-        if any(value <= 0 for value in tile_grid_shape):
-            raise ValueError("transform _scope.tile_grid_shape_yx must contain positive integers")
-        if not isinstance(tile_index, (int, np.integer)) or int(tile_index) <= 0:
-            raise ValueError("transform _scope.tile_index must be a positive integer for tile_local coverage")
-        tile_index_int = int(tile_index)
-        max_tiles = int(tile_grid_shape[0] * tile_grid_shape[1])
-        if tile_index_int > max_tiles:
-            raise ValueError(
-                f"transform _scope.tile_index={tile_index_int} exceeds tile grid capacity {max_tiles}"
-            )
-        normalized["tile_grid_shape_yx"] = tile_grid_shape
-        normalized["tile_index"] = tile_index_int
-
+    if scope.coverage_mode == "tile_local":
+        normalized["tile_grid_shape_yx"] = scope.tile_grid_shape_yx
+        normalized["tile_index"] = scope.tile_index
     return normalized
 
 
