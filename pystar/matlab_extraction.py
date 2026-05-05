@@ -11,7 +11,6 @@ any intensities are accepted.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from pathlib import Path
@@ -31,117 +30,72 @@ from .matlab_engine_bootstrap import (
     record_matlab_boundary_phase,
     snapshot_matlab_session_lifecycle,
 )
+from .matlab_runtime import (
+    collect_runtime_file_records as _collect_runtime_file_records_from_manifest,
+    format_exception_message as _format_exception_message,
+    load_runtime_manifest_json,
+    require_manifest_string,
+    resolve_repo_runtime_path,
+    trusted_matlab_runtime_root,
+    validate_configured_entrypoint_contract,
+    validate_runtime_manifest_file_buckets,
+    validate_runtime_manifest_file_entries,
+)
 
 
 MATLAB_EXTRACTION_RUNTIME_MANIFEST_NAME = "runtime_manifest.json"
 MATLAB_EXTRACTION_PACKAGE_NAME = "pystar_extraction"
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def _trusted_matlab_runtime_root() -> Path:
-    return (_repo_root() / "matlab_runtime").resolve()
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return f"sha256:{digest.hexdigest()}"
-
-
-def _format_exception_message(prefix: str, exc: Exception) -> str:
-    detail = str(exc).strip()
-    if detail:
-        return f"{prefix}: {detail}"
-    return f"{prefix} ({exc.__class__.__name__})"
-
-
 def resolve_matlab_extraction_runtime_path(config: ExperimentConfig) -> Path:
     """Resolve and validate the repo-local MATLAB extraction runtime path."""
 
-    runtime_path = config.providers.matlab.extraction.runtime_path
-    if not runtime_path.is_absolute():
-        runtime_path = _repo_root() / runtime_path
-    resolved_runtime_path = runtime_path.resolve()
-    trusted_root = _trusted_matlab_runtime_root()
-    try:
-        resolved_runtime_path.relative_to(trusted_root)
-    except ValueError as exc:
-        raise ValueError(
-            "providers.matlab.extraction.runtime_path must resolve inside the repo-local "
-            f"'{trusted_root}' runtime root; got {resolved_runtime_path}"
-        ) from exc
-    return resolved_runtime_path
+    return resolve_repo_runtime_path(
+        config.providers.matlab.extraction.runtime_path,
+        config_label="providers.matlab.extraction.runtime_path",
+        trusted_root=trusted_matlab_runtime_root(),
+    )
 
 
 def load_matlab_extraction_runtime_manifest(runtime_dir: Path) -> Dict[str, Any]:
     """Load the MATLAB extraction runtime manifest and validate its schema."""
 
-    manifest_path = runtime_dir / MATLAB_EXTRACTION_RUNTIME_MANIFEST_NAME
-    if not manifest_path.exists():
-        raise FileNotFoundError(
-            f"MATLAB extraction runtime manifest is missing: {manifest_path}. "
-            "Expected repo-local manifest for MATLAB extraction provider."
-        )
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError(f"MATLAB extraction runtime manifest must be a JSON object: {manifest_path}")
-
-    required_files = manifest.get("required_files")
-    optional_files = manifest.get("optional_files", [])
-    entrypoint = manifest.get("entrypoint")
+    manifest = load_runtime_manifest_json(
+        runtime_dir,
+        manifest_label="MATLAB extraction runtime manifest",
+        missing_hint="Expected repo-local manifest for MATLAB extraction provider.",
+        manifest_name=MATLAB_EXTRACTION_RUNTIME_MANIFEST_NAME,
+    )
+    required_files, optional_files = validate_runtime_manifest_file_buckets(
+        manifest,
+        manifest_label="MATLAB extraction runtime manifest",
+    )
+    _ = require_manifest_string(
+        manifest,
+        key="entrypoint",
+        manifest_label="MATLAB extraction runtime manifest",
+    )
     package_name = manifest.get("package_name")
-    if not isinstance(required_files, list) or not required_files:
-        raise ValueError("MATLAB extraction runtime manifest must declare a non-empty required_files list")
-    if not isinstance(optional_files, list):
-        raise ValueError("MATLAB extraction runtime manifest optional_files must be a list")
-    if not isinstance(entrypoint, str) or not entrypoint.strip():
-        raise ValueError("MATLAB extraction runtime manifest must declare a non-empty entrypoint")
     if package_name != MATLAB_EXTRACTION_PACKAGE_NAME:
         raise ValueError(
             "MATLAB extraction runtime manifest package_name mismatch: "
             f"expected {MATLAB_EXTRACTION_PACKAGE_NAME!r}, got {package_name!r}"
         )
-
-    for bucket_name, bucket in (("required_files", required_files), ("optional_files", optional_files)):
-        for item in bucket:
-            if not isinstance(item, dict):
-                raise ValueError(f"MATLAB extraction runtime manifest {bucket_name} entries must be JSON objects")
-            for key in ("name", "source_path", "role"):
-                value = item.get(key)
-                if not isinstance(value, str) or not value.strip():
-                    raise ValueError(
-                        f"MATLAB extraction runtime manifest entry in {bucket_name} is missing non-empty '{key}'"
-                    )
-
+    validate_runtime_manifest_file_entries(
+        required_files=required_files,
+        optional_files=optional_files,
+        manifest_label="MATLAB extraction runtime manifest",
+    )
     return manifest
 
 
 def _validate_runtime_entrypoint_contract(runtime_manifest: Mapping[str, Any], configured_entrypoint: str) -> None:
-    manifest_entrypoint = runtime_manifest.get("entrypoint")
-    if configured_entrypoint != manifest_entrypoint:
-        raise ValueError(
-            "providers.matlab.extraction.entrypoint must match the repo-local MATLAB runtime manifest. "
-            f"Config entrypoint={configured_entrypoint!r}, manifest entrypoint={manifest_entrypoint!r}"
-        )
-
-    declared_filenames = {
-        item["name"]
-        for bucket_name in ("required_files", "optional_files")
-        for item in runtime_manifest.get(bucket_name, [])
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
-    expected_entrypoint_file = f"{configured_entrypoint}.m"
-    if expected_entrypoint_file not in declared_filenames:
-        raise ValueError(
-            "MATLAB extraction runtime manifest must declare the configured entrypoint file. "
-            f"Missing {expected_entrypoint_file!r} in runtime manifest"
-        )
+    validate_configured_entrypoint_contract(
+        runtime_manifest,
+        configured_entrypoint,
+        config_label="providers.matlab.extraction.entrypoint",
+        manifest_label="MATLAB extraction runtime manifest",
+    )
 
 
 def build_matlab_extraction_plan(
@@ -258,29 +212,12 @@ class MATLABExtractionBackend:
         return self._session_capsule.validate_runtime_files(self._collect_runtime_file_records)
 
     def _collect_runtime_file_records(self) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        for bucket_name, required_default in (("required_files", True), ("optional_files", False)):
-            for item in self.runtime_manifest.get(bucket_name, []):
-                file_path = self.runtime_dir / item["name"]
-                is_required = bool(item.get("required", required_default))
-                is_used = is_required
-                if is_used and not file_path.exists():
-                    raise FileNotFoundError(
-                        f"Required MATLAB extraction runtime file is missing: {file_path}. "
-                        "MATLAB extraction provider cannot proceed."
-                    )
-
-                record = {
-                    "name": item["name"],
-                    "required": is_required,
-                    "used": is_used,
-                    "role": item["role"],
-                    "source_path": item["source_path"],
-                }
-                if file_path.exists():
-                    record["sha256"] = _sha256_file(file_path)
-                records.append(record)
-        return records
+        return _collect_runtime_file_records_from_manifest(
+            self.runtime_manifest,
+            self.runtime_dir,
+            missing_required_prefix="Required MATLAB extraction runtime file is missing",
+            missing_required_suffix="MATLAB extraction provider cannot proceed.",
+        )
 
     def _normalize_input_volume(self, volume: Any) -> Any:
         if volume.ndim != 3:
