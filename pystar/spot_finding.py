@@ -1,8 +1,6 @@
-import json
 import time
 import numpy as np
 import pandas as pd
-import tifffile
 from pathlib import Path
 from typing import Any, Optional, cast
 from numpy.typing import NDArray
@@ -16,27 +14,9 @@ from .matlab_engine_bootstrap import (
     summarize_matlab_boundary_traces,
 )
 from .matlab_spot_finding import MATLABSpotFindingBackend
+from .serialization import write_backend_metadata
 from .visualization import inspect_spots_interactive
 
-
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.integer):
-        return int(value)
-    if isinstance(value, np.floating):
-        return float(value)
-    return value
-
-
-def _write_backend_metadata(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=True), encoding="utf-8")
 
 def _empty_spots_dataframe() -> pd.DataFrame:
     """Return an empty spot table with the canonical numeric columns."""
@@ -249,7 +229,7 @@ class SpotFinder:
                     for summary in [record.get("session_lifecycle_summary")]
                     if isinstance(summary, dict)
                 ]
-                _write_backend_metadata(
+                write_backend_metadata(
                     paths["qc"] / f"spot_finding_backend_fov_{fov_id}.json",
                     {
                         "provider": self.spot_cfg.provider,
@@ -294,7 +274,7 @@ class SpotFinder:
             persistence_ms = round((time.perf_counter() - persistence_started) * 1000.0, 3)
             if boundary_summary is not None:
                 boundary_summary["fov_canonical_persistence_ms"] = persistence_ms
-            _write_backend_metadata(
+            write_backend_metadata(
                 paths["qc"] / f"spot_finding_backend_fov_{fov_id}.json",
                 {
                     "provider": self.spot_cfg.provider,

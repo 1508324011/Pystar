@@ -1,5 +1,4 @@
 # pystar/mining.py
-import json
 import time
 from typing import Any, Optional
 
@@ -30,27 +29,8 @@ from .matlab_engine_bootstrap import (
     summarize_matlab_boundary_traces,
 )
 from .matlab_extraction import MATLABExtractionBackend
+from .serialization import write_backend_metadata
 # visualization 模块保留引用，按需导入即可
-
-
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.integer):
-        return int(value)
-    if isinstance(value, np.floating):
-        return float(value)
-    return value
-
-
-def _write_backend_metadata(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=True), encoding="utf-8")
 
 class SignalMiner:
     """Extract per-round sequencing-channel intensities at detected spots.
@@ -437,7 +417,7 @@ class SignalMiner:
             persistence_ms = round((time.perf_counter() - persistence_started) * 1000.0, 3)
             if boundary_summary is not None:
                 boundary_summary["fov_canonical_persistence_ms"] = persistence_ms
-            _write_backend_metadata(
+            write_backend_metadata(
                 paths["qc"] / f"extraction_backend_fov_{fov_id}.json",
                 {
                     "provider": extraction_provider,
