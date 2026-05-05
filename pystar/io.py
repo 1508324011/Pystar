@@ -10,16 +10,17 @@ from typing import List, Optional, Dict, Any, cast
 from datetime import datetime, timezone
 from numpy.typing import NDArray
 from .infrastructure import ExperimentConfig
-from .runtime_artifacts import Flow3DSidecarDescriptor, TransformEntry, TransformManifest
-
-
-FLOW_3D_SIDECAR_STORAGE = "round_level_sidecar_npy"
-RELEASE_GATE_STATUSES = {"valid", "degraded", "invalid", "debug_only"}
-SCOPE_MODES = {"full_fov", "tile_local"}
-SCOPE_STATUSES = {"valid", "degraded", "invalid"}
-FIELD_SEMANTICS_REPRESENTATIONS = {"residual", "total", "unknown"}
-FIELD_SEMANTICS_COMPOSITIONS = {"sequential_global_then_local", "independent", "unknown"}
-FIELD_SEMANTICS_STATUSES = {"settled", "provisional", "unknown"}
+from .runtime_artifacts import (
+    FieldSemantics,
+    Flow3DSidecarDescriptor,
+    ScopeMetadata,
+    TransformEntry,
+    TransformManifest,
+    FLOW_3D_SIDECAR_STORAGE,
+    RELEASE_GATE_STATUSES,
+    SCOPE_MODES,
+    SCOPE_STATUSES,
+)
 
 REGISTRATION_PROFILE_FACTS: Dict[str, Dict[str, Any]] = {
     "demons_3d": {
@@ -334,39 +335,8 @@ def _coerce_field_semantics_payload(
     field_name: str,
     recorded_at: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if value is None:
-        return _default_field_semantics_payload(recorded_at=recorded_at)
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{field_name} must be a mapping")
-
-    representation = value.get("representation", "unknown")
-    composition = value.get("composition", "unknown")
-    status = value.get("status", "unknown")
-
-    if representation not in FIELD_SEMANTICS_REPRESENTATIONS:
-        raise ValueError(
-            f"{field_name}.representation must be one of {sorted(FIELD_SEMANTICS_REPRESENTATIONS)}, got {representation!r}"
-        )
-    if composition not in FIELD_SEMANTICS_COMPOSITIONS:
-        raise ValueError(
-            f"{field_name}.composition must be one of {sorted(FIELD_SEMANTICS_COMPOSITIONS)}, got {composition!r}"
-        )
-    if status not in FIELD_SEMANTICS_STATUSES:
-        raise ValueError(
-            f"{field_name}.status must be one of {sorted(FIELD_SEMANTICS_STATUSES)}, got {status!r}"
-        )
-
-    payload: Dict[str, Any] = {
-        "representation": representation,
-        "composition": composition,
-        "status": status,
-    }
-    recorded_value = value.get("recorded_at", recorded_at)
-    if recorded_value is not None:
-        if not isinstance(recorded_value, str) or not recorded_value.strip():
-            raise ValueError(f"{field_name}.recorded_at must be a non-empty ISO timestamp string when present")
-        payload["recorded_at"] = recorded_value
-    return payload
+    semantics = FieldSemantics.from_legacy(value, field_name=field_name, recorded_at=recorded_at)
+    return cast(Dict[str, Any], semantics.to_legacy())
 
 
 def _field_semantics_from_config(value: Any, *, field_name: str) -> Dict[str, Any]:
@@ -767,76 +737,16 @@ def _coerce_scope_int_tuple(value: Any, *, field_name: str, length: int) -> tupl
 
 
 def _normalize_round_scope_metadata(scope_payload: Any, *, field_name: str) -> Dict[str, Any]:
-    if not isinstance(scope_payload, Mapping):
-        raise ValueError(f"{field_name} must be a mapping")
-
-    coverage_mode = scope_payload.get("coverage_mode")
-    if coverage_mode not in SCOPE_MODES:
-        raise ValueError(f"{field_name}.coverage_mode must be one of {sorted(SCOPE_MODES)}, got {coverage_mode!r}")
-
-    region_origin_zyx = _coerce_scope_int_tuple(
-        scope_payload.get("region_origin_zyx"),
-        field_name=f"{field_name}.region_origin_zyx",
-        length=3,
-    )
-    region_shape_zyx = _coerce_scope_int_tuple(
-        scope_payload.get("region_shape_zyx"),
-        field_name=f"{field_name}.region_shape_zyx",
-        length=3,
-    )
-    full_volume_shape_zyx = _coerce_scope_int_tuple(
-        scope_payload.get("full_volume_shape_zyx"),
-        field_name=f"{field_name}.full_volume_shape_zyx",
-        length=3,
-    )
-
-    if any(value < 0 for value in region_origin_zyx):
-        raise ValueError(f"{field_name}.region_origin_zyx must contain non-negative integers")
-    if any(value <= 0 for value in region_shape_zyx):
-        raise ValueError(f"{field_name}.region_shape_zyx must contain positive integers")
-    if any(value <= 0 for value in full_volume_shape_zyx):
-        raise ValueError(f"{field_name}.full_volume_shape_zyx must contain positive integers")
-
-    for origin, size, full_size, axis_name in zip(
-        region_origin_zyx,
-        region_shape_zyx,
-        full_volume_shape_zyx,
-        ("z", "y", "x"),
-    ):
-        if origin + size > full_size:
-            raise ValueError(
-                f"{field_name} {axis_name}-axis region exceeds full volume bounds: "
-                f"origin={origin}, size={size}, full={full_size}"
-            )
-
+    scope = ScopeMetadata.from_legacy(scope_payload, field_name=field_name)
     normalized: Dict[str, Any] = {
-        "coverage_mode": str(coverage_mode),
-        "region_origin_zyx": region_origin_zyx,
-        "region_shape_zyx": region_shape_zyx,
-        "full_volume_shape_zyx": full_volume_shape_zyx,
+        "coverage_mode": scope.coverage_mode,
+        "region_origin_zyx": scope.region_origin_zyx,
+        "region_shape_zyx": scope.region_shape_zyx,
+        "full_volume_shape_zyx": scope.full_volume_shape_zyx,
     }
-
-    tile_grid_shape_yx = scope_payload.get("tile_grid_shape_yx")
-    tile_index = scope_payload.get("tile_index")
-    if coverage_mode == "tile_local":
-        tile_grid_shape = _coerce_scope_int_tuple(
-            tile_grid_shape_yx,
-            field_name=f"{field_name}.tile_grid_shape_yx",
-            length=2,
-        )
-        if any(value <= 0 for value in tile_grid_shape):
-            raise ValueError(f"{field_name}.tile_grid_shape_yx must contain positive integers")
-        if not isinstance(tile_index, (int, np.integer)) or int(tile_index) <= 0:
-            raise ValueError(f"{field_name}.tile_index must be a positive integer for tile_local coverage")
-        tile_index_int = int(tile_index)
-        if tile_index_int > int(tile_grid_shape[0] * tile_grid_shape[1]):
-            raise ValueError(
-                f"{field_name}.tile_index={tile_index_int} exceeds tile grid capacity "
-                f"{int(tile_grid_shape[0] * tile_grid_shape[1])}"
-            )
-        normalized["tile_grid_shape_yx"] = tile_grid_shape
-        normalized["tile_index"] = tile_index_int
-
+    if scope.coverage_mode == "tile_local":
+        normalized["tile_grid_shape_yx"] = scope.tile_grid_shape_yx
+        normalized["tile_index"] = scope.tile_index
     return normalized
 
 

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 
 FLOW_3D_SIDECAR_STORAGE = "round_level_sidecar_npy"
@@ -263,7 +264,7 @@ class ScopeMetadata:
             extra=extra,
         )
 
-    def contains(self, coords_zyx: np.ndarray) -> np.ndarray:
+    def contains(self, coords_zyx: npt.NDArray[Any]) -> npt.NDArray[np.bool_]:
         coords = np.asarray(coords_zyx)
         if coords.ndim != 2 or coords.shape[1] != 3:
             raise ValueError(f"coords_zyx must have shape (N, 3), got {coords.shape}")
