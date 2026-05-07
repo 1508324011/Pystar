@@ -7,6 +7,7 @@ from numpy.typing import NDArray
 from scipy import ndimage
 from skimage.feature import blob_dog
 from skimage.morphology import local_maxima
+from ._artifact_schemas import SpotTableSchema, empty_spot_table, validate_spot_table
 from .io import ImageLoader
 from .io import get_fov_output_structure, get_matlab_stage_contract
 from .matlab_engine_bootstrap import (
@@ -20,12 +21,7 @@ from .visualization import inspect_spots_interactive
 
 def _empty_spots_dataframe() -> pd.DataFrame:
     """Return an empty spot table with the canonical numeric columns."""
-    return pd.DataFrame({
-        'z': pd.Series(dtype=np.float32),
-        'y': pd.Series(dtype=np.float32),
-        'x': pd.Series(dtype=np.float32),
-        'intensity': pd.Series(dtype=np.float32),
-    })
+    return empty_spot_table()
 
 
 def _threshold_reference_value(vol_3d: NDArray[np.generic]) -> float:
@@ -214,6 +210,17 @@ class SpotFinder:
             
         # 4. 合并结果
         if not all_spots_dfs:
+            empty_df = empty_spot_table(extra_columns=("channel", "fov", "algo"))
+            empty_df["fov"] = pd.Series(dtype=np.int64)
+            empty_df["algo"] = pd.Series(dtype=object)
+            out_csv = paths["spots"] / f"spots_fov_{fov_id}.csv"
+            validated_empty_df = validate_spot_table(
+                empty_df,
+                fov_id=fov_id,
+                path=out_csv,
+                context="spot save",
+            )
+            validated_empty_df.to_csv(out_csv, index=False)
             if self.spot_cfg.provider == "matlab" and backend_records:
                 boundary_traces = [
                     trace
@@ -243,13 +250,19 @@ class SpotFinder:
                     },
                 )
             print(" [SpotFinding] No spots found in any channel!")
-            return pd.DataFrame()
+            return validated_empty_df
 
         df = pd.concat(all_spots_dfs, ignore_index=True)
 
         # 注入元数据
         df['fov'] = fov_id
         df['algo'] = final_algo
+        df = validate_spot_table(
+            df,
+            fov_id=fov_id,
+            path=paths["spots"] / f"spots_fov_{fov_id}.csv",
+            context="spot save",
+        )
 
         # 固化结果
         out_csv = paths["spots"] / f"spots_fov_{fov_id}.csv"
@@ -360,6 +373,21 @@ class SpotFinder:
             cols = [f'col_{i}' for i in range(blobs.shape[1])]
 
         df = pd.DataFrame({col: blobs[:, idx] for idx, col in enumerate(cols)})
+        schema = SpotTableSchema()
+        if all(column in df.columns for column in schema.required_columns):
+            return df
+
+        if not all(column in df.columns for column in ('z', 'y', 'x')):
+            raise ValueError(
+                "blob_dog output cannot be normalized to the canonical spot schema because it lacks z/y/x coordinates"
+            )
+
+        coords_zyx = np.rint(df[['z', 'y', 'x']].to_numpy(dtype=np.float32)).astype(np.int64)
+        z_max, y_max, x_max = vol_3d.shape
+        coords_zyx[:, 0] = np.clip(coords_zyx[:, 0], 0, z_max - 1)
+        coords_zyx[:, 1] = np.clip(coords_zyx[:, 1], 0, y_max - 1)
+        coords_zyx[:, 2] = np.clip(coords_zyx[:, 2], 0, x_max - 1)
+        df['intensity'] = vol_3d[coords_zyx[:, 0], coords_zyx[:, 1], coords_zyx[:, 2]].astype(np.float32)
         return df
 
     def _run_peak_local_max(self, vol_3d):

@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import tifffile
 
+from ._artifact_schemas import SpotTableSchema, validate_spot_table, wrap_table_read_error
 from .infrastructure import ExperimentConfig
 from .matlab_engine_bootstrap import (
     MATLABSessionCapsule,
@@ -140,8 +141,15 @@ def _load_matlab_engine_factory() -> Callable[[], Any]:
     return factory
 
 
-def _normalize_spot_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_spot_dataframe(
+    df: pd.DataFrame,
+    *,
+    fov_id: int,
+    path: Path | str | None,
+) -> pd.DataFrame:
     """Normalize MATLAB spot CSV columns to PyStar's `z, y, x, intensity` schema."""
+
+    expected = SpotTableSchema().expected_description()
 
     if all(column in df.columns for column in MATLAB_SPOTFINDING_REQUIRED_COLUMNS):
         normalized = df.loc[:, list(MATLAB_SPOTFINDING_REQUIRED_COLUMNS)].copy()
@@ -149,13 +157,18 @@ def _normalize_spot_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         normalized = df.loc[:, ["z", "y", "x", "intensity"]].copy()
     else:
         raise ValueError(
-            "MATLAB spot-finding output must contain either [z, y, x, intensity] or [x, y, z, intensity] columns"
+            f"FOV {fov_id} spot table schema error during matlab spot normalization at {path}: "
+            "missing required columns for MATLAB spot output; expected either [z, y, x, intensity] "
+            f"or [x, y, z, intensity]. Expected schema: {expected}"
         )
 
-    for column in MATLAB_SPOTFINDING_REQUIRED_COLUMNS:
-        normalized[column] = pd.to_numeric(normalized[column], errors="raise")
-
-    return normalized.astype({"z": np.float32, "y": np.float32, "x": np.float32, "intensity": np.float32})
+    validated = validate_spot_table(
+        normalized,
+        fov_id=fov_id,
+        path=path,
+        context="matlab spot normalization",
+    )
+    return validated.astype({"z": np.float32, "y": np.float32, "x": np.float32, "intensity": np.float32})
 
 
 def _write_staged_volume_tiff(volume_path: Path, volume: Any) -> None:
@@ -460,7 +473,23 @@ class MATLABSpotFindingBackend:
                 round_id=round_id,
                 channel_id=channel_id,
             )
-            spots_df = _normalize_spot_dataframe(pd.read_csv(output_path))
+            try:
+                raw_spots_df = pd.read_csv(output_path)
+            except Exception as exc:
+                raise wrap_table_read_error(
+                    exc,
+                    "MATLAB spot output",
+                    fov_id=fov_id,
+                    path=output_path,
+                    context="matlab spot normalization",
+                    expected=SpotTableSchema().expected_description(),
+                ) from exc
+
+            spots_df = _normalize_spot_dataframe(
+                raw_spots_df,
+                fov_id=fov_id,
+                path=output_path,
+            )
             record_matlab_boundary_phase(
                 boundary_trace,
                 phase_name="result_validation",
