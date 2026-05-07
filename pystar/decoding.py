@@ -1,4 +1,5 @@
 # pystar/decoding.py
+from json import loads
 from pathlib import Path
 from typing import Any, Callable, Dict, Tuple, cast
 
@@ -7,6 +8,21 @@ import numpy.typing as npt
 import pandas as pd
 from tqdm import tqdm
 
+from ._artifact_schemas import (
+    SpotTableSchema,
+    build_intensity_matrix_spec,
+    empty_decoded_table,
+    intensity_matrix_metadata_expected_description,
+    intensity_matrix_metadata_path,
+    validate_decoded_table,
+    validate_intensity_matrix,
+    validate_intensity_matrix_consumer_contract,
+    validate_intensity_matrix_metadata_payload,
+    validate_spot_table,
+    wrap_array_read_error,
+    wrap_payload_read_error,
+    wrap_table_read_error,
+)
 from .io import get_fov_output_structure
 from .infrastructure import ExperimentConfig
 
@@ -143,6 +159,99 @@ class Decoder:
         # 加载并编译码本
         self.gene_map, self.barcode_map = self._compile_codebook()
         self.reverse_lookups = self._build_reverse_lookups()
+
+    def _sequencing_channels(self) -> list[int]:
+        roles = self.cfg.dataset.channel_roles
+        return sorted([channel_id for channel_id, role in roles.items() if role == 'seq'])
+
+    def _decoded_artifact_extra_columns(self) -> tuple[str, ...]:
+        return ("channel", "fov", "algo", "pattern_valid", "in_codebook", "gating_mode")
+
+    def _write_decoded_artifact(
+        self,
+        df: pd.DataFrame,
+        *,
+        fov_id: int,
+        path: Path,
+        context: str,
+    ) -> pd.DataFrame:
+        validated = validate_decoded_table(
+            df,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+        )
+        validated.to_csv(path, index=False)
+        return validated
+
+    def _load_validated_intensity_matrix(
+        self,
+        *,
+        fov_id: int,
+        matrix_path: Path,
+        matrix_spec: Any,
+    ) -> NDArrayAny:
+        expected = matrix_spec.expected_description()
+        try:
+            raw_matrix = np.load(matrix_path, allow_pickle=False)
+        except Exception as exc:
+            raise wrap_array_read_error(
+                exc,
+                "intensity matrix",
+                fov_id=fov_id,
+                path=matrix_path,
+                context="decode load",
+                expected=expected,
+            ) from exc
+
+        metadata_path = intensity_matrix_metadata_path(matrix_path)
+        if metadata_path.exists():
+            metadata_expected = intensity_matrix_metadata_expected_description()
+            try:
+                metadata_payload = loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise wrap_payload_read_error(
+                    exc,
+                    "intensity matrix metadata sidecar",
+                    fov_id=fov_id,
+                    path=metadata_path,
+                    context="decode metadata load",
+                    expected=metadata_expected,
+                ) from exc
+            persisted_spec = validate_intensity_matrix_metadata_payload(
+                metadata_payload,
+                fov_id=fov_id,
+                path=metadata_path,
+                context="decode metadata load",
+            )
+            validate_intensity_matrix_consumer_contract(
+                persisted_spec,
+                matrix_spec,
+                path=metadata_path,
+                context="decode metadata load",
+                matrix_path=matrix_path,
+            )
+            print(
+                f" -> Validating intensity matrix {matrix_path.name} against metadata sidecar {metadata_path.name} "
+                f"(round_order={list(persisted_spec.rounds)}, channel_order={list(persisted_spec.channels)})"
+            )
+            return validate_intensity_matrix(
+                raw_matrix,
+                persisted_spec,
+                path=matrix_path,
+                context="decode load against metadata sidecar",
+            )
+
+        print(
+            f" -> Intensity metadata sidecar absent at {metadata_path}; using explicit legacy config-derived "
+            f"matrix validation for {matrix_path.name} without reordering, reshaping, or reinterpretation."
+        )
+        return validate_intensity_matrix(
+            raw_matrix,
+            matrix_spec,
+            path=matrix_path,
+            context="decode load (legacy config-derived validation; sidecar absent)",
+        )
         
     def _compile_codebook(self) -> tuple[dict[str, str], pd.DataFrame]:
         """
@@ -549,12 +658,61 @@ class Decoder:
             raise FileNotFoundError(f"Intensity matrix missing: {raw_path}")
             
         # Shape: (N_spots, N_rounds, N_channels)
-        raw_matrix = np.load(raw_path)
-        spots_df = pd.read_csv(spots_path)
+        spot_expected = SpotTableSchema().expected_description()
+        try:
+            raw_spots_df = pd.read_csv(spots_path)
+        except Exception as exc:
+            raise wrap_table_read_error(
+                exc,
+                "spot table",
+                fov_id=fov_id,
+                path=spots_path,
+                context="decode load",
+                expected=spot_expected,
+            ) from exc
+        spots_df = validate_spot_table(
+            raw_spots_df,
+            fov_id=fov_id,
+            path=spots_path,
+            context="decode load",
+        )
         n_spots = len(spots_df)
-        
-        if len(raw_matrix) != len(spots_df):
-            raise ValueError("Matrix and Spots count mismatch! Pipeline broken.")
+        rounds = sorted(list(self.cfg.dataset.round_structure.keys()))
+        channels = self._sequencing_channels()
+        matrix_spec = build_intensity_matrix_spec(
+            fov_id=fov_id,
+            n_spots=n_spots,
+            rounds=rounds,
+            channels=channels,
+        )
+        raw_matrix = self._load_validated_intensity_matrix(
+            fov_id=fov_id,
+            matrix_path=raw_path,
+            matrix_spec=matrix_spec,
+        )
+
+        if n_spots == 0:
+            decoded_empty = empty_decoded_table(extra_columns=self._decoded_artifact_extra_columns())
+            self._write_decoded_artifact(
+                decoded_empty,
+                fov_id=fov_id,
+                path=paths["decoded"] / f"decoded_fov_{fov_id}.csv",
+                context="decoded save",
+            )
+            self._write_decoded_artifact(
+                empty_decoded_table(extra_columns=self._decoded_artifact_extra_columns()),
+                fov_id=fov_id,
+                path=paths["decoded"] / f"decoded_fov_{fov_id}_goodreads.csv",
+                context="decoded goodreads save",
+            )
+            self._write_decoded_artifact(
+                decoded_empty,
+                fov_id=fov_id,
+                path=paths["decoded"] / f"decoded_fov_{fov_id}_pre_pattern_check.csv",
+                context="decoded pre-pattern save",
+            )
+            print(" [Decoder] No spots available after artifact load; wrote canonical empty decoded artifacts")
+            return decoded_empty
         
         # 因为 miner 已经过滤过了，raw_matrix 现在全是 seq channel
         # 我们不需要再切片，或者简单检查一下维度匹配
@@ -675,12 +833,31 @@ class Decoder:
             print("   Using pattern-first gate: keeping only pattern-valid reads")
 
         # 过滤掉未保留的spots
-        df_res_true = df_res[final_keep_mask].copy()
+        df_res_true = cast(pd.DataFrame, df_res[final_keep_mask].copy())
 
         if len(df_res_true) == 0:
             print(f" [ERROR] No spots left after gating mode '{gating_mode}'!")
             print(" [HINT] Check your anchor_base configuration and codebook compatibility in experiment_config.yaml")
-            return pd.DataFrame()
+            decoded_empty = empty_decoded_table(extra_columns=self._decoded_artifact_extra_columns())
+            self._write_decoded_artifact(
+                decoded_empty,
+                fov_id=fov_id,
+                path=paths["decoded"] / f"decoded_fov_{fov_id}.csv",
+                context="decoded save",
+            )
+            self._write_decoded_artifact(
+                empty_decoded_table(extra_columns=self._decoded_artifact_extra_columns()),
+                fov_id=fov_id,
+                path=paths["decoded"] / f"decoded_fov_{fov_id}_goodreads.csv",
+                context="decoded goodreads save",
+            )
+            self._write_decoded_artifact(
+                df_res,
+                fov_id=fov_id,
+                path=paths["decoded"] / f"decoded_fov_{fov_id}_pre_pattern_check.csv",
+                context="decoded pre-pattern save",
+            )
+            return decoded_empty
         
         # 计算每轮的平均质量分数（用于诊断）
         valid_finite_scores = valid_base_scores.copy()
@@ -714,23 +891,36 @@ class Decoder:
         
         # Top genes
         if n_mapped > 0:
-            top_genes = df_res_true[df_res_true['gene'] != 'background']['gene'].value_counts().head(10)
+            gene_only_df = cast(pd.DataFrame, df_res_true[df_res_true['gene'] != 'background'].copy())
+            top_genes = gene_only_df['gene'].value_counts().head(10)
             print(f"\n [Top 10 Detected Genes]")
             for gene, count in top_genes.items():
                 print(f"   {gene}: {count}")
         # 8. 保存
         out_path = paths["decoded"] / f"decoded_fov_{fov_id}.csv"
-        df_res_true.to_csv(out_path, index=False)
+        df_res_true = self._write_decoded_artifact(
+            df_res_true,
+            fov_id=fov_id,
+            path=out_path,
+            context="decoded save",
+        )
         print(f" [Decoder] Saved decoded list to {out_path.name}")
 
         goodreads_path = paths["decoded"] / f"decoded_fov_{fov_id}_goodreads.csv"
-        df_goodreads = df_res_true[df_res_true['gene'] != 'background'].copy()
-        df_goodreads.to_csv(goodreads_path, index=False)
+        df_goodreads = cast(pd.DataFrame, df_res_true[df_res_true['gene'] != 'background'].copy())
+        df_goodreads = self._write_decoded_artifact(
+            df_goodreads,
+            fov_id=fov_id,
+            path=goodreads_path,
+            context="decoded goodreads save",
+        )
         print(f" [Decoder] Saved decoded good reads to {goodreads_path.name} ({len(df_goodreads)} rows)")
         
-        df_res.to_csv(
-            paths["decoded"] / f"decoded_fov_{fov_id}_pre_pattern_check.csv", 
-            index=False
+        self._write_decoded_artifact(
+            df_res,
+            fov_id=fov_id,
+            path=paths["decoded"] / f"decoded_fov_{fov_id}_pre_pattern_check.csv",
+            context="decoded pre-pattern save",
         )
         
         return df_res_true

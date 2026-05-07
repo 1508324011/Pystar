@@ -1,5 +1,6 @@
 # pystar/mining.py
 import time
+from json import loads
 from typing import Any, Optional
 
 import numpy as np
@@ -7,6 +8,19 @@ import pandas as pd
 from tqdm import tqdm
 from importlib import import_module
 from pathlib import Path
+from ._artifact_schemas import (
+    SpotTableSchema,
+    build_intensity_matrix_spec,
+    build_intensity_matrix_metadata_payload,
+    intensity_matrix_metadata_expected_description,
+    intensity_matrix_metadata_path,
+    validate_intensity_matrix,
+    validate_intensity_matrix_consumer_contract,
+    validate_intensity_matrix_metadata_payload,
+    validate_spot_table,
+    wrap_payload_read_error,
+    wrap_table_read_error,
+)
 from .infrastructure import ExperimentConfig
 from .extraction_utils import (
     coords_within_transform_scope,
@@ -306,7 +320,25 @@ class SignalMiner:
         base_dir = Path(self.cfg.pipeline.output.directory)
         paths = get_fov_output_structure(base_dir, fov_id)
         # 1. Load Metadata & Transforms
-        spots_df = pd.read_csv(paths["spots"] / f"spots_fov_{fov_id}.csv")
+        spots_path = paths["spots"] / f"spots_fov_{fov_id}.csv"
+        spot_expected = SpotTableSchema().expected_description()
+        try:
+            raw_spots_df = pd.read_csv(spots_path)
+        except Exception as exc:
+            raise wrap_table_read_error(
+                exc,
+                "spot table",
+                fov_id=fov_id,
+                path=spots_path,
+                context="mining load",
+                expected=spot_expected,
+            ) from exc
+        spots_df = validate_spot_table(
+            raw_spots_df,
+            fov_id=fov_id,
+            path=spots_path,
+            context="mining load",
+        )
         transforms = self._load_transforms(fov_id)
         
         ref_coords = spots_df[['z', 'y', 'x']].values.astype(np.float32)
@@ -320,6 +352,12 @@ class SignalMiner:
         print(f" [Miner] Channels to extract: {channels}")
         
         rounds = sorted(list(self.cfg.dataset.round_structure.keys()))
+        matrix_spec = build_intensity_matrix_spec(
+            fov_id=fov_id,
+            n_spots=n_spots,
+            rounds=rounds,
+            channels=channels,
+        )
         
         # Pre-allocate
         intensity_matrix = np.zeros((n_spots, len(rounds), len(channels)), dtype=np.float32)
@@ -396,8 +434,61 @@ class SignalMiner:
 
         # 4. Save
         out_name = paths["extraction"] / f"intensity_matrix_fov_{fov_id}.npy"
+        metadata_path = intensity_matrix_metadata_path(out_name)
         persistence_started = time.perf_counter()
+        intensity_matrix = validate_intensity_matrix(
+            intensity_matrix,
+            matrix_spec,
+            path=out_name,
+            context="mining save",
+        )
+        metadata_payload = build_intensity_matrix_metadata_payload(matrix_spec)
+        persisted_spec = validate_intensity_matrix_metadata_payload(
+            metadata_payload,
+            fov_id=fov_id,
+            path=metadata_path,
+            context="mining metadata save",
+        )
+        validate_intensity_matrix_consumer_contract(
+            persisted_spec,
+            matrix_spec,
+            path=metadata_path,
+            context="mining metadata save",
+            matrix_path=out_name,
+        )
         np.save(out_name, intensity_matrix)
+        write_backend_metadata(metadata_path, metadata_payload)
+        metadata_expected = intensity_matrix_metadata_expected_description()
+        try:
+            persisted_metadata = loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise wrap_payload_read_error(
+                exc,
+                "intensity matrix metadata sidecar",
+                fov_id=fov_id,
+                path=metadata_path,
+                context="mining metadata save",
+                expected=metadata_expected,
+            ) from exc
+        persisted_spec = validate_intensity_matrix_metadata_payload(
+            persisted_metadata,
+            fov_id=fov_id,
+            path=metadata_path,
+            context="mining metadata save",
+        )
+        validate_intensity_matrix_consumer_contract(
+            persisted_spec,
+            matrix_spec,
+            path=metadata_path,
+            context="mining metadata save",
+            matrix_path=out_name,
+        )
+        _ = validate_intensity_matrix(
+            intensity_matrix,
+            persisted_spec,
+            path=out_name,
+            context="mining save against metadata sidecar",
+        )
         if extraction_provider == 'matlab' and backend_records:
             boundary_traces = [
                 trace

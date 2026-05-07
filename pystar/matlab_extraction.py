@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import tifffile
 
+from ._artifact_schemas import wrap_table_read_error
 from .infrastructure import ExperimentConfig
 from .matlab_engine_bootstrap import (
     MATLABSessionCapsule,
@@ -45,6 +46,10 @@ from .matlab_runtime import (
 
 MATLAB_EXTRACTION_RUNTIME_MANIFEST_NAME = "runtime_manifest.json"
 MATLAB_EXTRACTION_PACKAGE_NAME = "pystar_extraction"
+MATLAB_EXTRACTION_OUTPUT_EXPECTED_SCHEMA = (
+    "required columns ['spot_index', 'intensity']; 'spot_index' must be sequential 0..N-1 "
+    "and 'intensity' must be numeric with one row per staged spot"
+)
 
 
 def resolve_matlab_extraction_runtime_path(config: ExperimentConfig) -> Path:
@@ -468,20 +473,51 @@ class MATLABExtractionBackend:
                 expected_count=int(len(coords)),
                 expected_shape_zyx=(int(volume_for_matlab.shape[0]), int(volume_for_matlab.shape[1]), int(volume_for_matlab.shape[2])),
             )
-            output_df = pd.read_csv(output_path)
+            try:
+                output_df = pd.read_csv(output_path)
+            except Exception as exc:
+                raise wrap_table_read_error(
+                    exc,
+                    "MATLAB extraction output",
+                    fov_id=fov_id,
+                    path=output_path,
+                    context="matlab extraction output load",
+                    expected=MATLAB_EXTRACTION_OUTPUT_EXPECTED_SCHEMA,
+                ) from exc
             if "spot_index" not in output_df.columns or "intensity" not in output_df.columns:
-                raise ValueError("MATLAB extraction output must contain 'spot_index' and 'intensity' columns")
-            spot_index = np.asarray(pd.to_numeric(output_df["spot_index"], errors="raise"), dtype=np.int64)
+                raise ValueError(
+                    f"FOV {fov_id} MATLAB extraction output schema error during matlab extraction output load "
+                    f"at {output_path}: missing required columns 'spot_index' and/or 'intensity'. "
+                    f"Expected schema: {MATLAB_EXTRACTION_OUTPUT_EXPECTED_SCHEMA}"
+                )
+            try:
+                spot_index = np.asarray(pd.to_numeric(output_df["spot_index"], errors="raise"), dtype=np.int64)
+            except Exception as exc:
+                raise ValueError(
+                    f"FOV {fov_id} MATLAB extraction output schema error during matlab extraction output load "
+                    f"at {output_path}: column 'spot_index' contains non-numeric values. "
+                    f"Expected schema: {MATLAB_EXTRACTION_OUTPUT_EXPECTED_SCHEMA}"
+                ) from exc
             expected_index = np.arange(len(coords), dtype=np.int64)
             if not np.array_equal(spot_index, expected_index):
                 raise ValueError(
-                    "MATLAB extraction output spot_index ordering mismatch: expected sequential indices "
-                    f"0..{len(coords) - 1}"
+                    f"FOV {fov_id} MATLAB extraction output schema error during matlab extraction output load "
+                    f"at {output_path}: spot_index ordering mismatch; expected sequential indices "
+                    f"0..{len(coords) - 1}. Expected schema: {MATLAB_EXTRACTION_OUTPUT_EXPECTED_SCHEMA}"
                 )
-            intensities = np.asarray(pd.to_numeric(output_df["intensity"], errors="raise"), dtype=np.float32)
+            try:
+                intensities = np.asarray(pd.to_numeric(output_df["intensity"], errors="raise"), dtype=np.float32)
+            except Exception as exc:
+                raise ValueError(
+                    f"FOV {fov_id} MATLAB extraction output schema error during matlab extraction output load "
+                    f"at {output_path}: column 'intensity' contains non-numeric values. "
+                    f"Expected schema: {MATLAB_EXTRACTION_OUTPUT_EXPECTED_SCHEMA}"
+                ) from exc
             if len(intensities) != len(coords):
                 raise ValueError(
-                    f"MATLAB extraction output length mismatch: expected {len(coords)}, got {len(intensities)}"
+                    f"FOV {fov_id} MATLAB extraction output schema error during matlab extraction output load "
+                    f"at {output_path}: output length mismatch; expected {len(coords)}, got {len(intensities)}. "
+                    f"Expected schema: {MATLAB_EXTRACTION_OUTPUT_EXPECTED_SCHEMA}"
                 )
             record_matlab_boundary_phase(
                 boundary_trace,
