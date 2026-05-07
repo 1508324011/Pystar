@@ -1,3 +1,4 @@
+# pyright: reportDeprecated=false, reportExplicitAny=false, reportAny=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnusedCallResult=false, reportImplicitStringConcatenation=false, reportUnnecessaryCast=false
 """Private transform manifest and flow sidecar I/O helpers.
 
 This module owns filesystem persistence and hydration for transform manifests and
@@ -262,8 +263,20 @@ def save_transform_manifest(
 
     manifest_model = TransformManifest.from_legacy(transforms, fov_id=fov_id)
     transforms = cast(dict[Any, Any], manifest_model.to_legacy())
+    release_contract = transforms.get("_contract")
+    if release_contract is not None and not isinstance(release_contract, Mapping):
+        raise ValueError("Transform manifest _contract must be a mapping when present")
 
     if provenance is not None:
+        provenance_release_contract = provenance.get("release_contract")
+        if not isinstance(provenance_release_contract, Mapping):
+            raise ValueError("Transform manifest _provenance.release_contract must be a mapping")
+        if release_contract is not None and dict(release_contract) != dict(provenance_release_contract):
+            raise ValueError(
+                "Transform manifest persisted _contract must match _provenance.release_contract; "
+                "manifest metadata drifted at the I/O boundary"
+            )
+
         (
             backfill_requested_intent_diagnostic_defaults,
             backfill_field_semantics_contract,
@@ -413,6 +426,10 @@ def load_transform_manifest(
     transforms = cast(dict[Any, Any], manifest_model.to_legacy())
 
     provenance = transforms.get("_provenance")
+    release_contract = transforms.get("_contract")
+    if release_contract is not None and not isinstance(release_contract, Mapping):
+        raise ValueError("Transform manifest _contract must be a mapping when present")
+
     if provenance is not None:
         (
             backfill_requested_intent_diagnostic_defaults,
@@ -424,6 +441,25 @@ def load_transform_manifest(
         backfill_requested_intent_diagnostic_defaults(provenance)
         backfill_field_semantics_contract(provenance, transforms)
         validate_provenance_schema(provenance)
+
+        provenance_release_contract = provenance.get("release_contract")
+        if not isinstance(provenance_release_contract, Mapping):
+            raise ValueError("Transform manifest _provenance.release_contract must be a mapping")
+
+        if release_contract is None:
+            if load_provenance:
+                raise ValueError(
+                    "Transform manifest persisted _provenance but is missing matching _contract; "
+                    "load_transform_manifest(load_provenance=True) requires both metadata fields"
+                )
+        elif dict(release_contract) != dict(provenance_release_contract):
+            raise ValueError(
+                "Transform manifest _contract must match _provenance.release_contract; "
+                "manifest metadata drifted at the I/O boundary"
+            )
+
+        if release_contract is not None:
+            release_contract = cast(Mapping[Any, Any], release_contract)
     else:
         validate_round_scope_contract_alignment = None
 
@@ -455,8 +491,9 @@ def load_transform_manifest(
     if load_provenance and provenance is not None:
         cast(_ValidateRoundScopeAlignment, validate_round_scope_contract_alignment)(
             materialized,
-            provenance["release_contract"],
+            cast(Mapping[Any, Any], provenance["release_contract"]),
         )
+        materialized["_contract"] = copy.deepcopy(cast(Mapping[Any, Any], release_contract))
         materialized["_provenance"] = provenance
 
     return materialized
