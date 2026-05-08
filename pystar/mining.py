@@ -538,11 +538,19 @@ class SignalMiner:
         qc_dir = paths["qc"]
             
         # Trace Plots
+        n_spots = int(len(matrix))
+        if n_spots == 0:
+            print(" [QC] No spots available for extraction trace QC; skipping trace plot and writing empty debug CSV")
+            self._save_debug_csv(matrix, spots_df, rounds, channels, fov_id)
+            return
+
         total_intensity = matrix.sum(axis=(1, 2))
-        top_indices = np.argsort(total_intensity)[-5:] 
-        random_indices = np.random.choice(len(matrix), 5, replace=False)
-        selected_indices = np.concatenate([top_indices, random_indices])
-            
+        top_count = min(5, n_spots)
+        random_count = min(5, n_spots)
+        top_indices = np.argsort(total_intensity)[-top_count:]
+        random_indices = np.random.choice(n_spots, random_count, replace=False)
+        selected_indices = np.unique(np.concatenate([top_indices, random_indices])).astype(np.int64, copy=False)
+
         plot_spot_traces(
             matrix, selected_indices, 
             rounds, channels,
@@ -557,7 +565,7 @@ class SignalMiner:
         for r in rounds:
             for c in channels:
                 cols.append(f"R{r}_C{c}")
-        flat_mat = matrix[:n_debug].reshape(n_debug, -1)
+        flat_mat = matrix[:n_debug].reshape(n_debug, len(cols))
         df_debug = spots_df.iloc[:n_debug].copy()
         df_vals = pd.DataFrame(flat_mat, columns=pd.Index(cols), index=df_debug.index)
         final = pd.concat([df_debug, df_vals], axis=1)

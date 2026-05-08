@@ -270,9 +270,20 @@ def build_intensity_matrix_spec(
 ) -> IntensityMatrixSpec:
     """Construct an intensity-matrix spec from stage-owned ordering facts."""
 
+    coerced_n_spots = int(n_spots)
+    if coerced_n_spots < 0:
+        raise _schema_error(
+            "intensity matrix",
+            fov_id=int(fov_id),
+            path=None,
+            context="spec construction",
+            detail=f"field 'n_spots' must be non-negative, got {coerced_n_spots}",
+            expected="numeric rank-3 array with non-negative shape (N_spots, N_rounds, N_seq_channels)",
+        )
+
     return IntensityMatrixSpec(
         fov_id=int(fov_id),
-        n_spots=int(n_spots),
+        n_spots=coerced_n_spots,
         n_rounds=len(rounds),
         n_channels=len(channels),
         rounds=tuple(int(value) for value in rounds),
@@ -467,6 +478,15 @@ def validate_intensity_matrix_metadata_payload(
         context=context,
         expected=expected,
     )
+    if n_spots < 0:
+        raise _schema_error(
+            artifact_name,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+            detail=f"field 'n_spots' must be non-negative, got {n_spots}",
+            expected=expected,
+        )
     round_order = _coerce_int_sequence(
         payload,
         "round_order",
@@ -495,6 +515,16 @@ def validate_intensity_matrix_metadata_payload(
         expected=expected,
         expected_length=3,
     )
+    negative_dimensions = [value for value in matrix_shape if value < 0]
+    if negative_dimensions:
+        raise _schema_error(
+            artifact_name,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+            detail=f"field 'matrix_shape' contains negative dimensions {negative_dimensions}",
+            expected=expected,
+        )
 
     spec = build_intensity_matrix_spec(
         fov_id=persisted_fov_id,

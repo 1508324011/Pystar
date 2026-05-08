@@ -184,6 +184,36 @@ class Decoder:
         validated.to_csv(path, index=False)
         return validated
 
+    def _write_empty_decoded_family(
+        self,
+        *,
+        fov_id: int,
+        paths: dict[str, Path],
+        pre_pattern_df: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        """Write the three decoded CSV artifacts with canonical empty schemas."""
+
+        decoded_empty = empty_decoded_table(extra_columns=self._decoded_artifact_extra_columns())
+        written_empty = self._write_decoded_artifact(
+            decoded_empty,
+            fov_id=fov_id,
+            path=paths["decoded"] / f"decoded_fov_{fov_id}.csv",
+            context="decoded save",
+        )
+        self._write_decoded_artifact(
+            empty_decoded_table(extra_columns=self._decoded_artifact_extra_columns()),
+            fov_id=fov_id,
+            path=paths["decoded"] / f"decoded_fov_{fov_id}_goodreads.csv",
+            context="decoded goodreads save",
+        )
+        self._write_decoded_artifact(
+            decoded_empty if pre_pattern_df is None else pre_pattern_df,
+            fov_id=fov_id,
+            path=paths["decoded"] / f"decoded_fov_{fov_id}_pre_pattern_check.csv",
+            context="decoded pre-pattern save",
+        )
+        return written_empty
+
     def _load_validated_intensity_matrix(
         self,
         *,
@@ -268,19 +298,64 @@ class Decoder:
         codebook_cfg = self.cfg.codebook
         gene_list_path = Path(codebook_cfg.gene_list)
         topo = codebook_cfg.topology
+
+        def _empty_gene_list_error() -> ValueError:
+            return ValueError(
+                f"Codebook gene-map contract error: gene list is empty at {gene_list_path}. "
+                "Decoder requires at least one gene/sequence row that can compile to a barcode."
+            )
+
+        def _drop_optional_header_row(df: pd.DataFrame) -> pd.DataFrame:
+            if len(df) == 0:
+                return df
+            first_gene = str(df.iloc[0]["gene"]).strip().lower()
+            first_seq = str(df.iloc[0]["seq"]).strip().lower()
+            gene_header_names = {"gene", "gene_name", "genename", "name"}
+            sequence_header_names = {"seq", "sequence"}
+            if first_gene in gene_header_names and first_seq in sequence_header_names:
+                return cast(pd.DataFrame, df.iloc[1:].reset_index(drop=True))
+            return df
         
         if not gene_list_path.exists():
             raise FileNotFoundError(f"Gene list not found: {gene_list_path}")
-            
+
         # 1. 读取基因表 (假设没有 header，或者根据实际情况修改)
         # 通常 genes.csv 结构是: GeneName, Sequence
         try:
             df_genes = cast(pd.DataFrame, pd.read_csv(gene_list_path, header=None, names=['gene', 'seq']))
+        except pd.errors.EmptyDataError as exc:
+            raise _empty_gene_list_error() from exc
         except Exception:
             # 兼容带有 header 的情况
-            df_genes = cast(pd.DataFrame, pd.read_csv(gene_list_path))
+            try:
+                df_genes = cast(pd.DataFrame, pd.read_csv(gene_list_path))
+            except pd.errors.EmptyDataError as exc:
+                raise _empty_gene_list_error() from exc
             if 'gene' not in df_genes.columns: # fallback
                 df_genes.columns = ['gene', 'seq']
+
+        df_genes = _drop_optional_header_row(df_genes)
+
+        if len(df_genes) == 0:
+            raise _empty_gene_list_error()
+
+        missing_codebook_columns = [column for column in ('gene', 'seq') if column not in df_genes.columns]
+        if missing_codebook_columns:
+            raise ValueError(
+                f"Codebook gene-map contract error at {gene_list_path}: missing required columns "
+                f"{missing_codebook_columns}. Expected columns ['gene', 'seq'] or a two-column gene list."
+            )
+
+        invalid_gene_mask = df_genes['gene'].isna() | (df_genes['gene'].astype(str).str.strip() == "")
+        invalid_seq_mask = df_genes['seq'].isna() | (df_genes['seq'].astype(str).str.strip() == "")
+        if bool(invalid_gene_mask.any()) or bool(invalid_seq_mask.any()):
+            raise ValueError(
+                f"Codebook gene-map contract error at {gene_list_path}: gene and seq values must be non-empty "
+                "for every row before barcode compilation."
+            )
+
+        df_genes['gene'] = df_genes['gene'].astype(str)
+        df_genes['seq'] = df_genes['seq'].astype(str)
         
         # Topology Preprocessing (Global)
         # ---------------------------------------------------
@@ -293,8 +368,20 @@ class Decoder:
             
         # 3. Build Encoding Functions (闭包工厂)
         # 我们把 Config 里的 mapping 转换成 Python 可调用的函数
+        encoding_tables = codebook_cfg.encoding_tables
+        if not isinstance(encoding_tables, dict) or not encoding_tables:
+            raise ValueError(
+                "Codebook gene-map contract error: encoding_tables is empty. "
+                "Decoder requires at least one non-empty encoding table before barcode compilation."
+            )
+
         encoders = {}
-        for table_name, mapping in codebook_cfg.encoding_tables.items():
+        for table_name, mapping in encoding_tables.items():
+            if not isinstance(mapping, dict) or not mapping:
+                raise ValueError(
+                    f"Codebook gene-map contract error: encoding table {table_name!r} is empty or malformed. "
+                    "Decoder requires non-empty base-to-color mappings before barcode compilation."
+                )
             encoders[table_name] = self._create_encoder(mapping, codebook_cfg.channel_base_index)
 
         # 4. Parse Blueprint Structure
@@ -305,6 +392,12 @@ class Decoder:
         for seg_id in topo.physical_order:
             if seg_id not in segment_defs:
                 raise ValueError(f"Topology physical_order references undefined segment ID: {seg_id}")
+            encoding_table_name = segment_defs[seg_id].encoding_table
+            if encoding_table_name not in encoders:
+                raise ValueError(
+                    f"Codebook gene-map contract error: topology segment {seg_id!r} references missing "
+                    f"encoding table {encoding_table_name!r}. Available encoding tables: {sorted(encoders)}"
+                )
 
         # 5. The Assembler (核心循环)
         def assemble_barcode(seq: str) -> str:
@@ -362,8 +455,19 @@ class Decoder:
         if len(valid_df) < len(df_genes):
             print(f" [Warning] {len(df_genes) - len(valid_df)} genes failed barcode generation (Check sequence lengths).")
 
+        if len(valid_df) == 0:
+            raise ValueError(
+                f"Codebook gene-map contract error: gene list at {gene_list_path} compiled to zero valid barcodes. "
+                "Check topology csv_slice/physical_order and gene sequence lengths before decoding."
+            )
+
         # 生成查找表
         gene_map = dict(zip(valid_df['barcode'], valid_df['gene']))
+        if not gene_map:
+            raise ValueError(
+                f"Codebook gene-map contract error: compiled gene map is empty for {gene_list_path}. "
+                "Decoder requires at least one barcode-to-gene mapping."
+            )
         
         # Save Debug CSV (这是给你检查切片对不对的关键文件)
         # 我们把切分后的每一段也保存下来方便肉眼Debug，这需要稍微改一下上面的逻辑，但作为Debug
@@ -653,6 +757,13 @@ class Decoder:
         # 1. 加载数据
         raw_path = paths["extraction"] / f"intensity_matrix_fov_{fov_id}.npy"
         spots_path = paths["spots"] / f"spots_fov_{fov_id}.csv"
+        if hasattr(self, "gene_map"):
+            early_gene_map = getattr(self, "gene_map")
+            if not isinstance(early_gene_map, dict) or not early_gene_map:
+                raise ValueError(
+                    f"Codebook gene-map contract error: compiled gene map is empty before decoding FOV {fov_id}. "
+                    "Decoder requires at least one barcode-to-gene mapping and will not interpret reads against an empty map."
+                )
         
         if not raw_path.exists():
             raise FileNotFoundError(f"Intensity matrix missing: {raw_path}")
@@ -692,27 +803,17 @@ class Decoder:
         )
 
         if n_spots == 0:
-            decoded_empty = empty_decoded_table(extra_columns=self._decoded_artifact_extra_columns())
-            self._write_decoded_artifact(
-                decoded_empty,
-                fov_id=fov_id,
-                path=paths["decoded"] / f"decoded_fov_{fov_id}.csv",
-                context="decoded save",
-            )
-            self._write_decoded_artifact(
-                empty_decoded_table(extra_columns=self._decoded_artifact_extra_columns()),
-                fov_id=fov_id,
-                path=paths["decoded"] / f"decoded_fov_{fov_id}_goodreads.csv",
-                context="decoded goodreads save",
-            )
-            self._write_decoded_artifact(
-                decoded_empty,
-                fov_id=fov_id,
-                path=paths["decoded"] / f"decoded_fov_{fov_id}_pre_pattern_check.csv",
-                context="decoded pre-pattern save",
-            )
+            decoded_empty = self._write_empty_decoded_family(fov_id=fov_id, paths=paths)
             print(" [Decoder] No spots available after artifact load; wrote canonical empty decoded artifacts")
             return decoded_empty
+
+        gene_map_raw = getattr(self, "gene_map", None)
+        gene_map: dict[str, str] | None = gene_map_raw if isinstance(gene_map_raw, dict) else None
+        if not gene_map:
+            raise ValueError(
+                f"Codebook gene-map contract error: compiled gene map is empty before decoding FOV {fov_id}. "
+                "Decoder requires at least one barcode-to-gene mapping and will not interpret reads against an empty map."
+            )
         
         # 因为 miner 已经过滤过了，raw_matrix 现在全是 seq channel
         # 我们不需要再切片，或者简单检查一下维度匹配
@@ -769,6 +870,11 @@ class Decoder:
         print(f"   Final kept:         {final_pass.sum()} ({final_pass.sum()/n_spots:.2%})")
         print(f"   Removed by quality filter:  {n_spots - final_pass.sum()}")
 
+        if not bool(final_pass.any()):
+            decoded_empty = self._write_empty_decoded_family(fov_id=fov_id, paths=paths)
+            print(" [Decoder] No reads passed base-calling and quality filtering; wrote canonical empty decoded artifacts")
+            return decoded_empty
+
         # 5. Fast String Construction (Vectorized)
         print(" -> Constructing barcodes...")
         
@@ -784,7 +890,7 @@ class Decoder:
         # 这是一个 Numpy 到 Pandas 的技巧
         print(" -> Matching codebook...")
         
-        sample_code = next(iter(self.gene_map.keys()))
+        sample_code = next(iter(gene_map.keys()))
         if raw_matrix.shape[1] != len(sample_code):
             print(f" [Warning] Imaging Rounds ({raw_matrix.shape[1]}) != Codebook Length ({len(sample_code)})")
             
@@ -811,7 +917,7 @@ class Decoder:
         n_pattern_fail = (~pattern_valid).sum()
         pattern_fail_rate = n_pattern_fail / len(df_res) if len(df_res) > 0 else 0
 
-        in_codebook = df_res['barcode'].isin(self.gene_map)
+        in_codebook = df_res['barcode'].isin(gene_map)
         n_codebook = int(in_codebook.sum())
         codebook_rate = n_codebook / len(df_res) if len(df_res) > 0 else 0
 
@@ -819,7 +925,7 @@ class Decoder:
         print(f"   In-codebook after quality filter: {n_codebook} spots ({codebook_rate:.2%})")
 
         # Gene mapping
-        df_res['gene'] = df_res['barcode'].map(self.gene_map).fillna('background')
+        df_res['gene'] = df_res['barcode'].map(gene_map).fillna('background')
 
         df_res['pattern_valid'] = pattern_valid.values
         df_res['in_codebook'] = in_codebook.values
@@ -838,24 +944,10 @@ class Decoder:
         if len(df_res_true) == 0:
             print(f" [ERROR] No spots left after gating mode '{gating_mode}'!")
             print(" [HINT] Check your anchor_base configuration and codebook compatibility in experiment_config.yaml")
-            decoded_empty = empty_decoded_table(extra_columns=self._decoded_artifact_extra_columns())
-            self._write_decoded_artifact(
-                decoded_empty,
+            decoded_empty = self._write_empty_decoded_family(
                 fov_id=fov_id,
-                path=paths["decoded"] / f"decoded_fov_{fov_id}.csv",
-                context="decoded save",
-            )
-            self._write_decoded_artifact(
-                empty_decoded_table(extra_columns=self._decoded_artifact_extra_columns()),
-                fov_id=fov_id,
-                path=paths["decoded"] / f"decoded_fov_{fov_id}_goodreads.csv",
-                context="decoded goodreads save",
-            )
-            self._write_decoded_artifact(
-                df_res,
-                fov_id=fov_id,
-                path=paths["decoded"] / f"decoded_fov_{fov_id}_pre_pattern_check.csv",
-                context="decoded pre-pattern save",
+                paths=paths,
+                pre_pattern_df=df_res,
             )
             return decoded_empty
         
