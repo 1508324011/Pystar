@@ -23,6 +23,13 @@ from ._artifact_schemas import (
     wrap_payload_read_error,
     wrap_table_read_error,
 )
+from ._codebook_contracts import (
+    CompiledCodebook,
+    build_reverse_lookups,
+    build_single_reverse_lookup,
+    compile_codebook_contract,
+    create_encoder,
+)
 from .io import get_fov_output_structure
 from .infrastructure import ExperimentConfig
 
@@ -155,10 +162,14 @@ class Decoder:
         self.cfg = config
         self.output_dir = Path(self.cfg.pipeline.output.directory)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 加载并编译码本
-        self.gene_map, self.barcode_map = self._compile_codebook()
-        self.reverse_lookups = self._build_reverse_lookups()
+
+        # Load and validate the codebook once. Keep the legacy debug CSV at the
+        # configured output root; decode_fov also writes it into the concrete
+        # Position<fov>/output_pystar root used by runtime artifacts.
+        self.compiled_codebook = compile_codebook_contract(self.cfg.codebook, output_dir=self.output_dir)
+        self.gene_map = self.compiled_codebook.gene_map
+        self.barcode_map = self.compiled_codebook.dataframe
+        self.reverse_lookups = self.compiled_codebook.reverse_lookups
 
     def _sequencing_channels(self) -> list[int]:
         roles = self.cfg.dataset.channel_roles
@@ -284,320 +295,23 @@ class Decoder:
         )
         
     def _compile_codebook(self) -> tuple[dict[str, str], pd.DataFrame]:
-        """
-        Compile gene sequences into expected color barcodes.
+        """Compatibility wrapper returning the legacy tuple surface."""
 
-        This is the critical forward-simulation step. PyStar does not infer the
-        codebook by reversing the observed reads; it takes each gene sequence,
-        applies the configured topology transform, slices the sequence according
-        to `BlueprintSegment.csv_slice`, encodes each segment with its declared
-        color table, and concatenates segments in `physical_order`. Config
-        slices are 1-based inclusive and become Python's 0-based half-open
-        ranges inside this method.
-        """
-        codebook_cfg = self.cfg.codebook
-        gene_list_path = Path(codebook_cfg.gene_list)
-        topo = codebook_cfg.topology
-
-        def _empty_gene_list_error() -> ValueError:
-            return ValueError(
-                f"Codebook gene-map contract error: gene list is empty at {gene_list_path}. "
-                "Decoder requires at least one gene/sequence row that can compile to a barcode."
-            )
-
-        def _drop_optional_header_row(df: pd.DataFrame) -> pd.DataFrame:
-            if len(df) == 0:
-                return df
-            first_gene = str(df.iloc[0]["gene"]).strip().lower()
-            first_seq = str(df.iloc[0]["seq"]).strip().lower()
-            gene_header_names = {"gene", "gene_name", "genename", "name"}
-            sequence_header_names = {"seq", "sequence"}
-            if first_gene in gene_header_names and first_seq in sequence_header_names:
-                return cast(pd.DataFrame, df.iloc[1:].reset_index(drop=True))
-            return df
-        
-        if not gene_list_path.exists():
-            raise FileNotFoundError(f"Gene list not found: {gene_list_path}")
-
-        # 1. 读取基因表 (假设没有 header，或者根据实际情况修改)
-        # 通常 genes.csv 结构是: GeneName, Sequence
-        try:
-            df_genes = cast(pd.DataFrame, pd.read_csv(gene_list_path, header=None, names=['gene', 'seq']))
-        except pd.errors.EmptyDataError as exc:
-            raise _empty_gene_list_error() from exc
-        except Exception:
-            # 兼容带有 header 的情况
-            try:
-                df_genes = cast(pd.DataFrame, pd.read_csv(gene_list_path))
-            except pd.errors.EmptyDataError as exc:
-                raise _empty_gene_list_error() from exc
-            if 'gene' not in df_genes.columns: # fallback
-                df_genes.columns = ['gene', 'seq']
-
-        df_genes = _drop_optional_header_row(df_genes)
-
-        if len(df_genes) == 0:
-            raise _empty_gene_list_error()
-
-        missing_codebook_columns = [column for column in ('gene', 'seq') if column not in df_genes.columns]
-        if missing_codebook_columns:
-            raise ValueError(
-                f"Codebook gene-map contract error at {gene_list_path}: missing required columns "
-                f"{missing_codebook_columns}. Expected columns ['gene', 'seq'] or a two-column gene list."
-            )
-
-        invalid_gene_mask = df_genes['gene'].isna() | (df_genes['gene'].astype(str).str.strip() == "")
-        invalid_seq_mask = df_genes['seq'].isna() | (df_genes['seq'].astype(str).str.strip() == "")
-        if bool(invalid_gene_mask.any()) or bool(invalid_seq_mask.any()):
-            raise ValueError(
-                f"Codebook gene-map contract error at {gene_list_path}: gene and seq values must be non-empty "
-                "for every row before barcode compilation."
-            )
-
-        df_genes['gene'] = df_genes['gene'].astype(str)
-        df_genes['seq'] = df_genes['seq'].astype(str)
-        
-        # Topology Preprocessing (Global)
-        # ---------------------------------------------------
-        if topo.func == "reverse_string":
-            print(" [Decoder] Applying Topology: Reverse Sequence")
-            # STRING REVERSE in Python
-            df_genes['processed_seq'] = df_genes['seq'].apply(lambda s: s[::-1])
-        else:
-            df_genes['processed_seq'] = df_genes['seq']
-            
-        # 3. Build Encoding Functions (闭包工厂)
-        # 我们把 Config 里的 mapping 转换成 Python 可调用的函数
-        encoding_tables = codebook_cfg.encoding_tables
-        if not isinstance(encoding_tables, dict) or not encoding_tables:
-            raise ValueError(
-                "Codebook gene-map contract error: encoding_tables is empty. "
-                "Decoder requires at least one non-empty encoding table before barcode compilation."
-            )
-
-        encoders = {}
-        for table_name, mapping in encoding_tables.items():
-            if not isinstance(mapping, dict) or not mapping:
-                raise ValueError(
-                    f"Codebook gene-map contract error: encoding table {table_name!r} is empty or malformed. "
-                    "Decoder requires non-empty base-to-color mappings before barcode compilation."
-                )
-            encoders[table_name] = self._create_encoder(mapping, codebook_cfg.channel_base_index)
-
-        # 4. Parse Blueprint Structure
-        # 建立一个字典方便按 ID 查找 segment 定义
-        segment_defs = {seg.id: seg for seg in topo.structure}
-        
-        # 验证 physical_order 是否都定义了
-        for seg_id in topo.physical_order:
-            if seg_id not in segment_defs:
-                raise ValueError(f"Topology physical_order references undefined segment ID: {seg_id}")
-            encoding_table_name = segment_defs[seg_id].encoding_table
-            if encoding_table_name not in encoders:
-                raise ValueError(
-                    f"Codebook gene-map contract error: topology segment {seg_id!r} references missing "
-                    f"encoding table {encoding_table_name!r}. Available encoding tables: {sorted(encoders)}"
-                )
-
-        # 5. The Assembler (核心循环)
-        def assemble_barcode(seq: str) -> str:
-            full_barcode = ""
-            
-            # 严格按照物理成像顺序 (Physical Order) 拼接
-            # 因为 Miner 提取出来的矩阵是 [R1, R2 ... Rn] 排序的
-            # 如果 R1-5 属于 seqD，R6-10 属于 seqF，那我们就必须先算 seqD 再算 seqF
-            
-            # 注意：这里的 physical_order 实际上应该是指 "Decoder Order"
-            # 你的 config 里 physical_order: ['seqD', 'seqF', 'seqE']
-            # 对应 Rounds: [1..5], [6..10], [11]
-            # 只要这个顺序和 io.py 加载图像的顺序一致，就是对的。
-            
-            for seg_id in topo.physical_order:
-                seg_def = segment_defs[seg_id]
-                
-                # A. Slicing (Config is 1-based Inclusive -> Python 0-based Exclusive)
-                # Config: [1, 6] -> Python: [0 : 6] (Length 6)
-                # Config: [7, 12] -> Python: [6 : 12] (Length 6)
-                start_1b, end_1b = seg_def.csv_slice
-                py_start = max(0, start_1b - 1) # 防止用户输入 0 导致负索引
-                py_end = end_1b
-                
-                # 防御性截取
-                if py_end > len(seq):
-                    # 如果配置切片超出了序列长度，那是 Config 写错了或者 CSV 脏了
-                    return "ERROR_LEN"
-                
-                sub_seq = seq[py_start : py_end]
-                
-                # B. Encoding
-                encoder = encoders[seg_def.encoding_table]
-                encoded_chunk = encoder(sub_seq)
-                
-                # C. Check Expectations
-                # 编码后的长度应该等于该段对应的物理轮次数量
-                expected_rounds = len(seg_def.rounds)
-                if len(encoded_chunk) != expected_rounds:
-                    # 这通常发生在 N 碱基或者逻辑错误
-                    # 比如 seq="GC", rounds=1. encoder("GC")->"1". OK.
-                    # 比如 seq="GNNNNA", rounds=5. encoder-> ".....". OK.
-                    pass # 只要逻辑自洽就行，暂不报错
-                    
-                full_barcode += encoded_chunk
-            
-            return full_barcode
-
-        # Apply Assembly
-        df_genes['barcode'] = df_genes['processed_seq'].apply(assemble_barcode)
-        
-        # 6. Checks & Output
-        # 过滤掉生成失败的
-        valid_df = cast(pd.DataFrame, df_genes[df_genes['barcode'] != "ERROR_LEN"].copy())
-        if len(valid_df) < len(df_genes):
-            print(f" [Warning] {len(df_genes) - len(valid_df)} genes failed barcode generation (Check sequence lengths).")
-
-        if len(valid_df) == 0:
-            raise ValueError(
-                f"Codebook gene-map contract error: gene list at {gene_list_path} compiled to zero valid barcodes. "
-                "Check topology csv_slice/physical_order and gene sequence lengths before decoding."
-            )
-
-        # 生成查找表
-        gene_map = dict(zip(valid_df['barcode'], valid_df['gene']))
-        if not gene_map:
-            raise ValueError(
-                f"Codebook gene-map contract error: compiled gene map is empty for {gene_list_path}. "
-                "Decoder requires at least one barcode-to-gene mapping."
-            )
-        
-        # Save Debug CSV (这是给你检查切片对不对的关键文件)
-        # 我们把切分后的每一段也保存下来方便肉眼Debug，这需要稍微改一下上面的逻辑，但作为Debug
-        # 我们可以直接保存最终结果
-        debug_path = self.output_dir / "compiled_codebook_debug.csv"
-        valid_df.to_csv(debug_path, index=False)
-        print(f"   -> Compiled {len(valid_df)} barcodes. Debug info saved to {debug_path.name}")
-        
-        return gene_map, valid_df
+        compiled = compile_codebook_contract(self.cfg.codebook, output_dir=self.output_dir)
+        return compiled.gene_map, compiled.dataframe
 
     def _create_encoder(self, mapping: Dict[str, int], base_idx: int) -> Callable[[str], str]:
-        """
-        Build a sequence-to-color encoder for one configured table.
-
-        Two cases are supported by the same closure: a direct lookup when the
-        sequence length equals the table key length, and a sliding-window lookup
-        for standard two-base encodings. Color indices are normalized by
-        `base_idx` so the emitted barcode characters match Python argmax channel
-        indices (`0`, `1`, `2`, ...).
-        """
-        # 探测 Window Size
-        keys = list(mapping.keys())
-        if not keys:
-            raise ValueError("Empty encoding table")
-        window_size = len(keys[0]) # e.g. 2 for "AT"
-        
-        # 将 Config 里的 1,2,3 转换为 Python 的 0,1,2 (如果 base_index=1)
-        # 这样生成的 barcode 字符串由 '0', '1', '2' 组成，对应从图像 argmax 出来的 0,1,2
-        normalized_map = {k: str(v - base_idx) for k, v in mapping.items()}
-
-        def encode(seq: str) -> str:
-            res = []
-            N = len(seq)
-            
-            # 情况 1: 序列长度正好等于窗口大小 (例如 Omics "GC" -> 1)
-            # 这种情况下直接查表，不滑动
-            if N == window_size:
-                val = normalized_map.get(seq, ".")
-                return val
-            
-            # 情况 2: 滑动窗口 (Standard STARmap/RIBOmap)
-            # Seq: A G T C (Len 4)
-            # Win=2
-            # 0: AG
-            # 1: GT
-            # 2: TC
-            # Output Len = 4 - 2 + 1 = 3 colors.
-            # 这个逻辑是标准的。
-            
-            # 计算输出长度
-            if N < window_size:
-                return "." * (N) # 序列不够长，这就尴尬了，补坏点
-
-            steps = N - window_size + 1
-            for i in range(steps):
-                chunk = seq[i : i + window_size]
-                val = normalized_map.get(chunk, ".")
-                res.append(val)
-                
-            return "".join(res)
-            
-        return encode
+        return create_encoder(mapping, base_idx)
     
     def _build_reverse_lookups(self) -> Dict[str, Dict[Tuple[str, int], str]]:
-        """
-        构建所有encoding tables的反向查找表
-        
-        用于end bases验证：给定(前一个碱基, 颜色) -> 推断出后一个碱基
-        
-        例如：
-        "AT": 4 -> reverse_lookup[('A', 3)] = 'T'  (假设base_idx=1)
-        "TG": 3 -> reverse_lookup[('T', 2)] = 'G'
-        
-        Returns:
-        --------
-        Dict[table_name, Dict[(prev_base, color), next_base]]
-        """
-        reverse_lookups = {}
-        
-        for table_name, mapping in self.cfg.codebook.encoding_tables.items():
-            reverse_lookups[table_name] = self._build_single_reverse_lookup(
-                mapping, 
-                self.cfg.codebook.channel_base_index
-            )
-        
-        return reverse_lookups
+        return build_reverse_lookups(self.cfg.codebook.encoding_tables, self.cfg.codebook.channel_base_index)
     
     def _build_single_reverse_lookup(
         self, 
         encoding_table: Dict[str, int], 
         base_idx: int
     ) -> Dict[Tuple[str, int], str]:
-        """
-        构建单个encoding table的反向查找表
-        
-        Parameters:
-        -----------
-        encoding_table : Dict[str, int]
-            碱基对 -> 颜色的映射，如 {"AT": 4, "CA": 2, ...}
-        base_idx : int
-            Config中的base index（0或1），用于归一化颜色值
-            
-        Returns:
-        --------
-        reverse : Dict[(prev_base, color), next_base]
-            (前碱基, 归一化颜色) -> 后碱基
-        """
-        reverse = {}
-        
-        for base_pair, color in encoding_table.items():
-            if len(base_pair) != 2:
-                # 跳过非两碱基编码（如果有的话）
-                continue
-            
-            prev_base = base_pair[0]
-            next_base = base_pair[1]
-            normalized_color = color - base_idx  # 转换为0-based
-            
-            key = (prev_base, normalized_color)
-            
-            # 检测编码冲突
-            if key in reverse and reverse[key] != next_base:
-                raise ValueError(
-                    f"Ambiguous encoding in table: "
-                    f"{key} maps to both '{reverse[key]}' and '{next_base}'"
-                )
-            
-            reverse[key] = next_base
-        
-        return reverse
+        return build_single_reverse_lookup(encoding_table, base_idx)
     
     def _decode_color_sequence(
         self, 
@@ -753,6 +467,9 @@ class Decoder:
         
         base_dir = Path(self.cfg.pipeline.output.directory)
         paths = get_fov_output_structure(base_dir, fov_id)
+        compiled_codebook = getattr(self, "compiled_codebook", None)
+        if isinstance(compiled_codebook, CompiledCodebook):
+            _ = compiled_codebook.write_debug_csv(paths["root"])
         
         # 1. 加载数据
         raw_path = paths["extraction"] / f"intensity_matrix_fov_{fov_id}.npy"
