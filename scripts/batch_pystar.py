@@ -4,11 +4,13 @@ import argparse
 import logging
 import traceback
 from pathlib import Path
+from typing import cast
 
 # 确保能找到 pystar 包
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from pystar.infrastructure import load_config
+from pystar.infrastructure import ExperimentConfig, load_config
+from pystar._stage_contracts import get_stage_spec
 from pystar.io import get_fov_output_structure
 from pystar.preprocessing import DataSanitizer
 from pystar.registration import RegistrationEngine
@@ -16,7 +18,15 @@ from pystar.spot_finding import SpotFinder
 from pystar.mining import SignalMiner
 from pystar.decoding import Decoder
 
-def setup_logger(fov_id, output_dir_base):
+
+def log_stage_start(logger: logging.Logger, stage_id: str) -> None:
+    """Render the canonical stage label without changing runner control flow."""
+
+    stage = get_stage_spec(stage_id)
+    logger.info(f">>> Stage {stage.order_index}: {stage.display_label}...")
+
+
+def setup_logger(fov_id: int, output_dir_base: str | Path) -> logging.Logger:
     """
     让每个 Job 自己管理自己的日志文件，而不是全部堆在 Slurm 的 error log 里。
     """
@@ -40,14 +50,16 @@ def setup_logger(fov_id, output_dir_base):
 
 def main():
     parser = argparse.ArgumentParser(description="PyStar Worker Node")
-    parser.add_argument("--config", required=True, help="Path to experiment_config.yaml")
+    _ = parser.add_argument("--config", required=True, help="Path to experiment_config.yaml")
     # Slurm Array ID 是从 1 开始的，我们在内部把它转为 List Index
-    parser.add_argument("--task_id", required=True, type=int, help="Slurm Array Task ID (1-based)")
+    _ = parser.add_argument("--task_id", required=True, type=int, help="Slurm Array Task ID (1-based)")
     args = parser.parse_args()
+    config_path = cast(str, args.config)
+    task_id = int(cast(int, args.task_id))
 
     # 1. 加载配置
     try:
-        cfg = load_config(args.config)
+        cfg: ExperimentConfig = load_config(config_path)
     except Exception as e:
         print(f"FATAL: Config load failed: {e}")
         sys.exit(1)
@@ -55,22 +67,22 @@ def main():
     # 2. 映射 Task ID -> FOV ID
     # 你的 fov_list 可能是 "1-56" 也可能是 [1, 5, 9]
     # cfg.dataset.parsed_fovs 是最权威的列表
-    fov_list = cfg.dataset.parsed_fovs
+    fov_list: list[int] = cfg.dataset.parsed_fovs
     total_jobs = len(fov_list)
     
     # 边界检查 (Never trust user input)
-    if args.task_id < 1 or args.task_id > total_jobs:
-        print(f"FATAL: Task ID {args.task_id} is out of range [1, {total_jobs}]")
+    if task_id < 1 or task_id > total_jobs:
+        print(f"FATAL: Task ID {task_id} is out of range [1, {total_jobs}]")
         sys.exit(1)
 
     # 获取当前任务要处理的真实 FOV ID
-    current_fov = fov_list[args.task_id - 1] # 0-based index
+    current_fov = int(fov_list[task_id - 1]) # 0-based index
 
     # 3. 初始化日志
     logger = setup_logger(current_fov, cfg.pipeline.output.directory)
     logger.info(f"{'='*40}")
     logger.info(f" PyStar Worker Started")
-    logger.info(f" Task ID: {args.task_id} / {total_jobs}")
+    logger.info(f" Task ID: {task_id} / {total_jobs}")
     logger.info(f" Target FOV: {current_fov}")
     logger.info(f"{'='*40}")
 
@@ -79,14 +91,14 @@ def main():
     try:
         # === Stage 1: Preprocessing ===
         t0 = time.time()
-        logger.info(">>> Stage 1: Preprocessing (Sanitization)...")
+        log_stage_start(logger, "preprocessing")
         sanitizer = DataSanitizer(cfg)
-        sanitizer.sanitize_fov(current_fov)
+        _ = sanitizer.sanitize_fov(current_fov)
         logger.info(f"    Done in {time.time() - t0:.2f}s")
 
         # === Stage 2: Registration ===
         t0 = time.time()
-        logger.info(">>> Stage 2: Registration...")
+        log_stage_start(logger, "registration")
         # 实例化 IO 加载数据，利用 xarray 的惰性加载机制
         # 注意：这里可能需要稍微调整 registration API 以接受 fov_id 而不是 data array
         # 为了保持你现有逻辑，我们这里做个适配
@@ -97,7 +109,7 @@ def main():
         
         reg_engine = RegistrationEngine(cfg)
         # 跑配准
-        reg_engine.register_fov(data_xr, current_fov)
+        _ = reg_engine.register_fov(data_xr, current_fov)
         logger.info(f"    Done in {time.time() - t0:.2f}s")
         
         # 显式清理，防止 Dask 图过大
@@ -106,23 +118,23 @@ def main():
 
         # === Stage 3: Spot Finding ===
         t0 = time.time()
-        logger.info(">>> Stage 3: Spot Finding...")
+        log_stage_start(logger, "spot_finding")
         finder = SpotFinder(cfg)
-        finder.find_spots_in_fov(current_fov)
+        _ = finder.find_spots_in_fov(current_fov)
         logger.info(f"    Done in {time.time() - t0:.2f}s")
 
         # === Stage 4: Mining ===
         t0 = time.time()
-        logger.info(">>> Stage 4: Signal Extraction...")
+        log_stage_start(logger, "signal_extraction")
         miner = SignalMiner(cfg)
-        miner.mine_fov(current_fov)
+        _ = miner.mine_fov(current_fov)
         logger.info(f"    Done in {time.time() - t0:.2f}s")
 
         # === Stage 5: Decoding ===
         t0 = time.time()
-        logger.info(">>> Stage 5: Decoding...")
+        log_stage_start(logger, "decoding")
         decoder = Decoder(cfg)
-        decoder.decode_fov(current_fov)
+        _ = decoder.decode_fov(current_fov)
         logger.info(f"    Done in {time.time() - t0:.2f}s")
 
         total_time = time.time() - start_time_global
