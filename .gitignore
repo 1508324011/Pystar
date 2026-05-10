@@ -34,7 +34,9 @@ ipython_config.py
 # Environment
 .env
 .venv
-env/
+env/*
+!env/pixi.toml
+!env/pixi.lock
 venv/
 ENV/
 env.bak/
