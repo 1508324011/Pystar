@@ -59,6 +59,7 @@ class _LocalRegistrationContext:
     mask: BoolArray
     local_provider: str
     local_method: str
+    local_handler_name: Optional[str]
 
 
 @dataclass(slots=True)
@@ -68,6 +69,38 @@ class _LocalRegistrationOutcome:
     final_corr: float
     final_img_qc: FloatArray
     backend_metadata: Optional[Dict[str, Any]]
+
+
+@dataclass(frozen=True, slots=True)
+class _RoundRegistrationStrategy:
+    global_provider: str
+    local_provider: str
+    local_method: str
+    enable_local: bool
+    local_skip_if_global_corr_below: float
+    global_handler_name: str
+    local_handler_name: Optional[str]
+    local_default_mode: Optional[str]
+
+
+_GLOBAL_REGISTRATION_HANDLER_NAMES: Dict[str, str] = {
+    'native': '_run_global_registration_native',
+    'matlab': '_run_global_registration_matlab',
+}
+
+
+_LOCAL_REGISTRATION_HANDLER_NAMES: Dict[Tuple[str, str], str] = {
+    ('native', 'demons_3d'): '_run_local_native_demons_3d',
+    ('native', 'optical_flow'): '_run_local_native_optical_flow',
+    ('native', 'bspline'): '_run_local_native_bspline',
+    ('matlab', 'demons_3d'): '_run_local_matlab_demons_3d',
+}
+
+
+_LOCAL_PROVIDER_DEFAULT_MODES: Dict[str, str] = {
+    'native': 'native_local_registration',
+    'matlab': 'experimental_local_kernel_swap',
+}
 
 
 def _ensure_supported_matlab_local_method(local_method: str) -> None:
@@ -1195,10 +1228,124 @@ class RegistrationEngine:
             )
         return combined_vol
 
+    def _resolve_global_registration_handler_name(self, provider: str) -> str:
+        try:
+            return _GLOBAL_REGISTRATION_HANDLER_NAMES[provider]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported registration.global.provider: {provider!r}") from exc
+
+    def _resolve_local_registration_handler_name(self, *, local_provider: str, local_method: str) -> str:
+        try:
+            return _LOCAL_REGISTRATION_HANDLER_NAMES[(local_provider, local_method)]
+        except KeyError as exc:
+            if local_provider == 'native':
+                raise ValueError(
+                    f"Unsupported registration.local.method for provider 'native': {local_method!r}"
+                ) from exc
+            if local_provider == 'matlab':
+                _ensure_supported_matlab_local_method(local_method)
+            raise ValueError(f"Unsupported registration.local.provider: {local_provider!r}") from exc
+
+    def _build_round_registration_strategy(
+        self,
+        *,
+        global_provider: Optional[str] = None,
+        local_provider: Optional[str] = None,
+        local_method: Optional[str] = None,
+        enable_local: Optional[bool] = None,
+        local_skip_if_global_corr_below: Optional[float] = None,
+    ) -> _RoundRegistrationStrategy:
+        resolved_global_provider = cast(
+            str,
+            self.reg_cfg.global_provider if global_provider is None else global_provider,
+        )
+        resolved_local_provider = cast(
+            str,
+            self.reg_cfg.local_provider if local_provider is None else local_provider,
+        )
+        resolved_local_method = cast(
+            str,
+            self.reg_cfg.local_method if local_method is None else local_method,
+        )
+        resolved_enable_local = bool(self.reg_cfg.enable_local if enable_local is None else enable_local)
+        resolved_local_threshold = float(
+            self.reg_cfg.guards.skip_if_global_corr_below
+            if local_skip_if_global_corr_below is None
+            else local_skip_if_global_corr_below
+        )
+
+        global_handler_name = self._resolve_global_registration_handler_name(resolved_global_provider)
+        local_handler_name: Optional[str] = None
+        local_default_mode: Optional[str] = None
+        if resolved_enable_local:
+            try:
+                local_default_mode = _LOCAL_PROVIDER_DEFAULT_MODES[resolved_local_provider]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Unsupported registration.local.provider: {resolved_local_provider!r}"
+                ) from exc
+            local_handler_name = self._resolve_local_registration_handler_name(
+                local_provider=resolved_local_provider,
+                local_method=resolved_local_method,
+            )
+
+        return _RoundRegistrationStrategy(
+            global_provider=resolved_global_provider,
+            local_provider=resolved_local_provider,
+            local_method=resolved_local_method,
+            enable_local=resolved_enable_local,
+            local_skip_if_global_corr_below=resolved_local_threshold,
+            global_handler_name=global_handler_name,
+            local_handler_name=local_handler_name,
+            local_default_mode=local_default_mode,
+        )
+
+    def _run_global_registration_native(
+        self,
+        *,
+        ref_scope_3d: FloatArray,
+        mov_scope_3d: FloatArray,
+        **_: Any,
+    ) -> Tuple[FloatArray, float, Optional[Dict[str, Any]]]:
+        global_shift_3d, global_corr = compute_global_shift_3d(
+            ref_scope_3d,
+            mov_scope_3d,
+            downsample_factor=self.reg_cfg.downsample_factor,
+            max_shift=self.reg_cfg.global_max_shift,
+        )
+        print(f"     Global Shift (3D): {global_shift_3d}, Corr (Est): {global_corr:.4f}")
+        return global_shift_3d, global_corr, None
+
+    def _run_global_registration_matlab(
+        self,
+        *,
+        fov_id: int,
+        round_id: int,
+        ref_round: int,
+        ref_scope_3d: FloatArray,
+        mov_scope_3d: FloatArray,
+        scope_descriptor: Dict[str, Any],
+        **_: Any,
+    ) -> Tuple[FloatArray, float, Optional[Dict[str, Any]]]:
+        matlab_backend = self._get_matlab_backend()
+        result = matlab_backend.compute_global_shift(
+            ref_scope_3d,
+            mov_scope_3d,
+            fov_id=fov_id,
+            round_id=int(round_id),
+            reference_round=int(ref_round),
+            scope_descriptor=scope_descriptor,
+        )
+        global_shift_3d = np.asarray(result['global_shift_3d'], dtype=np.float32)
+        global_corr = float(result['global_corr'])
+        backend_metadata = cast(Optional[Dict[str, Any]], result.get('backend_metadata'))
+        print(f"     MATLAB Global Shift (3D): {global_shift_3d}, Corr (Kernel): {global_corr:.4f}")
+        return global_shift_3d, global_corr, backend_metadata
+
     def _run_global_registration(
         self,
         *,
-        provider: str,
+        handler_name: str,
         fov_id: int,
         round_id: int,
         ref_round: int,
@@ -1206,33 +1353,15 @@ class RegistrationEngine:
         mov_scope_3d: FloatArray,
         scope_descriptor: Dict[str, Any],
     ) -> Tuple[FloatArray, float, Optional[Dict[str, Any]]]:
-        backend_metadata: Optional[Dict[str, Any]] = None
-        if provider == 'native':
-            global_shift_3d, global_corr = compute_global_shift_3d(
-                ref_scope_3d,
-                mov_scope_3d,
-                downsample_factor=self.reg_cfg.downsample_factor,
-                max_shift=self.reg_cfg.global_max_shift,
-            )
-            print(f"     Global Shift (3D): {global_shift_3d}, Corr (Est): {global_corr:.4f}")
-        elif provider == 'matlab':
-            matlab_backend = self._get_matlab_backend()
-            result = matlab_backend.compute_global_shift(
-                ref_scope_3d,
-                mov_scope_3d,
-                fov_id=fov_id,
-                round_id=int(round_id),
-                reference_round=int(ref_round),
-                scope_descriptor=scope_descriptor,
-            )
-            global_shift_3d = np.asarray(result['global_shift_3d'], dtype=np.float32)
-            global_corr = float(result['global_corr'])
-            backend_metadata = cast(Optional[Dict[str, Any]], result.get('backend_metadata'))
-            print(f"     MATLAB Global Shift (3D): {global_shift_3d}, Corr (Kernel): {global_corr:.4f}")
-        else:
-            raise ValueError(f"Unsupported registration.global.provider: {provider!r}")
-
-        return global_shift_3d, global_corr, backend_metadata
+        handler = cast(Any, getattr(self, handler_name))
+        return handler(
+            fov_id=fov_id,
+            round_id=round_id,
+            ref_round=ref_round,
+            ref_scope_3d=ref_scope_3d,
+            mov_scope_3d=mov_scope_3d,
+            scope_descriptor=scope_descriptor,
+        )
 
     def _compute_post_global_registration_state(
         self,
@@ -1269,6 +1398,7 @@ class RegistrationEngine:
         backend_metadata: Optional[Dict[str, Any]],
         local_provider: str,
         local_method: str,
+        local_handler_name: Optional[str] = None,
     ) -> _LocalRegistrationContext:
         reject_if_worse = bool(self.reg_cfg.guards.reject_if_correlation_worse)
         overlap_mask = compute_overlap_roi(
@@ -1294,6 +1424,7 @@ class RegistrationEngine:
             mask=mask,
             local_provider=local_provider,
             local_method=local_method,
+            local_handler_name=local_handler_name,
         )
 
     def _build_round_transform(
@@ -1315,22 +1446,13 @@ class RegistrationEngine:
         }
 
     def _dispatch_local_registration(self, context: _LocalRegistrationContext) -> _LocalRegistrationOutcome:
-        dispatch = {
-            ('native', 'demons_3d'): self._run_local_native_demons_3d,
-            ('native', 'optical_flow'): self._run_local_native_optical_flow,
-            ('native', 'bspline'): self._run_local_native_bspline,
-            ('matlab', 'demons_3d'): self._run_local_matlab_demons_3d,
-        }
-        try:
-            handler = dispatch[(context.local_provider, context.local_method)]
-        except KeyError:
-            if context.local_provider == 'native':
-                raise ValueError(
-                    f"Unsupported registration.local.method for provider 'native': {context.local_method!r}"
-                )
-            if context.local_provider == 'matlab':
-                _ensure_supported_matlab_local_method(context.local_method)
-            raise ValueError(f"Unsupported registration.local.provider: {context.local_provider!r}")
+        resolved_handler_name = context.local_handler_name
+        if resolved_handler_name is None:
+            resolved_handler_name = self._resolve_local_registration_handler_name(
+                local_provider=context.local_provider,
+                local_method=context.local_method,
+            )
+        handler = cast(Any, getattr(self, resolved_handler_name))
         return handler(context)
 
     def _run_local_native_demons_3d(self, context: _LocalRegistrationContext) -> _LocalRegistrationOutcome:
@@ -1642,13 +1764,12 @@ class RegistrationEngine:
         ref_mip_clean: FloatArray,
         mov_scope_3d: FloatArray,
         scope_descriptor: Dict[str, Any],
+        strategy: Optional[_RoundRegistrationStrategy] = None,
     ) -> Tuple[Dict[str, Any], FloatArray, Optional[Dict[str, Any]]]:
-        global_provider = cast(str, self.reg_cfg.global_provider)
-        local_provider = cast(str, self.reg_cfg.local_provider)
-        local_threshold = self.reg_cfg.guards.skip_if_global_corr_below
+        resolved_strategy = strategy or self._build_round_registration_strategy()
 
         global_shift_3d, global_corr, backend_metadata = self._run_global_registration(
-            provider=global_provider,
+            handler_name=resolved_strategy.global_handler_name,
             fov_id=fov_id,
             round_id=round_id,
             ref_round=ref_round,
@@ -1667,7 +1788,7 @@ class RegistrationEngine:
         final_corr = float(corr_after_global)
         final_img_qc = mov_mip_shifted
 
-        if self.reg_cfg.enable_local:
+        if resolved_strategy.enable_local:
             context = self._build_local_registration_context(
                 fov_id=fov_id,
                 round_id=int(round_id),
@@ -1682,22 +1803,28 @@ class RegistrationEngine:
                 corr_after_global=float(corr_after_global),
                 scope_descriptor=scope_descriptor,
                 backend_metadata=backend_metadata,
-                local_provider=local_provider,
-                local_method=self.reg_cfg.local_method,
+                local_provider=resolved_strategy.local_provider,
+                local_method=resolved_strategy.local_method,
+                local_handler_name=resolved_strategy.local_handler_name,
             )
 
-            if corr_after_global < local_threshold:
+            if corr_after_global < resolved_strategy.local_skip_if_global_corr_below:
                 warnings.warn(f"Low correlation {corr_after_global:.3f}, skipping local.")
                 backend_metadata = _attach_local_flow_metadata(
                     backend_metadata,
-                    provider=local_provider,
-                    local_method=self.reg_cfg.local_method,
+                    provider=resolved_strategy.local_provider,
+                    local_method=resolved_strategy.local_method,
                     status='skipped_low_global_corr',
                     corr_after_global=float(corr_after_global),
                     reject_if_worse=context.reject_if_worse,
-                    default_mode='experimental_local_kernel_swap' if local_provider == 'matlab' else 'native_local_registration',
+                    default_mode=cast(str, resolved_strategy.local_default_mode),
                 )
             else:
+                local_handler_name = resolved_strategy.local_handler_name
+                if local_handler_name is None:
+                    raise ValueError(
+                        "Round registration strategy enabled local registration without a local handler name"
+                    )
                 local_result = self._dispatch_local_registration(context)
                 flow_2d = local_result.flow_2d
                 flow_3d = local_result.flow_3d
@@ -1724,172 +1851,19 @@ class RegistrationEngine:
         ref_mip_clean: FloatArray,
         mov_scope_3d: FloatArray,
     ) -> Tuple[Dict[str, Any], FloatArray, Optional[Dict[str, Any]]]:
-        """Legacy native-only round registration helper.
-
-        This path computes a native 3-D phase-correlation shift and optional
-        native local refinement, returning a transform dictionary, a 2-D MIP used
-        only for QC visualization, and optional diagnostic metadata. It is kept
-        for older call sites; the mixed-provider path is implemented in
-        ``_register_round``.
-        """
-        global_shift_3d, global_corr = compute_global_shift_3d(
-            ref_scope_3d,
-            mov_scope_3d,
-            downsample_factor=self.reg_cfg.downsample_factor,
-            max_shift=self.reg_cfg.global_max_shift,
-        )
-        print(f"     Global Shift (3D): {global_shift_3d}, Corr (Est): {global_corr:.4f}")
-
-        mov_mip_clean = mov_scope_3d.max(axis=0)
-        shift_2d = global_shift_3d[1:]
-        mov_mip_shifted = np.asarray(
-            scipy_shift(mov_mip_clean, shift_2d, order=1),
-            dtype=np.float32,
-        )
-        corr_after_global = simple_correlation(ref_mip_clean, mov_mip_shifted)
-        print(f"     After Global (Clean MIP): Corr = {corr_after_global:.4f}")
-
-        flow_2d = None
-        flow_3d = None
-        final_corr = corr_after_global
-        final_img_qc = mov_mip_shifted
-        backend_metadata: Optional[Dict[str, Any]] = None
-        reject_if_worse = bool(self.reg_cfg.guards.reject_if_correlation_worse)
-
-        if self.reg_cfg.enable_local:
-            overlap_mask = compute_overlap_roi(
-                (int(ref_mip_clean.shape[0]), int(ref_mip_clean.shape[1])),
-                shift_2d,
-            )
-            mask = create_quality_mask(ref_mip_clean, valid_roi_mask=overlap_mask)
-
-            if corr_after_global < 0.2:
-                warnings.warn(f"Low correlation {corr_after_global:.3f}, skipping local.")
-                backend_metadata = _attach_local_flow_metadata(
-                    backend_metadata,
-                    provider='native',
-                    local_method=self.reg_cfg.local_method,
-                    status='skipped_low_global_corr',
-                    corr_after_global=float(corr_after_global),
-                    reject_if_worse=reject_if_worse,
-                    default_mode='native_local_registration',
-                )
-
-            elif self.reg_cfg.local_method == "demons_3d":
-                mov_shifted_3d = apply_rigid_shift_3d(mov_scope_3d, global_shift_3d)
-                flow_3d = register_local_demons_3d(
-                    ref_scope_3d,
-                    mov_shifted_3d,
-                    self.cfg.pipeline.registration.demons_3d,
-                )
-
-                if flow_3d is None:
-                    backend_metadata = _attach_local_flow_metadata(
-                        backend_metadata,
-                        provider='native',
-                        local_method=self.reg_cfg.local_method,
-                        status='no_flow_returned',
-                        corr_after_global=float(corr_after_global),
-                        reject_if_worse=reject_if_worse,
-                        default_mode='native_local_registration',
-                    )
-                else:
-                    final_img_qc_clean = apply_warp_field_3d(mov_shifted_3d, flow_3d).max(axis=0)
-                    rec_corr = simple_correlation(ref_mip_clean, final_img_qc_clean)
-                    status = 'accepted'
-
-                    if rec_corr < corr_after_global:
-                        print(
-                            "  [Diagnostic] Correlation decreased, but keeping local 3D flow; "
-                            "final_corr remains diagnostic-only "
-                            f"({rec_corr:.4f} < {corr_after_global:.4f})"
-                        )
-                        status = 'accepted_correlation_decrease'
-                    else:
-                        print(
-                            "  [Diagnostic] After Local 3D: "
-                            f"Corr = {rec_corr:.4f} (Δ = {rec_corr - corr_after_global:+.4f})"
-                        )
-                    final_corr = rec_corr
-                    final_img_qc = final_img_qc_clean
-                    backend_metadata = _attach_local_flow_metadata(
-                        backend_metadata,
-                        provider='native',
-                        local_method=self.reg_cfg.local_method,
-                        status=status,
-                        corr_after_global=float(corr_after_global),
-                        corr_after_local=float(rec_corr),
-                        reject_if_worse=reject_if_worse,
-                        default_mode='native_local_registration',
-                    )
-            elif self.reg_cfg.local_method == "optical_flow":
-                flow_2d = compute_optical_flow_masked(
-                    ref_mip_clean,
-                    mov_mip_shifted,
-                    mask,
-                    self.cfg.pipeline.registration.optical_flow,
-                )
-            elif self.reg_cfg.local_method == "bspline":
-                flow_2d = register_local_bspline(
-                    ref_mip_clean,
-                    mov_mip_shifted,
-                    mask,
-                    self.cfg.pipeline.registration.bspline,
-                )
-
-            if self.reg_cfg.local_method in {"optical_flow", "bspline"} and flow_2d is None and corr_after_global >= 0.2:
-                backend_metadata = _attach_local_flow_metadata(
-                    backend_metadata,
-                    provider='native',
-                    local_method=self.reg_cfg.local_method,
-                    status='no_flow_returned',
-                    corr_after_global=float(corr_after_global),
-                    reject_if_worse=reject_if_worse,
-                    default_mode='native_local_registration',
-                )
-
-            if flow_2d is not None:
-                final_img_qc_clean = composite_transform_2d(mov_mip_clean, shift_2d, flow_2d)
-                rec_corr = simple_correlation(ref_mip_clean, final_img_qc_clean)
-                diff = rec_corr - corr_after_global
-                status = 'accepted'
-
-                if rec_corr < corr_after_global:
-                    print(
-                        "     [Diagnostic] Correlation decreased, but keeping local flow; "
-                        "final_corr remains diagnostic-only "
-                        f"({rec_corr:.4f} < {corr_after_global:.4f})"
-                    )
-                    status = 'accepted_correlation_decrease'
-                else:
-                    print(
-                        "     [Diagnostic] After Local:  "
-                        f"Corr = {rec_corr:.4f} (Δ = {diff:+.4f})"
-                    )
-                final_corr = rec_corr
-                final_img_qc = final_img_qc_clean
-                backend_metadata = _attach_local_flow_metadata(
-                    backend_metadata,
-                    provider='native',
-                    local_method=self.reg_cfg.local_method,
-                    status=status,
-                    corr_after_global=float(corr_after_global),
-                    corr_after_local=float(rec_corr),
-                    reject_if_worse=reject_if_worse,
-                    default_mode='native_local_registration',
-                )
-
-        return (
-            {
-                'global_shift_3d': global_shift_3d,
-                'global_corr': global_corr,
-                'flow_2d': flow_2d,
-                'flow_3d': flow_3d,
-                'final_corr': final_corr,
-                'is_reference_round': False,
-            },
-            final_img_qc,
-            backend_metadata,
+        """Legacy native wrapper that delegates to the canonical round authority."""
+        return self._register_round_orchestrated(
+            fov_id=-1,
+            round_id=-1,
+            ref_round=int(self.reg_cfg.reference_round),
+            ref_scope_3d=ref_scope_3d,
+            ref_mip_clean=ref_mip_clean,
+            mov_scope_3d=mov_scope_3d,
+            scope_descriptor=_build_scope_descriptor(ref_scope_3d, 'full_fov'),
+            strategy=self._build_round_registration_strategy(
+                global_provider='native',
+                local_provider='native',
+            ),
         )
 
     def _register_round_matlab_extracted(
@@ -1903,107 +1877,19 @@ class RegistrationEngine:
         mov_scope_3d: FloatArray,
         scope_descriptor: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], FloatArray, Optional[Dict[str, Any]]]:
-        """Legacy MATLAB-backed round registration helper.
-
-        The helper calls the MATLAB global-registration seam, optionally calls
-        the MATLAB local demons seam, and normalizes outputs into the same PyStar
-        transform schema used by native registration. It is retained for older
-        extracted-volume experiments; current provider mixing flows through
-        ``_register_round``.
-        """
-        matlab_backend = self._get_matlab_backend()
-        result = matlab_backend.compute_global_shift(
-            ref_scope_3d,
-            mov_scope_3d,
+        """Legacy MATLAB wrapper that delegates to the canonical round authority."""
+        return self._register_round_orchestrated(
             fov_id=fov_id,
-            round_id=int(round_id),
-            reference_round=int(ref_round),
+            round_id=round_id,
+            ref_round=ref_round,
+            ref_scope_3d=ref_scope_3d,
+            ref_mip_clean=ref_mip_clean,
+            mov_scope_3d=mov_scope_3d,
             scope_descriptor=scope_descriptor,
-        )
-        global_shift_3d = np.asarray(result['global_shift_3d'], dtype=np.float32)
-        global_corr = float(result['global_corr'])
-        print(f"     MATLAB Global Shift (3D): {global_shift_3d}, Corr (Kernel): {global_corr:.4f}")
-
-        mov_mip_clean = mov_scope_3d.max(axis=0)
-        shift_2d = global_shift_3d[1:]
-        mov_mip_shifted = np.asarray(
-            scipy_shift(mov_mip_clean, shift_2d, order=1),
-            dtype=np.float32,
-        )
-        corr_after_global = simple_correlation(ref_mip_clean, mov_mip_shifted)
-        print(f"     After MATLAB Global (Clean MIP): Corr = {corr_after_global:.4f}")
-
-        flow_3d = None
-        final_corr = corr_after_global
-        final_img_qc = mov_mip_shifted
-        backend_metadata = cast(Optional[Dict[str, Any]], result.get('backend_metadata'))
-
-        if self.reg_cfg.enable_local:
-            if self.reg_cfg.local_method != 'demons_3d':
-                _ensure_supported_matlab_local_method(self.reg_cfg.local_method)
-            elif corr_after_global < 0.2:
-                warnings.warn(f"Low correlation {corr_after_global:.3f}, skipping local.")
-                if backend_metadata is not None:
-                    backend_metadata['local_flow'] = {
-                        'status': 'skipped_low_global_corr',
-                        'requested_local_method': self.reg_cfg.local_method,
-                        'diagnostic_corr_after_global': float(corr_after_global),
-                    }
-            else:
-                mov_shifted_3d = apply_rigid_shift_3d(mov_scope_3d, global_shift_3d)
-                local_result = matlab_backend.compute_local_flow(
-                    ref_scope_3d,
-                    mov_shifted_3d,
-                    fov_id=fov_id,
-                    round_id=int(round_id),
-                    reference_round=int(ref_round),
-                    scope_descriptor=scope_descriptor,
-                )
-                flow_3d = np.asarray(local_result['flow_3d'], dtype=np.float32)
-                expected_shape = (3, *mov_shifted_3d.shape)
-                if flow_3d.shape != expected_shape:
-                    raise ValueError(
-                        "MATLAB local registration returned flow_3d with incompatible shape: "
-                        f"expected {expected_shape}, got {flow_3d.shape}"
-                    )
-
-                final_img_qc_clean = apply_warp_field_3d(mov_shifted_3d, flow_3d).max(axis=0)
-                rec_corr = simple_correlation(ref_mip_clean, final_img_qc_clean)
-                local_backend_metadata = cast(Dict[str, Any], local_result['backend_metadata'])
-                local_backend_metadata['diagnostic_corr_after_global'] = float(corr_after_global)
-                local_backend_metadata['diagnostic_corr_after_local'] = float(rec_corr)
-
-                if rec_corr < corr_after_global:
-                    print(
-                        "  [Diagnostic] MATLAB local correlation decreased; reverting local 3D heuristic "
-                        f"({rec_corr:.4f} < {corr_after_global:.4f})"
-                    )
-                    flow_3d = None
-                    local_backend_metadata['status'] = 'reverted_correlation_decrease'
-                else:
-                    print(
-                        "  [Diagnostic] After MATLAB Local 3D: "
-                        f"Corr = {rec_corr:.4f} (Δ = {rec_corr - corr_after_global:+.4f})"
-                    )
-                    final_corr = rec_corr
-                    final_img_qc = final_img_qc_clean
-                    local_backend_metadata['status'] = 'accepted'
-
-                if backend_metadata is not None:
-                    backend_metadata['mode'] = 'experimental_local_kernel_swap'
-                    backend_metadata['local_flow'] = local_backend_metadata
-
-        return (
-            {
-                'global_shift_3d': global_shift_3d,
-                'global_corr': global_corr,
-                'flow_2d': None,
-                'flow_3d': flow_3d,
-                'final_corr': final_corr,
-                'is_reference_round': False,
-            },
-            final_img_qc,
-            backend_metadata,
+            strategy=self._build_round_registration_strategy(
+                global_provider='matlab',
+                local_provider='matlab',
+            ),
         )
 
     def _register_round(
@@ -2026,6 +1912,7 @@ class RegistrationEngine:
         warping. ``final_img_qc`` is a MIP for registration QC plots, not the data
         consumed by extraction.
         """
+        strategy = self._build_round_registration_strategy()
         return self._register_round_orchestrated(
             fov_id=fov_id,
             round_id=round_id,
@@ -2034,6 +1921,7 @@ class RegistrationEngine:
             ref_mip_clean=ref_mip_clean,
             mov_scope_3d=mov_scope_3d,
             scope_descriptor=scope_descriptor,
+            strategy=strategy,
         )
 
     def register_fov(self, data: xr.DataArray, fov_id: int) -> Dict[int, Dict[str, Any]]:
