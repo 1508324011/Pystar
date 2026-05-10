@@ -11,13 +11,16 @@ from tqdm import tqdm
 from ._artifact_schemas import (
     SpotTableSchema,
     build_intensity_matrix_spec,
+    build_spot_row_lineage,
     empty_decoded_table,
     intensity_matrix_metadata_expected_description,
     intensity_matrix_metadata_path,
+    spot_row_lineage_from_intensity_metadata_payload,
     validate_decoded_table,
     validate_intensity_matrix,
     validate_intensity_matrix_consumer_contract,
     validate_intensity_matrix_metadata_payload,
+    validate_spot_row_lineage_consumer_contract,
     validate_spot_table,
     wrap_array_read_error,
     wrap_payload_read_error,
@@ -231,6 +234,8 @@ class Decoder:
         fov_id: int,
         matrix_path: Path,
         matrix_spec: Any,
+        spots_df: pd.DataFrame,
+        spots_path: Path,
     ) -> NDArrayAny:
         expected = matrix_spec.expected_description()
         try:
@@ -272,10 +277,39 @@ class Decoder:
                 context="decode metadata load",
                 matrix_path=matrix_path,
             )
-            print(
-                f" -> Validating intensity matrix {matrix_path.name} against metadata sidecar {metadata_path.name} "
-                f"(round_order={list(persisted_spec.rounds)}, channel_order={list(persisted_spec.channels)})"
+            persisted_lineage = spot_row_lineage_from_intensity_metadata_payload(
+                metadata_payload,
+                fov_id=fov_id,
+                path=metadata_path,
+                context="decode metadata load",
             )
+            if persisted_lineage is not None:
+                consumer_lineage = build_spot_row_lineage(
+                    spots_df,
+                    fov_id=fov_id,
+                    path=spots_path,
+                    context="decode row-lineage build",
+                )
+                validate_spot_row_lineage_consumer_contract(
+                    persisted_lineage,
+                    consumer_lineage,
+                    fov_id=fov_id,
+                    path=metadata_path,
+                    context="decode metadata load",
+                    spot_path=spots_path,
+                )
+                print(
+                    f" -> Validating intensity matrix {matrix_path.name} against metadata sidecar "
+                    f"{metadata_path.name} (round_order={list(persisted_spec.rounds)}, "
+                    f"channel_order={list(persisted_spec.channels)}, "
+                    f"spot_row_lineage={persisted_lineage.fingerprint})"
+                )
+            else:
+                print(
+                    f" -> Intensity metadata sidecar {metadata_path.name} lacks spot_row_lineage; using "
+                    f"explicit legacy compatibility validation for {matrix_path.name} without row-order tamper "
+                    f"detection."
+                )
             return validate_intensity_matrix(
                 raw_matrix,
                 persisted_spec,
@@ -517,6 +551,8 @@ class Decoder:
             fov_id=fov_id,
             matrix_path=raw_path,
             matrix_spec=matrix_spec,
+            spots_df=spots_df,
+            spots_path=spots_path,
         )
 
         if n_spots == 0:

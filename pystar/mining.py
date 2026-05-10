@@ -12,11 +12,14 @@ from ._artifact_schemas import (
     SpotTableSchema,
     build_intensity_matrix_spec,
     build_intensity_matrix_metadata_payload,
+    build_spot_row_lineage,
     intensity_matrix_metadata_expected_description,
     intensity_matrix_metadata_path,
+    spot_row_lineage_from_intensity_metadata_payload,
     validate_intensity_matrix,
     validate_intensity_matrix_consumer_contract,
     validate_intensity_matrix_metadata_payload,
+    validate_spot_row_lineage_consumer_contract,
     validate_spot_table,
     wrap_payload_read_error,
     wrap_table_read_error,
@@ -159,8 +162,9 @@ class SignalMiner:
                 continue
             if scope_metadata['coverage_mode'] != delivered_coverage:
                 raise ValueError(
-                    f"FOV {fov_id} round {round_id} scope metadata reports {scope_metadata['coverage_mode']!r}, "
-                    f"but release_contract delivered_coverage is {delivered_coverage!r}"
+                    f"FOV {fov_id} round {round_id} scope metadata reports "
+                    f"{scope_metadata['coverage_mode']!r}, but release_contract delivered_coverage is "
+                    f"{delivered_coverage!r}"
                 )
 
             normalized_scope = dict(scope_metadata)
@@ -307,6 +311,27 @@ class SignalMiner:
         )
         return result['intensities'], result.get('backend_metadata')
 
+    def _require_persisted_spot_row_lineage(
+        self,
+        metadata_payload: dict[str, Any],
+        *,
+        fov_id: int,
+        metadata_path: Path,
+        context: str,
+    ) -> Any:
+        persisted_lineage = spot_row_lineage_from_intensity_metadata_payload(
+            metadata_payload,
+            fov_id=fov_id,
+            path=metadata_path,
+            context=context,
+        )
+        if persisted_lineage is None:
+            raise ValueError(
+                f"FOV {fov_id} intensity metadata sidecar at {metadata_path} is missing spot_row_lineage during "
+                f"{context}; newly persisted mining artifacts must carry explicit row-lineage metadata"
+            )
+        return persisted_lineage
+
     def mine_fov(self, fov_id: int):
         """Run signal extraction for every configured round/channel in one FOV.
 
@@ -338,6 +363,12 @@ class SignalMiner:
             fov_id=fov_id,
             path=spots_path,
             context="mining load",
+        )
+        spot_row_lineage = build_spot_row_lineage(
+            spots_df,
+            fov_id=fov_id,
+            path=spots_path,
+            context="mining row-lineage build",
         )
         transforms = self._load_transforms(fov_id)
         
@@ -442,7 +473,7 @@ class SignalMiner:
             path=out_name,
             context="mining save",
         )
-        metadata_payload = build_intensity_matrix_metadata_payload(matrix_spec)
+        metadata_payload = build_intensity_matrix_metadata_payload(matrix_spec, spot_row_lineage=spot_row_lineage)
         persisted_spec = validate_intensity_matrix_metadata_payload(
             metadata_payload,
             fov_id=fov_id,
@@ -455,6 +486,20 @@ class SignalMiner:
             path=metadata_path,
             context="mining metadata save",
             matrix_path=out_name,
+        )
+        persisted_lineage = self._require_persisted_spot_row_lineage(
+            metadata_payload,
+            fov_id=fov_id,
+            metadata_path=metadata_path,
+            context="mining metadata save",
+        )
+        validate_spot_row_lineage_consumer_contract(
+            persisted_lineage,
+            spot_row_lineage,
+            fov_id=fov_id,
+            path=metadata_path,
+            context="mining metadata save",
+            spot_path=spots_path,
         )
         np.save(out_name, intensity_matrix)
         write_backend_metadata(metadata_path, metadata_payload)
@@ -482,6 +527,20 @@ class SignalMiner:
             path=metadata_path,
             context="mining metadata save",
             matrix_path=out_name,
+        )
+        reloaded_lineage = self._require_persisted_spot_row_lineage(
+            persisted_metadata,
+            fov_id=fov_id,
+            metadata_path=metadata_path,
+            context="mining metadata save",
+        )
+        validate_spot_row_lineage_consumer_contract(
+            reloaded_lineage,
+            spot_row_lineage,
+            fov_id=fov_id,
+            path=metadata_path,
+            context="mining metadata save",
+            spot_path=spots_path,
         )
         _ = validate_intensity_matrix(
             intensity_matrix,
