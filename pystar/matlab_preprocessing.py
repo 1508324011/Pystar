@@ -39,13 +39,11 @@ from .matlab_engine_bootstrap import (
 from .matlab_runtime import (
     collect_runtime_file_records as _collect_runtime_file_records_from_manifest,
     format_exception_message as _format_exception_message,
-    load_runtime_manifest_json,
-    require_manifest_string,
+    load_validated_runtime_manifest,
     resolve_repo_runtime_path,
     trusted_matlab_runtime_root,
     validate_configured_entrypoint_contract,
-    validate_runtime_manifest_file_buckets,
-    validate_runtime_manifest_file_entries,
+    validate_runtime_step_metadata,
 )
 
 
@@ -135,31 +133,12 @@ def resolve_matlab_runtime_path(config: ExperimentConfig) -> Path:
 def load_matlab_runtime_manifest(runtime_dir: Path) -> Dict[str, Any]:
     """Load and validate the preprocessing MATLAB runtime manifest."""
 
-    manifest = load_runtime_manifest_json(
+    manifest = load_validated_runtime_manifest(
         runtime_dir,
         manifest_label="MATLAB runtime manifest",
         missing_hint="Expected repo-local manifest for matlab_extracted preprocessing backend.",
+        package_name=MATLAB_PREPROCESSING_PACKAGE_NAME,
         manifest_name=MATLAB_RUNTIME_MANIFEST_NAME,
-    )
-    required_files, optional_files = validate_runtime_manifest_file_buckets(
-        manifest,
-        manifest_label="MATLAB runtime manifest",
-    )
-    _ = require_manifest_string(
-        manifest,
-        key="entrypoint",
-        manifest_label="MATLAB runtime manifest",
-    )
-    package_name = manifest.get("package_name")
-    if package_name != MATLAB_PREPROCESSING_PACKAGE_NAME:
-        raise ValueError(
-            "MATLAB runtime manifest package_name mismatch: "
-            f"expected {MATLAB_PREPROCESSING_PACKAGE_NAME!r}, got {package_name!r}"
-        )
-    validate_runtime_manifest_file_entries(
-        required_files=required_files,
-        optional_files=optional_files,
-        manifest_label="MATLAB runtime manifest",
     )
     return manifest
 
@@ -451,20 +430,11 @@ class MATLABPreprocessingBackend:
                 f"expected {plan['expected_z_slices']}, got {output_shape[2]}"
             )
 
-        steps = metadata.get("steps")
-        if not isinstance(steps, list) or not steps:
-            raise ValueError("MATLAB preprocessing entrypoint did not report executed preprocessing steps")
-        for index, step in enumerate(steps):
-            if not isinstance(step, Mapping):
-                raise ValueError(f"MATLAB preprocessing step #{index} must be a mapping")
-            name = step.get("name")
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"MATLAB preprocessing step #{index} is missing a non-empty name")
-            duration_ms = step.get("duration_ms")
-            if not isinstance(duration_ms, (int, float)) or duration_ms < 0:
-                raise ValueError(
-                    f"MATLAB preprocessing step '{name}' must report a non-negative duration_ms"
-                )
+        validate_runtime_step_metadata(
+            metadata.get("steps"),
+            missing_steps_message="MATLAB preprocessing entrypoint did not report executed preprocessing steps",
+            step_label="MATLAB preprocessing step",
+        )
 
         expected_dtype = np.dtype(str(plan["loader_output_dtype"]))
         clean_output_dir = clean_output_dir.resolve()
