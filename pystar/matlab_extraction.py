@@ -19,7 +19,6 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 import numpy as np
 import pandas as pd
-import tifffile
 
 from ._artifact_schemas import wrap_table_read_error
 from .infrastructure import ExperimentConfig
@@ -34,13 +33,14 @@ from .matlab_engine_bootstrap import (
 from .matlab_runtime import (
     collect_runtime_file_records as _collect_runtime_file_records_from_manifest,
     format_exception_message as _format_exception_message,
-    load_runtime_manifest_json,
-    require_manifest_string,
+    load_validated_runtime_manifest,
     resolve_repo_runtime_path,
+    resolve_staged_output_path,
     trusted_matlab_runtime_root,
+    validate_expected_3d_staged_volume_shape,
     validate_configured_entrypoint_contract,
-    validate_runtime_manifest_file_buckets,
-    validate_runtime_manifest_file_entries,
+    validate_runtime_step_metadata,
+    write_staged_3d_volume_tiff,
 )
 
 
@@ -65,31 +65,12 @@ def resolve_matlab_extraction_runtime_path(config: ExperimentConfig) -> Path:
 def load_matlab_extraction_runtime_manifest(runtime_dir: Path) -> Dict[str, Any]:
     """Load the MATLAB extraction runtime manifest and validate its schema."""
 
-    manifest = load_runtime_manifest_json(
+    manifest = load_validated_runtime_manifest(
         runtime_dir,
         manifest_label="MATLAB extraction runtime manifest",
         missing_hint="Expected repo-local manifest for MATLAB extraction provider.",
+        package_name=MATLAB_EXTRACTION_PACKAGE_NAME,
         manifest_name=MATLAB_EXTRACTION_RUNTIME_MANIFEST_NAME,
-    )
-    required_files, optional_files = validate_runtime_manifest_file_buckets(
-        manifest,
-        manifest_label="MATLAB extraction runtime manifest",
-    )
-    _ = require_manifest_string(
-        manifest,
-        key="entrypoint",
-        manifest_label="MATLAB extraction runtime manifest",
-    )
-    package_name = manifest.get("package_name")
-    if package_name != MATLAB_EXTRACTION_PACKAGE_NAME:
-        raise ValueError(
-            "MATLAB extraction runtime manifest package_name mismatch: "
-            f"expected {MATLAB_EXTRACTION_PACKAGE_NAME!r}, got {package_name!r}"
-        )
-    validate_runtime_manifest_file_entries(
-        required_files=required_files,
-        optional_files=optional_files,
-        manifest_label="MATLAB extraction runtime manifest",
     )
     return manifest
 
@@ -147,13 +128,7 @@ def _load_matlab_engine_factory() -> Callable[[], Any]:
 
 
 def _write_staged_volume_tiff(volume_path: Path, volume: Any) -> None:
-    staged_volume = np.asarray(volume)
-    if staged_volume.ndim != 3:
-        raise ValueError(f"MATLAB extraction expects a 3D staged volume, got ndim={staged_volume.ndim}")
-
-    with tifffile.TiffWriter(volume_path) as writer:
-        for plane in staged_volume:
-            writer.write(np.asarray(plane), photometric="minisblack", metadata=None)
+    write_staged_3d_volume_tiff(volume_path, volume, owner_label="MATLAB extraction")
 
 
 class MATLABExtractionBackend:
@@ -276,44 +251,25 @@ class MATLABExtractionBackend:
                 f"MATLAB extraction metadata n_spots mismatch: expected {expected_count}, got {metadata_count!r}"
             )
 
-        volume_shape = metadata.get("volume_shape_zyx")
-        if not isinstance(volume_shape, list) or [int(v) for v in volume_shape] != [int(v) for v in expected_shape_zyx]:
-            raise ValueError(
-                "MATLAB extraction metadata volume_shape_zyx mismatch: "
-                f"expected {list(expected_shape_zyx)}, got {volume_shape!r}"
-            )
+        validate_expected_3d_staged_volume_shape(
+            metadata.get("volume_shape_zyx"),
+            expected_shape_zyx=expected_shape_zyx,
+            mismatch_prefix="MATLAB extraction metadata volume_shape_zyx mismatch",
+        )
 
-        output_path_value = metadata.get("output_path")
-        if not isinstance(output_path_value, str) or not output_path_value.strip():
-            raise ValueError("MATLAB extraction metadata must declare a non-empty output_path")
-        output_path = Path(output_path_value)
-        if not output_path.is_absolute():
-            output_path = tmpdir_path / output_path
-        output_path = output_path.resolve()
-        if output_path.parent != tmpdir_path.resolve():
-            raise ValueError(
-                "MATLAB extraction output must stay inside the staged temporary directory: "
-                f"{output_path}"
-            )
-        if not output_path.exists():
-            raise FileNotFoundError(
-                f"MATLAB extraction reported output that does not exist: {output_path}"
-            )
+        output_path = resolve_staged_output_path(
+            metadata.get("output_path"),
+            tmpdir_path=tmpdir_path,
+            missing_output_path_message="MATLAB extraction metadata must declare a non-empty output_path",
+            outside_tmpdir_prefix="MATLAB extraction output must stay inside the staged temporary directory",
+            missing_output_prefix="MATLAB extraction reported output that does not exist",
+        )
 
-        steps = metadata.get("steps")
-        if not isinstance(steps, list) or not steps:
-            raise ValueError("MATLAB extraction metadata must declare a non-empty steps list")
-        for index, step in enumerate(steps):
-            if not isinstance(step, Mapping):
-                raise ValueError(f"MATLAB extraction step #{index} must be a mapping")
-            name = step.get("name")
-            duration_ms = step.get("duration_ms")
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"MATLAB extraction step #{index} is missing a non-empty name")
-            if not isinstance(duration_ms, (int, float)) or duration_ms < 0:
-                raise ValueError(
-                    f"MATLAB extraction step '{name}' must report a non-negative duration_ms"
-                )
+        validate_runtime_step_metadata(
+            metadata.get("steps"),
+            missing_steps_message="MATLAB extraction metadata must declare a non-empty steps list",
+            step_label="MATLAB extraction step",
+        )
 
         return output_path
 
