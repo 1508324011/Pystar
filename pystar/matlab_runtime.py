@@ -6,7 +6,10 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
+
+import numpy as np
+import tifffile
 
 
 MATLAB_RUNTIME_MANIFEST_NAME = "runtime_manifest.json"
@@ -174,6 +177,53 @@ def validate_runtime_manifest_file_entries(
                 )
 
 
+def load_validated_runtime_manifest(
+    runtime_dir: Path,
+    *,
+    manifest_label: str,
+    missing_hint: str,
+    package_name: str | None = None,
+    manifest_name: str = MATLAB_RUNTIME_MANIFEST_NAME,
+    required_string_fields: Sequence[str] = ("entrypoint",),
+    optional_string_fields: Sequence[str] = (),
+) -> dict[str, object]:
+    """Load and validate the shared MATLAB runtime manifest contract."""
+
+    manifest = load_runtime_manifest_json(
+        runtime_dir,
+        manifest_label=manifest_label,
+        missing_hint=missing_hint,
+        manifest_name=manifest_name,
+    )
+    required_files, optional_files = validate_runtime_manifest_file_buckets(
+        manifest,
+        manifest_label=manifest_label,
+    )
+    for key in required_string_fields:
+        _ = require_manifest_string(
+            manifest,
+            key=key,
+            manifest_label=manifest_label,
+        )
+    for key in optional_string_fields:
+        _ = require_manifest_string(
+            manifest,
+            key=key,
+            manifest_label=manifest_label,
+            allow_missing=True,
+        )
+    if package_name is not None and manifest.get("package_name") != package_name:
+        raise ValueError(
+            f"{manifest_label} package_name mismatch: expected {package_name!r}, got {manifest.get('package_name')!r}"
+        )
+    validate_runtime_manifest_file_entries(
+        required_files=required_files,
+        optional_files=optional_files,
+        manifest_label=manifest_label,
+    )
+    return manifest
+
+
 def declared_runtime_filenames(runtime_manifest: RuntimeManifest) -> set[str]:
     """Return all declared runtime filenames across manifest buckets."""
 
@@ -192,6 +242,22 @@ def declared_runtime_filenames(runtime_manifest: RuntimeManifest) -> set[str]:
     return filenames
 
 
+def validate_manifest_declares_entrypoint_file(
+    runtime_manifest: RuntimeManifest,
+    entrypoint_name: str,
+    *,
+    manifest_label: str,
+    expectation_label: str = "configured entrypoint file",
+) -> None:
+    """Require the manifest to declare the expected ``<entrypoint>.m`` file."""
+
+    expected_entrypoint_file = f"{entrypoint_name}.m"
+    if expected_entrypoint_file not in declared_runtime_filenames(runtime_manifest):
+        raise ValueError(
+            f"{manifest_label} must declare the {expectation_label}. Missing {expected_entrypoint_file!r} in runtime manifest"
+        )
+
+
 def validate_configured_entrypoint_contract(
     runtime_manifest: RuntimeManifest,
     configured_entrypoint: str,
@@ -207,11 +273,93 @@ def validate_configured_entrypoint_contract(
             f"{config_label} must match the repo-local {manifest_label}. Config entrypoint={configured_entrypoint!r}, manifest entrypoint={manifest_entrypoint!r}"
         )
 
-    expected_entrypoint_file = f"{configured_entrypoint}.m"
-    if expected_entrypoint_file not in declared_runtime_filenames(runtime_manifest):
+    validate_manifest_declares_entrypoint_file(
+        runtime_manifest,
+        configured_entrypoint,
+        manifest_label=manifest_label,
+    )
+
+
+def validate_runtime_step_metadata(
+    steps: object,
+    *,
+    missing_steps_message: str,
+    step_label: str,
+) -> None:
+    """Validate non-empty step metadata with non-negative ``duration_ms`` values."""
+
+    if not isinstance(steps, list) or not steps:
+        raise ValueError(missing_steps_message)
+    for index, raw_step in enumerate(cast(list[object], steps)):
+        if not isinstance(raw_step, Mapping):
+            raise ValueError(f"{step_label} #{index} must be a mapping")
+        step = cast(Mapping[str, object], raw_step)
+        name = step.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"{step_label} #{index} is missing a non-empty name")
+        duration_ms = step.get("duration_ms")
+        if not isinstance(duration_ms, (int, float)) or duration_ms < 0:
+            raise ValueError(f"{step_label} '{name}' must report a non-negative duration_ms")
+
+
+def resolve_staged_output_path(
+    output_path_value: object,
+    *,
+    tmpdir_path: Path,
+    missing_output_path_message: str,
+    outside_tmpdir_prefix: str,
+    missing_output_prefix: str,
+) -> Path:
+    """Resolve a MATLAB-produced temp output path and keep it inside ``tmpdir_path``."""
+
+    if not isinstance(output_path_value, str) or not output_path_value.strip():
+        raise ValueError(missing_output_path_message)
+    output_path = Path(output_path_value)
+    if not output_path.is_absolute():
+        output_path = tmpdir_path / output_path
+    output_path = output_path.resolve()
+    resolved_tmpdir = tmpdir_path.resolve()
+    if output_path.parent != resolved_tmpdir:
+        raise ValueError(f"{outside_tmpdir_prefix}: {output_path}")
+    if not output_path.exists():
+        raise FileNotFoundError(f"{missing_output_prefix}: {output_path}")
+    return output_path
+
+
+def validate_expected_3d_staged_volume_shape(
+    volume_shape_value: object,
+    *,
+    expected_shape_zyx: tuple[int, int, int],
+    mismatch_prefix: str,
+) -> None:
+    """Validate a ``volume_shape_zyx`` metadata field against staged 3-D input."""
+
+    if not isinstance(volume_shape_value, list):
         raise ValueError(
-            f"{manifest_label} must declare the configured entrypoint file. Missing {expected_entrypoint_file!r} in runtime manifest"
+            f"{mismatch_prefix}: expected {list(expected_shape_zyx)}, got {volume_shape_value!r}"
         )
+    try:
+        normalized_shape = [int(value) for value in cast(list[Any], volume_shape_value)]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{mismatch_prefix}: expected {list(expected_shape_zyx)}, got {volume_shape_value!r}"
+        ) from exc
+    if normalized_shape != [int(value) for value in expected_shape_zyx]:
+        raise ValueError(
+            f"{mismatch_prefix}: expected {list(expected_shape_zyx)}, got {volume_shape_value!r}"
+        )
+
+
+def write_staged_3d_volume_tiff(volume_path: Path, volume: object, *, owner_label: str) -> None:
+    """Write a staged 3-D TIFF stack with the shared MATLAB-provider contract."""
+
+    staged_volume = np.asarray(volume)
+    if staged_volume.ndim != 3:
+        raise ValueError(f"{owner_label} expects a 3D staged volume, got ndim={staged_volume.ndim}")
+
+    with tifffile.TiffWriter(volume_path) as writer:
+        for plane_index in range(int(staged_volume.shape[0])):
+            _ = writer.write(staged_volume[plane_index], photometric="minisblack", metadata=None)
 
 
 def collect_runtime_file_records(
