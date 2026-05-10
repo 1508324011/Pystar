@@ -9,6 +9,7 @@ while this module validates the dataframes/arrays that cross those boundaries.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -19,6 +20,11 @@ import pandas as pd
 
 INTENSITY_MATRIX_METADATA_SCHEMA_NAME = "pystar.private.intensity_matrix_metadata"
 INTENSITY_MATRIX_METADATA_SCHEMA_VERSION = 1
+SPOT_ROW_LINEAGE_SCHEMA_NAME = "pystar.private.spot_row_lineage"
+SPOT_ROW_LINEAGE_SCHEMA_VERSION = 1
+SPOT_ROW_LINEAGE_COLUMNS = ("z", "y", "x", "intensity", "channel", "fov", "algo")
+SPOT_ROW_LINEAGE_NUMERIC_COLUMNS = ("z", "y", "x", "intensity", "channel", "fov")
+SPOT_ROW_LINEAGE_OBJECT_COLUMNS = ("algo",)
 
 
 def _path_text(path: Path | str | None) -> str:
@@ -261,6 +267,262 @@ class IntensityMatrixSpec:
         )
 
 
+@dataclass(frozen=True)
+class SpotRowLineage:
+    """Explicit row-identity contract for spot-table order across stages."""
+
+    spot_count: int
+    fingerprint: str
+    columns: tuple[str, ...] = SPOT_ROW_LINEAGE_COLUMNS
+
+    def expected_description(self) -> str:
+        return spot_row_lineage_expected_description()
+
+
+def build_spot_row_lineage(
+    df: Any,
+    *,
+    fov_id: int,
+    path: Path | str | None,
+    context: str,
+) -> SpotRowLineage:
+    """Build a deterministic spot-row fingerprint from the validated spot table."""
+
+    normalized = validate_spot_table(
+        df,
+        fov_id=fov_id,
+        path=path,
+        context=context,
+    )
+    row_count = int(len(normalized))
+    digest = hashlib.sha256()
+    digest.update(f"{SPOT_ROW_LINEAGE_SCHEMA_NAME}:{SPOT_ROW_LINEAGE_SCHEMA_VERSION}".encode("utf-8"))
+    digest.update(np.asarray([row_count], dtype="<i8").tobytes())
+
+    for column in SPOT_ROW_LINEAGE_NUMERIC_COLUMNS:
+        digest.update(column.encode("utf-8"))
+        digest.update(b"\0")
+        if column in normalized.columns:
+            numeric_values = np.asarray(pd.to_numeric(normalized[column], errors="raise"), dtype="<f8")
+            mask = np.asarray(~np.isnan(numeric_values), dtype=np.uint8)
+            values = np.nan_to_num(numeric_values, nan=0.0, copy=True)
+        else:
+            mask = np.zeros(row_count, dtype=np.uint8)
+            values = np.zeros(row_count, dtype="<f8")
+        digest.update(mask.tobytes())
+        digest.update(values.tobytes())
+
+    for column in SPOT_ROW_LINEAGE_OBJECT_COLUMNS:
+        digest.update(column.encode("utf-8"))
+        digest.update(b"\0")
+        if column in normalized.columns:
+            series = normalized[column]
+        else:
+            series = pd.Series([None] * row_count, dtype=object)
+        mask = np.asarray(~series.isna(), dtype=np.uint8)
+        digest.update(mask.tobytes())
+        for raw_value in series:
+            if pd.isna(raw_value):
+                continue
+            encoded = str(raw_value).encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "little", signed=False))
+            digest.update(encoded)
+
+    return SpotRowLineage(
+        spot_count=row_count,
+        fingerprint=f"sha256:{digest.hexdigest()}",
+    )
+
+
+def build_spot_row_lineage_payload(lineage: SpotRowLineage) -> dict[str, Any]:
+    return {
+        "schema_name": SPOT_ROW_LINEAGE_SCHEMA_NAME,
+        "schema_version": SPOT_ROW_LINEAGE_SCHEMA_VERSION,
+        "spot_count": int(lineage.spot_count),
+        "columns": [str(column) for column in lineage.columns],
+        "fingerprint": lineage.fingerprint,
+    }
+
+
+def validate_spot_row_lineage_payload(
+    payload: Any,
+    *,
+    fov_id: int,
+    path: Path | str | None,
+    context: str,
+) -> SpotRowLineage:
+    artifact_name = "intensity matrix metadata sidecar"
+    expected = spot_row_lineage_expected_description()
+    if not isinstance(payload, dict):
+        raise _schema_error(
+            artifact_name,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+            detail="field 'spot_row_lineage' must be a JSON object",
+            expected=expected,
+        )
+
+    schema_name = payload.get("schema_name")
+    if schema_name != SPOT_ROW_LINEAGE_SCHEMA_NAME:
+        raise _schema_error(
+            artifact_name,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+            detail=(
+                f"field 'spot_row_lineage.schema_name' is {schema_name!r}; "
+                f"expected {SPOT_ROW_LINEAGE_SCHEMA_NAME!r}"
+            ),
+            expected=expected,
+        )
+
+    schema_version = _coerce_int_field(
+        payload,
+        "schema_version",
+        artifact_name=artifact_name,
+        fov_id=fov_id,
+        path=path,
+        context=context,
+        expected=expected,
+    )
+    if schema_version != SPOT_ROW_LINEAGE_SCHEMA_VERSION:
+        raise _schema_error(
+            artifact_name,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+            detail=(
+                f"field 'spot_row_lineage.schema_version' is {schema_version}; "
+                f"expected {SPOT_ROW_LINEAGE_SCHEMA_VERSION}"
+            ),
+            expected=expected,
+        )
+
+    spot_count = _coerce_int_field(
+        payload,
+        "spot_count",
+        artifact_name=artifact_name,
+        fov_id=fov_id,
+        path=path,
+        context=context,
+        expected=expected,
+    )
+    if spot_count < 0:
+        raise _schema_error(
+            artifact_name,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+            detail=f"field 'spot_row_lineage.spot_count' must be non-negative, got {spot_count}",
+            expected=expected,
+        )
+
+    columns = _coerce_string_sequence(
+        payload,
+        "columns",
+        artifact_name=artifact_name,
+        fov_id=fov_id,
+        path=path,
+        context=context,
+        expected=expected,
+        expected_length=len(SPOT_ROW_LINEAGE_COLUMNS),
+    )
+    if columns != SPOT_ROW_LINEAGE_COLUMNS:
+        raise _schema_error(
+            artifact_name,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+            detail=(
+                f"field 'spot_row_lineage.columns' is {list(columns)}; "
+                f"expected {list(SPOT_ROW_LINEAGE_COLUMNS)}"
+            ),
+            expected=expected,
+        )
+
+    fingerprint = payload.get("fingerprint")
+    if not isinstance(fingerprint, str) or not _is_canonical_sha256(fingerprint):
+        raise _schema_error(
+            artifact_name,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+            detail="field 'spot_row_lineage.fingerprint' must use canonical 'sha256:<hex>' form",
+            expected=expected,
+        )
+
+    return SpotRowLineage(spot_count=int(spot_count), fingerprint=fingerprint, columns=columns)
+
+
+def spot_row_lineage_from_intensity_metadata_payload(
+    payload: dict[str, Any],
+    *,
+    fov_id: int,
+    path: Path | str | None,
+    context: str,
+) -> SpotRowLineage | None:
+    raw_payload = payload.get("spot_row_lineage")
+    if raw_payload is None:
+        return None
+    return validate_spot_row_lineage_payload(
+        raw_payload,
+        fov_id=fov_id,
+        path=path,
+        context=context,
+    )
+
+
+def validate_spot_row_lineage_consumer_contract(
+    persisted_lineage: SpotRowLineage,
+    consumer_lineage: SpotRowLineage,
+    *,
+    fov_id: int,
+    path: Path | str | None,
+    context: str,
+    spot_path: Path | str | None,
+) -> None:
+    artifact_name = "intensity matrix metadata sidecar"
+    expected = consumer_lineage.expected_description()
+    if persisted_lineage.spot_count != consumer_lineage.spot_count:
+        raise _schema_error(
+            artifact_name,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+            detail=(
+                f"spot_row_lineage.spot_count={persisted_lineage.spot_count} but loaded spot table at "
+                f"{_path_text(spot_path)} has {consumer_lineage.spot_count} rows"
+            ),
+            expected=expected,
+        )
+    if persisted_lineage.columns != consumer_lineage.columns:
+        raise _schema_error(
+            artifact_name,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+            detail=(
+                f"spot_row_lineage.columns={list(persisted_lineage.columns)} but loaded spot table at "
+                f"{_path_text(spot_path)} canonicalizes to {list(consumer_lineage.columns)}"
+            ),
+            expected=expected,
+        )
+    if persisted_lineage.fingerprint != consumer_lineage.fingerprint:
+        raise _schema_error(
+            artifact_name,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+            detail=(
+                f"spot_row_lineage fingerprint mismatch for loaded spot table at {_path_text(spot_path)}; "
+                f"metadata fingerprint {persisted_lineage.fingerprint!r} does not match loaded spot fingerprint "
+                f"{consumer_lineage.fingerprint!r}. Spot row order/content changed after mining"
+            ),
+            expected=expected,
+        )
+
+
 def build_intensity_matrix_spec(
     *,
     fov_id: int,
@@ -304,7 +566,8 @@ def intensity_matrix_metadata_expected_description() -> str:
         f"schema_name={INTENSITY_MATRIX_METADATA_SCHEMA_NAME!r}, "
         f"schema_version={INTENSITY_MATRIX_METADATA_SCHEMA_VERSION}, "
         "integer fields 'fov_id'/'n_spots', integer lists 'round_order'/'channel_order', "
-        "and integer list 'matrix_shape' == [N_spots, N_rounds, N_seq_channels]"
+        "integer list 'matrix_shape' == [N_spots, N_rounds, N_seq_channels], "
+        "and optional object field 'spot_row_lineage' carrying the explicit spot-row fingerprint contract"
     )
 
 
@@ -376,10 +639,77 @@ def _coerce_int_sequence(
     return tuple(coerced)
 
 
-def build_intensity_matrix_metadata_payload(spec: IntensityMatrixSpec) -> dict[str, Any]:
+def _coerce_string_sequence(
+    payload: dict[str, Any],
+    field_name: str,
+    *,
+    artifact_name: str,
+    fov_id: int,
+    path: Path | str | None,
+    context: str,
+    expected: str,
+    expected_length: int | None = None,
+) -> tuple[str, ...]:
+    raw_values = payload.get(field_name)
+    if not isinstance(raw_values, list):
+        raise _schema_error(
+            artifact_name,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+            detail=f"field {field_name!r} must be a JSON list of strings",
+            expected=expected,
+        )
+    coerced: list[str] = []
+    for index, value in enumerate(raw_values):
+        if not isinstance(value, str) or not value:
+            raise _schema_error(
+                artifact_name,
+                fov_id=fov_id,
+                path=path,
+                context=context,
+                detail=f"field {field_name!r} contains a non-string value at index {index}",
+                expected=expected,
+            )
+        coerced.append(value)
+    if expected_length is not None and len(coerced) != expected_length:
+        raise _schema_error(
+            artifact_name,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+            detail=f"field {field_name!r} has length {len(coerced)} but expected {expected_length}",
+            expected=expected,
+        )
+    return tuple(coerced)
+
+
+def _is_canonical_sha256(value: str) -> bool:
+    if not value.startswith("sha256:"):
+        return False
+    digest = value[7:]
+    return len(digest) == 64 and all(char in "0123456789abcdef" for char in digest)
+
+
+def spot_row_lineage_expected_description() -> str:
+    return (
+        "JSON object with "
+        f"schema_name={SPOT_ROW_LINEAGE_SCHEMA_NAME!r}, "
+        f"schema_version={SPOT_ROW_LINEAGE_SCHEMA_VERSION}, "
+        "integer field 'spot_count', string list 'columns', and string field "
+        "'fingerprint' in canonical 'sha256:<hex>' form over validated spot-row order "
+        f"for columns {list(SPOT_ROW_LINEAGE_COLUMNS)}"
+    )
+
+
+def build_intensity_matrix_metadata_payload(
+    spec: IntensityMatrixSpec,
+    *,
+    spot_row_lineage: SpotRowLineage | None = None,
+) -> dict[str, Any]:
     """Serialize the minimal persisted ordering facts for an intensity matrix."""
 
-    return {
+    payload: dict[str, Any] = {
         "schema_name": INTENSITY_MATRIX_METADATA_SCHEMA_NAME,
         "schema_version": INTENSITY_MATRIX_METADATA_SCHEMA_VERSION,
         "fov_id": int(spec.fov_id),
@@ -388,6 +718,9 @@ def build_intensity_matrix_metadata_payload(spec: IntensityMatrixSpec) -> dict[s
         "channel_order": [int(value) for value in spec.channels],
         "matrix_shape": [int(value) for value in spec.expected_shape],
     }
+    if spot_row_lineage is not None:
+        payload["spot_row_lineage"] = build_spot_row_lineage_payload(spot_row_lineage)
+    return payload
 
 
 def validate_intensity_matrix_metadata_payload(
@@ -543,6 +876,14 @@ def validate_intensity_matrix_metadata_payload(
                 f"n_spots/round_order/channel_order is {list(spec.expected_shape)}"
             ),
             expected=expected,
+        )
+
+    if "spot_row_lineage" in payload:
+        _ = validate_spot_row_lineage_payload(
+            payload["spot_row_lineage"],
+            fov_id=fov_id,
+            path=path,
+            context=context,
         )
 
     return spec
