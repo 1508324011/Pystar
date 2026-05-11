@@ -1,0 +1,440 @@
+# ==========================================
+# MATLAB-provider parity example
+# ==========================================
+# 这个配置文件和 experiment_config.yaml 使用同一套详细注释风格，便于逐项对照。
+#
+# 参照来源：2026-04-28 Experiment 1 MATLAB-provider as-run 配置。
+# 该实验是当前 corr_scatter_position1 报告中的 PyStar MATLAB Exp1 结果：
+#   gene-level Position1 log10 Pearson ~= 0.9971
+#   gene-state-level log10 Pearson ~= 0.9943
+#
+# 重要边界：
+#   1. 本文件的算法/provider/tiling 参数对齐 2026-04-28 Experiment 1。
+#   2. dataset/codebook/output 路径仍保留发布仓库示例路径；实际运行前必须改成你的数据路径。
+#   3. 这是 MATLAB-provider parity 示例，不是默认生产入口；默认主线仍是 experiment_config.yaml。
+
+
+# ==========================================
+# 1. Dataset Specs
+# ==========================================
+# 这一节描述“数据在哪里、每张图像长什么样、每轮有哪些通道”。
+# 与默认 native 示例保持同一输入契约；这里不改成 benchmark 的 /media/... 路径，避免发布配置绑定单次实验机器路径。
+dataset:
+  # 原始 TIFF 数据根目录。
+  # 作用：ImageLoader 会在这个目录下按 filename_pattern 查找每个 FOV / round / channel 的图像。
+  # 调参建议：这是站点路径；换数据集时必须改成你的 raw image 根目录。
+  raw_data_path: "/gpfs/share/home/2201112433/labShare/2501111695/data/202512_mouse_testis_r1_leica/01_data"
+
+  # 图像文件名模板。
+  # 作用：程序用 raw_data_path + filename_pattern 拼出每张图像的 glob pattern。
+  # 可用占位符：{round}、{fov}、{ch}。
+  #   {round:03d} 表示 1 -> 001；2026-04-28 Exp1 benchmark 使用的是 {round:02d}。
+  #   本发布示例沿用当前站点数据布局；如果你的目录是 round01，应改成 {round:02d}。
+  # 注意：这里可以包含通配符 *，用于匹配显微镜导出的变长文件名。
+  filename_pattern: "round{round:03d}/Position{fov}/*_ch{ch}.tif"
+
+  # 显微镜像素尺寸，单位 nm。
+  # 作用：记录物理尺度，用于 QC、报告和后续把像素坐标换算到物理坐标。
+  # 调参影响：不改变图像处理结果；但会影响任何依赖物理尺度的下游解释。
+  pixel_size_xy_nm: 141.97  # XY 平面单像素边长
+  pixel_size_z_nm: 361.47   # 相邻 Z slice 的间距
+
+  # 单个 FOV 的图像尺寸。
+  # 作用：用于预分配、边界检查、transform / extraction 的 shape contract。
+  # 必须与原始 TIFF stack 一致；不一致时通常会在读图、配准或提取阶段暴露错误。
+  dimensions:
+    z: 42        # Z slice 数
+    width: 2048  # X 方向像素数
+    height: 2048 # Y 方向像素数
+
+  # 大图像读写 chunk 尺寸。
+  # 作用：控制大体积图像读写/缓存的分块大小，主要影响内存占用和 I/O 效率。
+  # 调参建议：
+  #   z 通常设为完整 stack 深度，避免 Z 方向切断 spot。
+  #   y/x 建议是 registration / tile block size 的整数倍；越大 I/O 次数越少但占内存越多。
+  io_chunk_size:
+    z: 42
+    y: 1024
+    x: 1024
+
+  # --- 显式结构定义 (Explicit Structure) ---
+
+  # 要处理的 FOV ID。
+  # 支持写法：
+  #   "1-324" 表示连续范围；
+  #   [1, 2, 5, 8] 表示只处理指定 FOV。
+  # 调参建议：调试时先用小列表；正式跑全数据时再切回完整范围。
+  fov_list: "1-324"
+
+  # 每个 round 包含哪些 channel。
+  # 作用：定义 ImageLoader 应该读取哪些 channel，以及 decoding / registration 可用的通道集合。
+  # 当前示例每轮都有 0/1/2 三个测序通道和 3 号 anchor 通道。
+  # 调参注意：如果某轮缺 channel，必须在这里删掉；否则会在读图阶段找不到文件。
+  round_structure:
+    1: [0, 1, 2, 3]
+    2: [0, 1, 2, 3]
+    3: [0, 1, 2, 3]
+    4: [0, 1, 2, 3]
+    5: [0, 1, 2, 3]
+    6: [0, 1, 2, 3]
+    7: [0, 1, 2, 3]
+    8: [0, 1, 2, 3]
+    9: [0, 1, 2, 3]
+    10: [0, 1, 2, 3]
+    11: [0, 1, 2, 3]
+
+  # 每个 channel 的语义。
+  #   "seq"    = 用于测序读码、spot finding、intensity extraction 的荧光通道。
+  #   "anchor" = 锚定/参考通道，通常用于实验结构或配准辅助，不作为条码颜色。
+  # 调参注意：channel_roles 必须和 round_structure 中出现的 channel 编号一致。
+  channel_roles:
+    0: "seq"
+    1: "seq"
+    2: "seq"
+    3: "anchor"
+
+
+# ==========================================
+# 2. Decoding Logic
+# ==========================================
+# 这一节描述“CSV 条码如何被解释成每轮颜色，以及物理读段如何拼回基因条码”。
+# 与 2026-04-28 Experiment 1 的 codebook topology 保持一致；只保留 gene_list 路径为发布示例路径。
+codebook:
+  # 基因/条码 CSV 路径。
+  # 作用：Decoder 会读取该文件，将每个 gene 的条码编译成可匹配的颜色序列。
+  # 换数据集时通常必须改成对应的 genes.csv。
+  gene_list: "/gpfs/share/home/2201112433/labShare/2501111695/data/202512_mouse_testis_r1_leica/01_data/genes.csv"
+
+  # 码本中颜色通道编号的起点。
+  # 当前 Leica/STATE 相关数据使用 1；调错后会造成系统性 channel 偏移。
+  channel_base_index: 1
+
+  # 碱基组合到颜色通道 ID 的映射表。
+  # 注意：这里的值仍使用 CSV/实验定义的颜色编号，随后由 channel_base_index 统一转换。
+  encoding_tables:
+    # 3-color tri 模式常规映射。
+    standard_3color:
+      "AT": 3
+      "GT": 1
+      "TT": 2
+      "AG": 1
+      "GG": 2
+      "TG": 3
+      "AA": 2
+      "GA": 3
+      "TA": 1
+
+    # 4-color 模式常规映射。当前示例不默认使用，但保留给 4-color codebook。
+    standard_4color:
+      "AA": 1
+      "CA": 2
+      "GA": 3
+      "TA": 4
+      "AC": 2
+      "CC": 1
+      "GC": 4
+      "TC": 3
+      "AG": 3
+      "CG": 4
+      "GG": 1
+      "TG": 2
+      "AT": 4
+      "CT": 3
+      "GT": 2
+      "TT": 1
+
+    # Leica/STATES omics tail 特殊映射。
+    # 作用：seqE 的 2-base segment 只用 GC/GT 区分状态。
+    omics_special:
+      "GC": 1
+      "GT": 2
+
+  # --- 拓扑结构定义 (Tri Mode) ---
+  topology:
+    # 条码拓扑变换函数。
+    # 当前 Leica/STATES 示例使用 reverse_string；改错会导致全局基因 identity 系统性错位。
+    func: "reverse_string"
+
+    # 每个读段 segment 的结构定义。
+    # 字段含义同默认 native 示例；除非实验设计或 genes.csv 格式改变，不要随意修改。
+    structure:
+      - id: "seqF"
+        length: 6
+        rounds: [6, 7, 8, 9, 10]
+        csv_slice: [1, 6]
+        anchor_base: ["A", "A"]
+        encoding_table: "standard_3color"
+
+      - id: "seqD"
+        length: 6
+        rounds: [1, 2, 3, 4, 5]
+        csv_slice: [7, 12]
+        anchor_base: ["G", "A"]
+        encoding_table: "standard_3color"
+
+      - id: "seqE"
+        length: 2
+        rounds: [11]
+        csv_slice: [13, 14]
+        anchor_base: ["G"]
+        encoding_table: "omics_special"
+
+    # 物理读段顺序。必须只引用 structure 中已有的 id。
+    physical_order: ["seqD", "seqF", "seqE"]
+
+
+# ==========================================
+# 3. Provider Runtime Configuration
+# ==========================================
+# 这一节配置 MATLAB provider seam 的 runtime 入口。
+# 与默认 native 配置不同，本文件后续 pipeline stage 全部写 provider: "matlab"，因此这些入口会被实际调用。
+providers:
+  matlab:
+    # 是否允许 MATLAB provider 被调用。
+    # true 只表示 runtime seam 可用；MATLAB runtime/Engine 不可用时应直接失败，不做 silent fallback。
+    enabled: true
+
+    preprocessing:
+      # MATLAB preprocessing runtime 目录和入口函数。
+      # runtime_path 相对仓库根目录；entrypoint 必须是 MATLAB path 中可调用的函数名。
+      runtime_path: "matlab_runtime/pystar_preprocessing"
+      entrypoint: "pystar_preprocess_entry"
+
+      # MATLAB 边界上的图像类型约定。
+      loader_input_format: "uint8"
+      loader_output_dtype: "uint8"
+
+      # MATLAB preprocessing 是否请求 GPU。
+      # 2026-04-28 Experiment 1 使用 false；保持 CPU 路径便于复现 parity。
+      use_gpu: false
+
+      # MATLAB morphology runtime 的默认参数。
+      # 这些值对齐 2026-04-28 Experiment 1：2D morphology，radius=6，height=3。
+      morphology:
+        method: "2d"
+        radius: 6
+        height: 3
+
+    registration:
+      # MATLAB registration runtime 目录和全局配准入口。
+      runtime_path: "matlab_runtime/pystar_registration"
+      entrypoint: "pystar_register_global_entry"
+
+      # MATLAB local registration 的方法到入口函数映射。
+      # 当前 MATLAB local provider 只支持 demons_3d。
+      local_entrypoints:
+        demons_3d: "pystar_register_local_demons_entry"
+
+      # Python <-> MATLAB 图像传输方式和输入 dtype。
+      volume_transfer_mode: "temporary_tiff"
+      input_volume_dtype: "uint8"
+      use_gpu: false
+
+    spot_finding:
+      # MATLAB spot-finding runtime。当前 Exp1 parity 路线使用 MATLAB-backed peak_local_max/max3d seam。
+      runtime_path: "matlab_runtime/pystar_spotfinding"
+      entrypoint: "pystar_spotfind_entry"
+      volume_transfer_mode: "temporary_tiff"
+      input_volume_dtype: "uint8"
+
+    extraction:
+      # MATLAB extraction runtime。当前 Exp1 parity 路线使用 MATLAB-backed box_sum/image_warp seam。
+      runtime_path: "matlab_runtime/pystar_extraction"
+      entrypoint: "pystar_extract_entry"
+
+      # 图像和坐标传输方式。
+      volume_transfer_mode: "temporary_tiff"
+      coords_transfer_mode: "temporary_csv"
+      input_volume_dtype: "float32"
+
+
+# ==========================================
+# 4. Pipeline Parameters
+# ==========================================
+# 这一节是主要算法参数。
+# 本文件的 stage/provider/tiling 参数按 2026-04-28 Experiment 1 MATLAB-provider as-run 配置设置。
+pipeline:
+  # 处理范围模式。
+  # full_fov 表示输出覆盖完整 Position/FOV。
+  # 注意：full_fov 不等于 local registration 不切块；本 MATLAB-provider 示例在 full-FOV 覆盖下按 4x4 subtile 计算 local demons。
+  scope_mode: "full_fov"
+
+  # 计算加速器。2026-04-28 Experiment 1 使用 CPU。
+  accelerator: "cpu"
+
+  # registration 位移场语义声明。
+  field_semantics:
+    representation: "residual"
+    composition: "sequential_global_then_local"
+    status: "provisional"
+
+  # ------------------------------------------
+  # Stage 0: Preprocessing (MATLAB-backed)
+  # ------------------------------------------
+  preprocessing:
+    # 是否执行预处理流水线。
+    enable: true
+
+    # 有序预处理流水线。
+    # 与默认 native 示例顺序相同，但每一步 provider 都切到 matlab，以对齐 Experiment 1。
+    sequence:
+      # Step 0: 占位/基础去噪。
+      - method: "none"
+        provider: "matlab"
+        params: {}
+
+      # Step 1: 初始线性归一化。
+      - method: "min_max_normalize"
+        provider: "matlab"
+        params: {}
+
+      # Step 2: round 间亮度校正。
+      - method: "histogram_match"
+        provider: "matlab"
+        params:
+          scope: "inter_round"
+
+      # Step 3: channel 间亮度校正。
+      - method: "histogram_match"
+        provider: "matlab"
+        params:
+          scope: "intra_round"
+
+      # Step 4: MATLAB morphology reconstruction 背景扣除/对比增强。
+      # radius=6 是 STATE/MATLAB 与 2026-04-28 Experiment 1 的对齐值。
+      - method: "morpho_reconstruction_contrast"
+        provider: "matlab"
+        params:
+          radius: 6
+          downsample_factor: 0.25
+
+  # ------------------------------------------
+  # Stage 1: Registration (MATLAB-backed)
+  # ------------------------------------------
+  registration:
+    # 参考 round。所有其它 round 会对齐到该 round。
+    reference_round: 1
+
+    # 构建 registration source image 的方式。
+    source:
+      method: "mip_all_channels"
+      single_channel_id: null
+      mip_channels: [0, 1, 2]
+
+    # 全局刚性/平移配准。
+    global:
+      enabled: true
+      method: "phase_corr_3d"
+      provider: "matlab"
+      params:
+        downsample_factor: 1
+        use_gpu: false
+        max_shift: 200
+
+    # 局部非刚性 refinement。
+    local:
+      enabled: true
+      method: "demons_3d"
+      provider: "matlab"
+      params:
+        # Legacy method parameter blocks are retained for schema parity with Experiment 1.
+        # They are not active when local.method="demons_3d", but keeping them avoids shape drift between configs.
+        bspline:
+          grid_spacing: 17
+          num_iter: 70
+
+        optical_flow:
+          coarse_scale: 0.12
+          blur_sigma: 1.9
+          attachment: 2.0
+          tightness: 0.45
+          num_warp: 5
+          num_iter: 10
+          tol: 0.0001
+
+        # demons_3d 是 Experiment 1 的实际 local registration 方法。
+        demons_3d:
+          num_iter: 50
+          smoothing_sigma: 1.0
+
+          # MATLAB/STATES-style local tiling。
+          # use_tiling=true + sqrt_pieces=4 表示把 full-FOV local registration 切成 4x4 subtiles 计算。
+          # tiling_layout_policy="matlab_subtile" 使用与 MATLAB subtile/stitch 兼容的 layout；最终 stitch 回完整 flow_3d。
+          use_tiling: true
+          sqrt_pieces: 4
+          tiling_layout_policy: "matlab_subtile"
+
+    # 配准安全门。
+    guards:
+      skip_if_global_corr_below: 0.2
+      reject_if_correlation_worse: true
+
+    # 输出控制。
+    save_displacement_fields: true
+    save_registered_images: false
+
+    # registration 位移场语义声明，与顶层 pipeline.field_semantics 保持一致。
+    field_semantics:
+      representation: "residual"
+      composition: "sequential_global_then_local"
+      status: "provisional"
+
+  # ------------------------------------------
+  # Stage 2: Spot Finding (MATLAB-backed)
+  # ------------------------------------------
+  spot_finding:
+    # Experiment 1 使用 MATLAB-backed peak_local_max/max3d seam。
+    algorithm: "peak_local_max"
+    provider: "matlab"
+    reference_round: 1
+    method: "max_intensity"
+
+    # Spotiflow 参数。保留结构，不是当前 Experiment 1 实际路径。
+    spotiflow:
+      model_name: "smfish_3d"
+      prob_thresh: 0.5
+      use_gpu: true
+
+    # Difference of Gaussians 参数。保留结构，不是当前 Experiment 1 实际路径。
+    blob_dog:
+      min_sigma: [0.5, 1.0, 1.0]
+      max_sigma: [2.0, 5.0, 5.0]
+      threshold: 0.01
+      overlap: 0.5
+
+    # MATLAB max3d/peak_local_max 参数。
+    # threshold_rel=0.1 对齐 2026-04-28 Experiment 1 和 MATLAB/STATE intensity_threshold=0.1。
+    peak_local_max:
+      min_distance: 2
+      threshold_rel: 0.1
+      exclude_border: true
+
+  # ------------------------------------------
+  # Stage 3: Extraction (MATLAB-backed)
+  # ------------------------------------------
+  extraction:
+    # Experiment 1 使用 MATLAB-backed box_sum，并用 image_warp 应用 transform。
+    method: "box_sum"
+    provider: "matlab"
+    integration_box: [3, 3, 3]
+    handle_out_of_bounds: "pad_zero"
+    transform_application_mode: "image_warp"
+
+  # ------------------------------------------
+  # Stage 4: Output (输出)
+  # ------------------------------------------
+  output:
+    # PyStar 输出根目录。
+    # 每个 FOV 会写入 Position{fov}/output_pystar/。
+    # 发布示例路径不是 benchmark Exp1 的输出路径；实际运行前请改成你的输出目录。
+    directory: "/gpfs/share/home/2201112433/labShare/2501111695/data/202512_mouse_testis_r1_leica/02_pystar_matlab_provider_output"
+
+    # Experiment 1 关闭 QC image 输出，避免大体积中间结果膨胀。
+    save_qc_images: false
+
+  # ------------------------------------------
+  # Stage 5: QC
+  # ------------------------------------------
+  qc:
+    # Experiment 1 关闭 QC 总开关；正式 benchmark 只保留必要指标和产物。
+    enable: false
