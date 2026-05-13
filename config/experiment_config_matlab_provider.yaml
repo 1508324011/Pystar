@@ -99,6 +99,8 @@ dataset:
 # ==========================================
 # 这一节描述“CSV 条码如何被解释成每轮颜色，以及物理读段如何拼回基因条码”。
 # 与 2026-04-28 Experiment 1 的 codebook topology 保持一致；只保留 gene_list 路径为发布示例路径。
+# 运行前除了改 gene_list，还要核对 channel_base_index / encoding_tables / topology.structure
+# 是否和实际数据的 round/channel 语义一致，尤其是 omics_special 这种实验特异 mapping。
 codebook:
   # 基因/条码 CSV 路径。
   # 作用：Decoder 会读取该文件，将每个 gene 的条码编译成可匹配的颜色序列。
@@ -145,6 +147,7 @@ codebook:
 
     # Leica/STATES omics tail 特殊映射。
     # 作用：seqE 的 2-base segment 只用 GC/GT 区分状态。
+    # 运行前必须确认这里的 1/2 与实际成像数据中 omics tail 使用的通道语义一致。
     omics_special:
       "GC": 1
       "GT": 2
