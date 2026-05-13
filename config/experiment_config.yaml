@@ -513,8 +513,9 @@ pipeline:
     # native = Python 实现；matlab = MATLAB extraction seam。MATLAB provider 当前只支持 method="box_sum"。
     provider: "native"
 
-    # 积分窗口尺寸 [Z, Y, X]，单位 pixel。
-    # 当前 [3,3,3] 表示以 spot 为中心的小立方体积分。
+    # 积分窗口尺寸 [Z, Y, X]，单位 pixel；这是完整窗口边长，不是半径。
+    # PyStar native 和 PyStar MATLAB provider 都按完整 box size 解释，当前 [3,3,3] 表示 3x3x3 小立方体积分。
+    # 若对齐 legacy STATES/core_matlab 的 voxel_size，要注意 MATLAB voxel_size 是 half-width：voxel_size [1,1,1] 等价这里的 integration_box [3,3,3]。
     # 过小会漏掉偏移/扩散信号；过大会混入邻近 spot 和背景。
     integration_box: [3, 3, 3]
 

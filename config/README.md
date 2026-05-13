@@ -8,6 +8,11 @@
 - `codebook.gene_list`：基因表/码本 CSV。
 - `pipeline.output.directory`：PyStar 输出目录。
 
+本目录提供两个入口：
+
+- `experiment_config.yaml`：默认 Python-native 示例，适合作为发布版主线入口。
+- `experiment_config_matlab_provider.yaml`：MATLAB-provider parity 示例，保留同一数据/码本结构，但把 preprocessing、registration、spot finding 和 extraction 都切到 `provider: matlab`。算法/provider/tiling 参数参照 2026-04-28 Experiment 1 MATLAB-provider as-run 配置（Position1 gene-level Pearson 约 `0.9971`，gene-state Pearson 约 `0.9943`）；数据路径仍是发布示例路径，运行前需要改成自己的数据位置。
+
 ## `dataset`
 
 - `raw_data_path`：原始输入根目录。所有原始图像路径都应从这里和 `filename_pattern` 推导，不要在代码里硬编码本地路径。
@@ -34,6 +39,15 @@
 
 如果手动启用 MATLAB provider，请把它视为实验功能。MATLAB provider 不做静默 fallback：MATLAB runtime 或 MATLAB Engine 不可用时应直接失败。
 
+`providers.matlab.shared_session` 是可选的 MATLAB Engine 复用配置，当前由 `scripts/batch_pystar.py` 使用：
+
+- `enabled`：默认 `false`，保持旧的每个 MATLAB backend 自管 Engine 生命周期。设为 `true` 后，批处理会创建一个显式共享 owner，并把同一个 owner 注入 preprocessing、registration、spot finding 和 extraction。
+- `name`：可填具体共享 session 名；为 `null` 时自动生成 `pystar_{config_stem}_{config_hash8}_{run_id}`。Slurm array 任务使用 `slurm_{SLURM_JOB_ID}_{SLURM_ARRAY_TASK_ID}` 作为 `run_id`，普通进程使用 `pid_{os.getpid()}`，避免同一 YAML 的并行 worker 误连同一个 MATLAB session。
+- `lifetime`：`run` 或 `fov`，默认 `run`。当前批处理 worker 一次处理一个 FOV，因此两者都在该 worker 边界释放 PyStar-owned session；`fov` 保留给隔离/调试。
+- `health_check_timeout_s`：共享 session attach/start 后的健康检查超时。
+
+共享 session 只按确定名称连接：不会调用未命名 `connect_matlab()`，不会连接“第一个可用 session”，健康检查或 sentinel 身份不匹配时会 fail loudly，也不会静默启动替代 session 或回退到 native provider。
+
 ## `pipeline`
 
 - `scope_mode: full_fov`：以完整 FOV 为处理单位，保持当前 Python-native 参考路径。
@@ -59,6 +73,7 @@
 - `source.mip_channels`：参与 MIP 的 channel，当前为 `0, 1, 2`。
 - `global`：全局 3D phase correlation，当前 `provider: native`，`max_shift: 200`。
 - `local`：局部 `demons_3d` refinement，当前 `num_iter: 50`、`smoothing_sigma: 1.0`。
+- 默认 native 示例没有开启 local tiling；MATLAB-provider 示例显式开启 `local.params.demons_3d.use_tiling: true`、`sqrt_pieces: 4`、`tiling_layout_policy: matlab_subtile`，表示 full-FOV 覆盖下按 4x4 subtile 计算 local demons 后 stitch 回完整 flow。
 - `guards.reject_if_correlation_worse: true`：局部 refinement 如果让相关性变差，应拒绝该 refinement。
 - `save_displacement_fields`：保存位移场，便于后续 signal extraction 和调试。
 - `save_registered_images`：是否保存 registered image；默认关闭以减少输出体积。
@@ -91,3 +106,5 @@
 ## MATLAB provider 状态
 
 当前 PyStar 可以通过 MATLAB provider 调用 MATLAB-backed preprocessing/registration/spot finding/extraction seam；内部 benchmark 中，全 MATLAB-provider 路线已经能接近 STATE。这个能力仍处于测试阶段，不是默认生产路径，也不替代 Python-native 示例配置。
+
+如果需要复现实验性 all-MATLAB provider 路线，请从 `experiment_config_matlab_provider.yaml` 开始改路径。该示例的算法参数对齐 2026-04-28 Experiment 1 MATLAB-provider as-run 配置；它保留 `scope_mode: full_fov`，但 local registration 使用 MATLAB subtile 4x4 tiling；这和“只处理一个 tile_local”不同，输出仍覆盖完整 Position。
