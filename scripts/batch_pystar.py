@@ -3,6 +3,7 @@ import time
 import argparse
 import logging
 import traceback
+from contextlib import nullcontext
 from pathlib import Path
 from typing import cast
 
@@ -11,7 +12,8 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from pystar.infrastructure import ExperimentConfig, load_config
 from pystar._stage_contracts import get_stage_spec
-from pystar.io import get_fov_output_structure
+from pystar.io import ImageLoader, get_fov_output_structure
+from pystar.matlab_engine_bootstrap import MatlabSharedSessionOwner, should_use_shared_matlab_session
 from pystar.preprocessing import DataSanitizer
 from pystar.registration import RegistrationEngine
 from pystar.spot_finding import SpotFinder
@@ -89,53 +91,57 @@ def main():
     start_time_global = time.time()
 
     try:
-        # === Stage 1: Preprocessing ===
-        t0 = time.time()
-        log_stage_start(logger, "preprocessing")
-        sanitizer = DataSanitizer(cfg)
-        _ = sanitizer.sanitize_fov(current_fov)
-        logger.info(f"    Done in {time.time() - t0:.2f}s")
+        matlab_session_owner_cm = nullcontext(None)
+        if should_use_shared_matlab_session(cfg):
+            matlab_session_owner_cm = MatlabSharedSessionOwner.from_config(cfg, fov_id=current_fov)
 
-        # === Stage 2: Registration ===
-        t0 = time.time()
-        log_stage_start(logger, "registration")
-        # 实例化 IO 加载数据，利用 xarray 的惰性加载机制
-        # 注意：这里可能需要稍微调整 registration API 以接受 fov_id 而不是 data array
-        # 为了保持你现有逻辑，我们这里做个适配
-        from pystar.io import ImageLoader
-        loader = ImageLoader(cfg)
-        # 只要建立了索引，load_fov 不会读入内存
-        data_xr = loader.load_fov(current_fov) 
-        
-        reg_engine = RegistrationEngine(cfg)
-        # 跑配准
-        _ = reg_engine.register_fov(data_xr, current_fov)
-        logger.info(f"    Done in {time.time() - t0:.2f}s")
-        
-        # 显式清理，防止 Dask 图过大
-        del data_xr
-        del loader
+        with matlab_session_owner_cm as matlab_session_owner:
+            # === Stage 1: Preprocessing ===
+            t0 = time.time()
+            log_stage_start(logger, "preprocessing")
+            sanitizer = DataSanitizer(cfg, matlab_session_owner=matlab_session_owner)
+            _ = sanitizer.sanitize_fov(current_fov)
+            logger.info(f"    Done in {time.time() - t0:.2f}s")
 
-        # === Stage 3: Spot Finding ===
-        t0 = time.time()
-        log_stage_start(logger, "spot_finding")
-        finder = SpotFinder(cfg)
-        _ = finder.find_spots_in_fov(current_fov)
-        logger.info(f"    Done in {time.time() - t0:.2f}s")
+            # === Stage 2: Registration ===
+            t0 = time.time()
+            log_stage_start(logger, "registration")
+            # 实例化 IO 加载数据，利用 xarray 的惰性加载机制
+            # 注意：这里可能需要稍微调整 registration API 以接受 fov_id 而不是 data array
+            # 为了保持你现有逻辑，我们这里做个适配
+            loader = ImageLoader(cfg)
+            # 只要建立了索引，load_fov 不会读入内存
+            data_xr = loader.load_fov(current_fov)
 
-        # === Stage 4: Mining ===
-        t0 = time.time()
-        log_stage_start(logger, "signal_extraction")
-        miner = SignalMiner(cfg)
-        _ = miner.mine_fov(current_fov)
-        logger.info(f"    Done in {time.time() - t0:.2f}s")
+            reg_engine = RegistrationEngine(cfg, matlab_session_owner=matlab_session_owner)
+            # 跑配准
+            _ = reg_engine.register_fov(data_xr, current_fov)
+            logger.info(f"    Done in {time.time() - t0:.2f}s")
 
-        # === Stage 5: Decoding ===
-        t0 = time.time()
-        log_stage_start(logger, "decoding")
-        decoder = Decoder(cfg)
-        _ = decoder.decode_fov(current_fov)
-        logger.info(f"    Done in {time.time() - t0:.2f}s")
+            # 显式清理，防止 Dask 图过大
+            del data_xr
+            del loader
+
+            # === Stage 3: Spot Finding ===
+            t0 = time.time()
+            log_stage_start(logger, "spot_finding")
+            finder = SpotFinder(cfg, matlab_session_owner=matlab_session_owner)
+            _ = finder.find_spots_in_fov(current_fov)
+            logger.info(f"    Done in {time.time() - t0:.2f}s")
+
+            # === Stage 4: Mining ===
+            t0 = time.time()
+            log_stage_start(logger, "signal_extraction")
+            miner = SignalMiner(cfg, matlab_session_owner=matlab_session_owner)
+            _ = miner.mine_fov(current_fov)
+            logger.info(f"    Done in {time.time() - t0:.2f}s")
+
+            # === Stage 5: Decoding ===
+            t0 = time.time()
+            log_stage_start(logger, "decoding")
+            decoder = Decoder(cfg)
+            _ = decoder.decode_fov(current_fov)
+            logger.info(f"    Done in {time.time() - t0:.2f}s")
 
         total_time = time.time() - start_time_global
         logger.info(f"{'='*40}")
