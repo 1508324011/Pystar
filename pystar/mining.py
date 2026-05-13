@@ -42,6 +42,7 @@ from .io import (
 )
 from .io import get_fov_output_structure
 from .matlab_engine_bootstrap import (
+    MatlabSharedSessionOwner,
     merge_matlab_session_lifecycle_summaries,
     summarize_matlab_boundary_traces,
 )
@@ -66,9 +67,10 @@ class SignalMiner:
     semantics rather than contract handling.
     """
 
-    def __init__(self, config: ExperimentConfig):
+    def __init__(self, config: ExperimentConfig, matlab_session_owner: Optional[MatlabSharedSessionOwner] = None):
         self.cfg = config
         self.loader = ImageLoader(config)
+        self._matlab_session_owner = matlab_session_owner
         self._matlab_backend: Optional[MATLABExtractionBackend] = None
 
     def close(self) -> None:
@@ -88,7 +90,10 @@ class SignalMiner:
 
     def _get_matlab_backend(self) -> MATLABExtractionBackend:
         if self._matlab_backend is None:
-            self._matlab_backend = MATLABExtractionBackend(self.cfg)
+            self._matlab_backend = MATLABExtractionBackend(
+                self.cfg,
+                matlab_session_owner=self._matlab_session_owner,
+            )
         return self._matlab_backend
 
     def _expected_field_semantics(self) -> dict[str, str]:

@@ -11,6 +11,7 @@ from ._artifact_schemas import SpotTableSchema, empty_spot_table, validate_spot_
 from .io import ImageLoader
 from .io import get_fov_output_structure, get_matlab_stage_contract
 from .matlab_engine_bootstrap import (
+    MatlabSharedSessionOwner,
     merge_matlab_session_lifecycle_summaries,
     summarize_matlab_boundary_traces,
 )
@@ -84,10 +85,11 @@ class SpotFinder:
     back to another implementation.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, matlab_session_owner: Optional[MatlabSharedSessionOwner] = None):
         self.cfg = config
         self.spot_cfg = config.pipeline.spot_finding
         self.loader = ImageLoader(config)
+        self._matlab_session_owner = matlab_session_owner
         
         # 预留模型槽位，不要在初始化时乱占显存
         self._model = None
@@ -110,7 +112,10 @@ class SpotFinder:
 
     def _get_matlab_backend(self) -> MATLABSpotFindingBackend:
         if self._matlab_backend is None:
-            self._matlab_backend = MATLABSpotFindingBackend(self.cfg)
+            self._matlab_backend = MATLABSpotFindingBackend(
+                self.cfg,
+                matlab_session_owner=self._matlab_session_owner,
+            )
         return self._matlab_backend
 
     def _get_spotiflow_model(self):

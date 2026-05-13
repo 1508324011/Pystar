@@ -21,7 +21,7 @@ from .matlab_preprocessing import (
     MATLABPreprocessingBackend,
     write_preprocessing_provenance,
 )
-from .matlab_engine_bootstrap import summarize_matlab_boundary_traces
+from .matlab_engine_bootstrap import MatlabSharedSessionOwner, summarize_matlab_boundary_traces
 
 ImageArray = NDArray[Any]
 ProcessorParams = dict[str, Any]
@@ -276,9 +276,10 @@ class DataSanitizer:
     switching is explicit provenance, not fallback behavior.
     """
 
-    def __init__(self, config: ExperimentConfig):
+    def __init__(self, config: ExperimentConfig, matlab_session_owner: Optional[MatlabSharedSessionOwner] = None):
         self.cfg = config
         self.loader = ImageLoader(config)
+        self._matlab_session_owner = matlab_session_owner
         self._matlab_backend: Optional[MATLABPreprocessingBackend] = None
 
     def close(self) -> None:
@@ -793,7 +794,10 @@ class DataSanitizer:
                     )
                 elif provider == "matlab":
                     if self._matlab_backend is None:
-                        self._matlab_backend = MATLABPreprocessingBackend(self.cfg)
+                        self._matlab_backend = MATLABPreprocessingBackend(
+                            self.cfg,
+                            matlab_session_owner=self._matlab_session_owner,
+                        )
                     matlab_output_root = Path(tmpdir) / f"segment_{segment_index}_{provider}_flat"
                     segment_record = self._matlab_backend.execute_sequence(
                         fov_id,

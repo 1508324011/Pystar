@@ -22,6 +22,7 @@ from .infrastructure import ExperimentConfig
 from .io import ImageLoader
 from .io import get_fov_output_structure
 from .io import PROVENANCE_VERSION, build_execution_envelope, build_release_contract, save_transform_manifest, persist_flow_3d_sidecar, load_transform_manifest
+from .matlab_engine_bootstrap import MatlabSharedSessionOwner
 from .matlab_registration import MATLABGlobalRegistrationBackend
 from .tiling import (
     TileLayout,
@@ -974,9 +975,10 @@ class RegistrationEngine:
     unsupported provider contracts fail explicitly instead of falling back.
     """
 
-    def __init__(self, config: ExperimentConfig):
+    def __init__(self, config: ExperimentConfig, matlab_session_owner: Optional[MatlabSharedSessionOwner] = None):
         self.cfg = config
         self.reg_cfg = config.pipeline.registration
+        self._matlab_session_owner = matlab_session_owner
         self._matlab_backend: Optional[MATLABGlobalRegistrationBackend] = None
 
     def close(self) -> None:
@@ -994,7 +996,10 @@ class RegistrationEngine:
 
     def _get_matlab_backend(self) -> MATLABGlobalRegistrationBackend:
         if self._matlab_backend is None:
-            self._matlab_backend = MATLABGlobalRegistrationBackend(self.cfg)
+            self._matlab_backend = MATLABGlobalRegistrationBackend(
+                self.cfg,
+                matlab_session_owner=self._matlab_session_owner,
+            )
         return self._matlab_backend
 
     def _build_provenance(
