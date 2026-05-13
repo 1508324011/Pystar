@@ -30,6 +30,7 @@ from .io import (
 )
 from .matlab_engine_bootstrap import (
     MATLABSessionCapsule,
+    MatlabSharedSessionOwner,
     create_matlab_boundary_trace,
     finalize_matlab_boundary_trace,
     load_matlab_engine_factory,
@@ -348,9 +349,11 @@ class MATLABPreprocessingBackend:
         config: ExperimentConfig,
         *,
         engine_factory: Optional[Callable[[], Any]] = None,
+        matlab_session_owner: MatlabSharedSessionOwner | None = None,
     ) -> None:
         self.config = config
         self.engine_factory = engine_factory
+        self.matlab_session_owner = matlab_session_owner
         self.runtime_dir = resolve_matlab_runtime_path(config)
         self.runtime_manifest = load_matlab_runtime_manifest(self.runtime_dir)
         self.entrypoint = config.providers.matlab.preprocessing.entrypoint
@@ -363,6 +366,8 @@ class MATLABPreprocessingBackend:
             engine_factory_consumer="preprocessing step provider='matlab'",
             startup_failure_prefix="Failed to start MATLAB Engine for preprocessing provider='matlab'",
             addpath_failure_prefix="Failed to add MATLAB preprocessing runtime path",
+            session_owner=matlab_session_owner,
+            runtime_file_validator=self._collect_runtime_file_records,
         )
 
     @property

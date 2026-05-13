@@ -24,6 +24,7 @@ from scipy.io import loadmat
 from .infrastructure import ExperimentConfig
 from .matlab_engine_bootstrap import (
     MATLABSessionCapsule,
+    MatlabSharedSessionOwner,
     create_matlab_boundary_trace,
     finalize_matlab_boundary_trace,
     load_matlab_engine_factory,
@@ -250,9 +251,11 @@ class MATLABRegistrationBackend:
         config: ExperimentConfig,
         *,
         engine_factory: Optional[Callable[[], Any]] = None,
+        matlab_session_owner: MatlabSharedSessionOwner | None = None,
     ) -> None:
         self.config = config
         self.engine_factory = engine_factory
+        self.matlab_session_owner = matlab_session_owner
         self.runtime_dir = resolve_matlab_registration_runtime_path(config)
         self.runtime_manifest = load_matlab_registration_runtime_manifest(self.runtime_dir)
         self.entrypoint = config.providers.matlab.registration.entrypoint
@@ -276,6 +279,8 @@ class MATLABRegistrationBackend:
             engine_factory_consumer="registration global/local provider='matlab'",
             startup_failure_prefix="Failed to start MATLAB Engine for registration provider='matlab'",
             addpath_failure_prefix="Failed to add MATLAB registration runtime path",
+            session_owner=matlab_session_owner,
+            runtime_file_validator=self._collect_runtime_file_records,
         )
 
     @property
