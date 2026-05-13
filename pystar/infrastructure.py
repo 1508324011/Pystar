@@ -1,4 +1,5 @@
 import hashlib
+import re
 import yaml
 from pathlib import Path
 from typing import List, Dict, Union, Any, Optional, Literal, Tuple
@@ -349,6 +350,43 @@ class MatlabExtractionProviderConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra='forbid')
 
 
+class MatlabSharedSessionConfig(BaseModel):
+    """Optional named MATLAB Engine session sharing policy.
+
+    The shared-session feature is opt-in so existing configs keep the historical
+    per-backend MATLAB Engine lifecycle.  When enabled, the batch runner creates
+    one explicit owner with a deterministic name and MATLAB-capable stages borrow
+    that owner instead of independently cold-starting sessions.
+    """
+
+    enabled: bool = False
+    name: Optional[str] = None
+    lifetime: Literal["run", "fov"] = "run"
+    health_check_timeout_s: float = Field(default=30.0, gt=0)
+
+    @model_validator(mode='after')
+    def validate_session_name(self) -> 'MatlabSharedSessionConfig':
+        if self.name is None:
+            return self
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("providers.matlab.shared_session.name must be a non-empty string when provided")
+        name = self.name.strip()
+        if len(name) > 63:
+            raise ValueError(
+                "providers.matlab.shared_session.name must be at most 63 characters for MATLAB "
+                "namelengthmax/shareEngine compatibility"
+            )
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name):
+            raise ValueError(
+                "providers.matlab.shared_session.name must contain only ASCII letters, digits, and underscores, "
+                "and must start with a letter"
+            )
+        object.__setattr__(self, "name", name)
+        return self
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+
 class MatlabProviderConfig(BaseModel):
     """Top-level switch and runtime sections for all MATLAB provider seams.
 
@@ -359,6 +397,7 @@ class MatlabProviderConfig(BaseModel):
     """
 
     enabled: bool = True
+    shared_session: MatlabSharedSessionConfig = Field(default_factory=MatlabSharedSessionConfig)
     preprocessing: MatlabPreprocessingProviderConfig = Field(default_factory=MatlabPreprocessingProviderConfig)
     registration: MatlabRegistrationProviderConfig = Field(default_factory=MatlabRegistrationProviderConfig)
     spot_finding: MatlabSpotFindingProviderConfig = Field(default_factory=MatlabSpotFindingProviderConfig)

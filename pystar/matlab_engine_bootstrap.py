@@ -11,8 +11,11 @@ behavior.
 from __future__ import annotations
 
 import importlib
+import hashlib
+import json
 import os
 import platform
+import re
 import shutil
 import sys
 import time
@@ -20,7 +23,9 @@ import uuid
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence, cast
+
+from .serialization import json_safe
 
 
 MATLAB_ROOT_ENV_KEYS = (
@@ -45,9 +50,14 @@ MATLAB_SESSION_TIMING_KEYS = (
     "configure_environment_ms",
     "engine_module_import_ms",
     "factory_resolution_ms",
+    "find_matlab_ms",
+    "connect_matlab_ms",
     "runtime_file_validation_ms",
     "start_matlab_ms",
+    "share_engine_ms",
     "addpath_ms",
+    "health_check_ms",
+    "sentinel_ms",
     "engine_bootstrap_ms",
     "teardown_ms",
 )
@@ -147,7 +157,7 @@ def _normalize_session_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any] |
     if not isinstance(session_id, str) or not session_id:
         return None
 
-    return {
+    normalized = {
         "schema_version": "1.0",
         "session_id": session_id,
         "consumer": snapshot.get("consumer"),
@@ -159,6 +169,10 @@ def _normalize_session_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any] |
         **{key: _count_as_int(snapshot.get(key)) for key in MATLAB_SESSION_COUNT_KEYS},
         "aggregate_timing_ms": _session_timing_totals(snapshot),
     }
+    shared_session = snapshot.get("shared_session")
+    if isinstance(shared_session, Mapping):
+        normalized["shared_session"] = dict(shared_session)
+    return normalized
 
 
 def _merge_session_snapshot(current: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -181,6 +195,12 @@ def _merge_session_snapshot(current: Mapping[str, Any], candidate: Mapping[str, 
     merged_timing = _session_timing_totals(current)
     _accumulate_metric_map(merged_timing, _session_timing_totals(candidate), mode="max")
     merged["aggregate_timing_ms"] = merged_timing
+    current_shared = current.get("shared_session")
+    candidate_shared = candidate.get("shared_session")
+    if isinstance(candidate_shared, Mapping):
+        merged["shared_session"] = dict(candidate_shared)
+    elif isinstance(current_shared, Mapping):
+        merged["shared_session"] = dict(current_shared)
     return merged
 
 
@@ -411,6 +431,49 @@ def load_matlab_engine_factory(*, consumer: str) -> tuple[Callable[[], Any], dic
     }
 
 
+def load_matlab_engine_module_with_metrics(*, consumer: str) -> tuple[Any, dict[str, Any]]:
+    """Resolve the `matlab.engine` module and shared-session callables."""
+
+    configure_started = time.perf_counter()
+    status = configure_matlab_engine_environment()
+    configure_environment_ms = _elapsed_ms(configure_started)
+
+    import_started = time.perf_counter()
+    try:
+        matlab_engine = importlib.import_module("matlab.engine")
+    except ImportError as exc:
+        matlab_root = status.get("matlab_root")
+        if matlab_root is None:
+            hint = (
+                "No MATLAB installation could be discovered from environment variables or `matlab` on PATH."
+            )
+        else:
+            hint = (
+                "Detected MATLAB root "
+                f"{matlab_root}, but the Engine module is still unavailable."
+            )
+        raise RuntimeError(
+            "MATLAB Engine for Python is unavailable. Configure the active Python environment before using "
+            f"{consumer}. {hint}"
+        ) from exc
+    engine_module_import_ms = _elapsed_ms(import_started)
+
+    resolve_started = time.perf_counter()
+    for function_name in ("find_matlab", "connect_matlab", "start_matlab"):
+        candidate = getattr(matlab_engine, function_name, None)
+        if candidate is None or not callable(candidate):
+            raise RuntimeError(f"Imported 'matlab.engine' module does not expose callable {function_name}()")
+    factory_resolution_ms = _elapsed_ms(resolve_started)
+
+    return matlab_engine, {
+        "consumer": consumer,
+        "configured_environment": status,
+        "configure_environment_ms": configure_environment_ms,
+        "engine_module_import_ms": engine_module_import_ms,
+        "factory_resolution_ms": factory_resolution_ms,
+    }
+
+
 def load_matlab_engine_module(*, consumer: str) -> Any:
     """Import the `matlab.engine` module after environment configuration."""
 
@@ -497,6 +560,720 @@ def close_matlab_engine_best_effort(engine: Any, *, consumer: str) -> str | None
         return message
 
 
+PYSTAR_SENTINEL_SCHEMA_VERSION = "1.0"
+PYSTAR_SENTINEL_APPDATA_KEY = "PyStarSession"
+MATLAB_SHARED_SESSION_NAME_MAX_LENGTH = 63
+_GENERATED_SHARED_SESSION_PREFIX = "pystar"
+_TRUNCATED_SESSION_COMPONENT_DIGEST_LENGTH = 6
+_MIN_GENERATED_SESSION_COMPONENT_LENGTH = 8
+
+
+def _pystar_source_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _pystar_matlab_runtime_root() -> Path:
+    return (_pystar_source_root() / "matlab_runtime").resolve()
+
+
+def _sanitize_session_name_component(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", value.strip())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned or "config"
+
+
+def _truncate_session_name_component(component: str, *, max_length: int) -> str:
+    if max_length < 1:
+        raise ValueError("Generated MATLAB shared-session name has no room for a deterministic identity component")
+    if len(component) <= max_length:
+        return component
+
+    digest = hashlib.sha256(component.encode("utf-8")).hexdigest()[:_TRUNCATED_SESSION_COMPONENT_DIGEST_LENGTH]
+    if max_length <= len(digest):
+        return digest[:max_length]
+
+    prefix_length = max_length - len(digest) - 1
+    prefix = component[:prefix_length].rstrip("_")
+    if not prefix:
+        return digest[:max_length]
+    return f"{prefix}_{digest}"
+
+
+def _generated_shared_session_name(config_stem: str, config_hash: str, run_id: str) -> str:
+    prefix = _GENERATED_SHARED_SESSION_PREFIX
+    config_stem = _sanitize_session_name_component(config_stem)
+    config_hash = _sanitize_session_name_component(config_hash)
+    run_id = _sanitize_session_name_component(run_id)
+    generated = f"{prefix}_{config_stem}_{config_hash}_{run_id}"
+    if len(generated) <= MATLAB_SHARED_SESSION_NAME_MAX_LENGTH:
+        return generated
+
+    component_budget = MATLAB_SHARED_SESSION_NAME_MAX_LENGTH - len(prefix) - len(config_hash) - 3
+    if component_budget < 2:
+        raise ValueError(
+            "Generated MATLAB shared-session name cannot fit MATLAB namelengthmax while preserving "
+            f"the deterministic config hash {config_hash!r}"
+        )
+
+    min_stem_budget = min(_MIN_GENERATED_SESSION_COMPONENT_LENGTH, max(1, component_budget // 2))
+    max_run_id_budget = component_budget - min_stem_budget
+    if len(run_id) > max_run_id_budget:
+        run_id = _truncate_session_name_component(run_id, max_length=max_run_id_budget)
+
+    config_stem_budget = component_budget - len(run_id)
+    config_stem = _truncate_session_name_component(config_stem, max_length=config_stem_budget)
+    return f"{prefix}_{config_stem}_{config_hash}_{run_id}"
+
+
+def _validate_shared_session_name(name: str, *, label: str = "MATLAB shared-session name") -> str:
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{label} must be a non-empty string")
+    normalized = name.strip()
+    if len(normalized) > MATLAB_SHARED_SESSION_NAME_MAX_LENGTH:
+        raise ValueError(
+            f"{label} must be at most {MATLAB_SHARED_SESSION_NAME_MAX_LENGTH} characters for MATLAB "
+            f"namelengthmax/shareEngine compatibility; got {len(normalized)} characters"
+        )
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", normalized):
+        raise ValueError(
+            f"{label} must contain only ASCII letters, digits, and underscores, and must start with a letter; "
+            f"got {name!r}"
+        )
+    return normalized
+
+
+def _config_hash8(config: Any) -> str:
+    raw_hash = getattr(config, "config_sha256", None)
+    if not isinstance(raw_hash, str) or not raw_hash.strip():
+        return "nohash"
+    digest = raw_hash.strip()
+    if digest.startswith("sha256:"):
+        digest = digest.split(":", 1)[1]
+    digest = re.sub(r"[^A-Fa-f0-9]", "", digest)
+    return digest[:8].lower() if digest else "nohash"
+
+
+def _config_stem(config: Any) -> str:
+    config_source_path = getattr(config, "config_source_path", None)
+    if config_source_path is None:
+        return "config"
+    try:
+        stem = Path(config_source_path).stem
+    except TypeError:
+        stem = "config"
+    return _sanitize_session_name_component(stem)
+
+
+def _run_id() -> tuple[str, str]:
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    slurm_array_task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+    if slurm_job_id and slurm_array_task_id:
+        return (
+            f"slurm_{_sanitize_session_name_component(slurm_job_id)}_{_sanitize_session_name_component(slurm_array_task_id)}",
+            "slurm",
+        )
+    return f"pid_{os.getpid()}", "pid"
+
+
+def resolve_matlab_shared_session_name(config: Any) -> dict[str, str]:
+    """Return the exact deterministic shared MATLAB Engine session identity."""
+
+    shared_cfg = getattr(getattr(getattr(config, "providers", None), "matlab", None), "shared_session", None)
+    configured_name = getattr(shared_cfg, "name", None)
+    if isinstance(configured_name, str) and configured_name.strip():
+        return {
+            "name": _validate_shared_session_name(
+                configured_name,
+                label="providers.matlab.shared_session.name",
+            ),
+            "name_source": "configured",
+            "run_id_source": "configured",
+        }
+
+    run_id, run_id_source = _run_id()
+    generated = _generated_shared_session_name(_config_stem(config), _config_hash8(config), run_id)
+    return {
+        "name": _validate_shared_session_name(generated, label="generated MATLAB shared-session name"),
+        "name_source": "generated",
+        "run_id_source": run_id_source,
+    }
+
+
+def should_use_shared_matlab_session(config: Any) -> bool:
+    """Return true when shared MATLAB sessions are both enabled and needed."""
+
+    shared_cfg = getattr(getattr(getattr(config, "providers", None), "matlab", None), "shared_session", None)
+    if not bool(getattr(shared_cfg, "enabled", False)):
+        return False
+    pipeline = getattr(config, "pipeline", None)
+    if pipeline is None:
+        return False
+    for method_name in (
+        "uses_matlab_preprocessing",
+        "uses_matlab_registration",
+        "uses_matlab_spot_finding",
+        "uses_matlab_extraction",
+    ):
+        method = getattr(pipeline, method_name, None)
+        if callable(method) and bool(method()):
+            return True
+    return False
+
+
+def _matlab_single_quote(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _share_engine_with_name(engine: Any, session_name: str) -> None:
+    command = f"matlab.engine.shareEngine('{_matlab_single_quote(session_name)}')"
+    engine.eval(command, nargout=0)
+
+
+def _declares_python_attribute(engine: Any, attribute_name: str) -> bool:
+    try:
+        if attribute_name in vars(engine):
+            return True
+    except TypeError:
+        pass
+
+    for cls in getattr(type(engine), "__mro__", (type(engine),)):
+        try:
+            if attribute_name in vars(cls):
+                return True
+        except TypeError:
+            continue
+    return False
+
+
+def _declares_true_python_attribute(engine: Any, attribute_name: str) -> bool:
+    try:
+        if vars(engine).get(attribute_name) is True:
+            return True
+    except TypeError:
+        pass
+
+    for cls in getattr(type(engine), "__mro__", (type(engine),)):
+        try:
+            if vars(cls).get(attribute_name) is True:
+                return True
+        except TypeError:
+            continue
+    return False
+
+
+def _uses_explicit_fake_sentinel_seam(engine: Any) -> bool:
+    return _declares_true_python_attribute(engine, "_pystar_fake_engine") or _declares_true_python_attribute(
+        engine,
+        "_pystar_fake_sentinel_seam",
+    )
+
+
+def _fake_sentinel_callable(engine: Any, attribute_name: str) -> Callable[..., Any] | None:
+    if not (_uses_explicit_fake_sentinel_seam(engine) or _declares_python_attribute(engine, attribute_name)):
+        return None
+    candidate = getattr(engine, attribute_name, None)
+    return candidate if callable(candidate) else None
+
+
+def _read_pystar_sentinel(engine: Any) -> dict[str, Any] | None:
+    fake_reader = _fake_sentinel_callable(engine, "_pystar_get_sentinel")
+    if fake_reader is not None:
+        sentinel = fake_reader()
+        return dict(sentinel) if isinstance(sentinel, Mapping) else None
+
+    key = _matlab_single_quote(PYSTAR_SENTINEL_APPDATA_KEY)
+    has_sentinel = engine.eval(f"isappdata(0, '{key}')", nargout=1)
+    if not bool(has_sentinel):
+        return None
+    payload = engine.eval(f"jsonencode(getappdata(0, '{key}'))", nargout=1)
+    if not isinstance(payload, str) or not payload.strip():
+        return None
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("MATLAB shared-session sentinel exists but is not valid JSON") from exc
+    if not isinstance(decoded, Mapping):
+        raise RuntimeError("MATLAB shared-session sentinel must decode to a JSON object")
+    return dict(decoded)
+
+
+def _write_pystar_sentinel(engine: Any, sentinel: Mapping[str, Any]) -> None:
+    fake_writer = _fake_sentinel_callable(engine, "_pystar_set_sentinel")
+    if fake_writer is not None:
+        fake_writer(dict(sentinel))
+        return
+
+    key = _matlab_single_quote(PYSTAR_SENTINEL_APPDATA_KEY)
+    payload = _matlab_single_quote(json.dumps(json_safe(dict(sentinel)), sort_keys=True))
+    engine.eval(
+        f"setappdata(0, '{key}', jsondecode('{payload}'))",
+        nargout=0,
+    )
+
+
+def _sentinel_identity(session_name: str) -> dict[str, str]:
+    return {
+        "sentinel_schema_version": PYSTAR_SENTINEL_SCHEMA_VERSION,
+        "session_name": session_name,
+        "pystar_source_root": str(_pystar_source_root().resolve()),
+        "matlab_runtime_root": str(_pystar_matlab_runtime_root()),
+    }
+
+
+def _safe_config_reference(config: Any) -> dict[str, str | None]:
+    config_source_path = getattr(config, "config_source_path", None)
+    config_hash = getattr(config, "config_sha256", None)
+    return {
+        "config_source_path": None if config_source_path is None else str(config_source_path),
+        "config_hash": config_hash if isinstance(config_hash, str) else None,
+    }
+
+
+def _shared_metadata_from_acquire_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    keys = (
+        "shared_session_enabled",
+        "shared_session_name",
+        "shared_session_name_source",
+        "shared_session_lifetime",
+        "shared_session_mode",
+        "shared_session_owner_id",
+        "engine_acquire_mode",
+        "attached_existing",
+        "started_owned",
+        "claimed_existing_without_sentinel",
+        "health_check_status",
+        "health_check_timestamp_utc",
+        "health_check_duration_ms",
+        "sentinel_schema_version",
+        "sentinel_identity_match",
+        "pystar_source_root",
+        "matlab_runtime_root",
+        "config_source_path",
+        "config_hash",
+        "run_id_source",
+    )
+    return {key: record.get(key) for key in keys if key in record}
+
+
+def _record_shared_session_on_lifecycle(session: dict[str, Any], record: Mapping[str, Any]) -> None:
+    session["shared_session"] = _shared_metadata_from_acquire_record(record)
+
+
+def record_matlab_session_shared_owner_acquire(
+    session: dict[str, Any],
+    acquire_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Record a borrowed shared-owner acquisition on a stage-local lifecycle."""
+
+    measured_at = str(acquire_record.get("measured_at") or _iso_utc_now())
+    details = dict(acquire_record)
+    engine_acquire_mode = str(details.get("engine_acquire_mode") or "owner_reuse")
+    if engine_acquire_mode == "owner_reuse":
+        session["engine_reuse_count"] = int(session.get("engine_reuse_count", 0)) + 1
+        session["last_reuse"] = {
+            "measured_at": measured_at,
+            "engine_reused": True,
+            "engine_acquire_mode": engine_acquire_mode,
+            "shared_session_name": details.get("shared_session_name"),
+        }
+    else:
+        session["engine_bootstrap_count"] = int(session.get("engine_bootstrap_count", 0)) + 1
+        session["last_bootstrap"] = details
+        if session.get("session_started_at") is None:
+            session["session_started_at"] = measured_at
+
+    if _metric_as_float(details.get("addpath_ms")) > 0:
+        session["addpath_call_count"] = int(session.get("addpath_call_count", 0)) + 1
+
+    session["session_last_used_at"] = measured_at
+    timing_totals = _session_timing_totals(session)
+    for key in MATLAB_SESSION_TIMING_KEYS:
+        if key == "teardown_ms":
+            continue
+        timing_totals[key] = round(timing_totals[key] + _metric_as_float(details.get(key)), 3)
+    session["aggregate_timing_ms"] = timing_totals
+    _record_shared_session_on_lifecycle(session, details)
+    return details
+
+
+class MatlabSharedSessionOwner:
+    """Own or borrow one deterministic named MATLAB Engine session."""
+
+    def __init__(
+        self,
+        *,
+        session_name: str,
+        name_source: str,
+        lifetime: str,
+        health_check_timeout_s: float,
+        config_reference: Mapping[str, str | None] | None = None,
+        run_id_source: str = "unknown",
+        fov_id: int | None = None,
+        engine_module_loader: Callable[[str], tuple[Any, Mapping[str, Any]]] | None = None,
+    ) -> None:
+        self.session_name = _validate_shared_session_name(session_name)
+        if lifetime not in {"run", "fov"}:
+            raise ValueError(f"MATLAB shared-session lifetime must be 'run' or 'fov', got {lifetime!r}")
+        if health_check_timeout_s <= 0:
+            raise ValueError("MATLAB shared-session health_check_timeout_s must be positive")
+        self.name_source = name_source
+        self.lifetime = lifetime
+        self.health_check_timeout_s = float(health_check_timeout_s)
+        self.config_reference = dict(config_reference or {})
+        self.run_id_source = run_id_source
+        self.fov_id = None if fov_id is None else int(fov_id)
+        self.owner_id = uuid.uuid4().hex
+        self.engine_module_loader = engine_module_loader or (
+            lambda consumer: load_matlab_engine_module_with_metrics(consumer=consumer)
+        )
+        self.engine: Any = None
+        self.mode: str = "inactive"
+        self._runtime_dirs_added: set[str] = set()
+        self.last_acquire_record: dict[str, Any] | None = None
+        self.last_teardown: dict[str, Any] | None = None
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Any,
+        *,
+        fov_id: int | None = None,
+        engine_module_loader: Callable[[str], tuple[Any, Mapping[str, Any]]] | None = None,
+    ) -> "MatlabSharedSessionOwner":
+        shared_cfg = getattr(getattr(getattr(config, "providers", None), "matlab", None), "shared_session", None)
+        identity = resolve_matlab_shared_session_name(config)
+        return cls(
+            session_name=identity["name"],
+            name_source=identity["name_source"],
+            lifetime=str(getattr(shared_cfg, "lifetime", "run")),
+            health_check_timeout_s=float(getattr(shared_cfg, "health_check_timeout_s", 30.0)),
+            config_reference=_safe_config_reference(config),
+            run_id_source=identity["run_id_source"],
+            fov_id=fov_id,
+            engine_module_loader=engine_module_loader,
+        )
+
+    def __enter__(self) -> "MatlabSharedSessionOwner":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback_obj: Any) -> None:
+        self.close()
+
+    def _base_acquire_record(self, *, consumer: str, runtime_dir: Path, entrypoint: str) -> dict[str, Any]:
+        identity = _sentinel_identity(self.session_name)
+        return {
+            "schema_version": "1.0",
+            "measured_at": _iso_utc_now(),
+            "consumer": consumer,
+            "fov_id": self.fov_id,
+            "runtime_path": str(runtime_dir),
+            "entrypoint": entrypoint,
+            "shared_session_enabled": True,
+            "shared_session_name": self.session_name,
+            "shared_session_name_source": self.name_source,
+            "shared_session_lifetime": self.lifetime,
+            "shared_session_owner_id": self.owner_id,
+            "run_id_source": self.run_id_source,
+            "sentinel_schema_version": PYSTAR_SENTINEL_SCHEMA_VERSION,
+            "pystar_source_root": identity["pystar_source_root"],
+            "matlab_runtime_root": identity["matlab_runtime_root"],
+            **self.config_reference,
+        }
+
+    def _apply_runtime_path(self, engine: Any, runtime_dir: Path, *, addpath_failure_prefix: str) -> float:
+        runtime_key = str(runtime_dir.resolve())
+        if runtime_key in self._runtime_dirs_added:
+            return 0.0
+        addpath_started = time.perf_counter()
+        try:
+            engine.addpath(str(runtime_dir), nargout=0)
+        except Exception as exc:
+            raise RuntimeError(
+                _format_exception_message(
+                    f"{addpath_failure_prefix}: {runtime_dir}",
+                    exc,
+                )
+            ) from exc
+        addpath_ms = _elapsed_ms(addpath_started)
+        self._runtime_dirs_added.add(runtime_key)
+        return addpath_ms
+
+    def _resolve_entrypoint(self, engine: Any, entrypoint: str, runtime_dir: Path) -> Any:
+        try:
+            return getattr(engine, entrypoint)
+        except AttributeError as exc:
+            raise RuntimeError(
+                f"MATLAB shared session '{self.session_name}' with runtime path {runtime_dir} does not expose entrypoint '{entrypoint}'"
+            ) from exc
+
+    def _run_health_check(
+        self,
+        engine: Any,
+        *,
+        runtime_dir: Path,
+        entrypoint: str,
+        mode: str,
+    ) -> dict[str, Any]:
+        health_started = time.perf_counter()
+        liveness_started = time.perf_counter()
+        try:
+            version_callable = getattr(engine, "version", None)
+            matlab_version = version_callable(nargout=1) if callable(version_callable) else engine.eval("version", nargout=1)
+        except Exception as exc:
+            raise RuntimeError(
+                f"MATLAB shared session '{self.session_name}' failed liveness/version health check"
+            ) from exc
+        liveness_ms = _elapsed_ms(liveness_started)
+
+        entrypoint_started = time.perf_counter()
+        _ = self._resolve_entrypoint(engine, entrypoint, runtime_dir)
+        entrypoint_resolution_ms = _elapsed_ms(entrypoint_started)
+
+        sentinel_started = time.perf_counter()
+        expected_identity = _sentinel_identity(self.session_name)
+        observed_sentinel = _read_pystar_sentinel(engine)
+        claimed_existing_without_sentinel = False
+        sentinel_identity_match = True
+        if observed_sentinel is not None:
+            mismatches = {
+                key: {"expected": expected_value, "observed": observed_sentinel.get(key)}
+                for key, expected_value in expected_identity.items()
+                if observed_sentinel.get(key) != expected_value
+            }
+            if mismatches:
+                sentinel_identity_match = False
+                raise RuntimeError(
+                    "MATLAB shared-session sentinel identity mismatch for "
+                    f"session '{self.session_name}'. Mismatches: {mismatches}. "
+                    "Use a different providers.matlab.shared_session.name or close the stale MATLAB session."
+                )
+        else:
+            claimed_existing_without_sentinel = mode == "attached_existing"
+            _write_pystar_sentinel(engine, expected_identity)
+        sentinel_ms = _elapsed_ms(sentinel_started)
+        health_check_ms = _elapsed_ms(health_started)
+        if health_check_ms / 1000.0 > self.health_check_timeout_s:
+            raise RuntimeError(
+                f"MATLAB shared session '{self.session_name}' health check exceeded timeout "
+                f"{self.health_check_timeout_s:.3f}s"
+            )
+        return {
+            "health_check_status": "passed",
+            "health_check_timestamp_utc": _iso_utc_now(),
+            "health_check_ms": health_check_ms,
+            "health_check_duration_ms": health_check_ms,
+            "health_check_timeout_s": self.health_check_timeout_s,
+            "health_check_liveness_ms": liveness_ms,
+            "health_check_entrypoint_resolution_ms": entrypoint_resolution_ms,
+            "sentinel_ms": sentinel_ms,
+            "sentinel_identity_match": sentinel_identity_match,
+            "claimed_existing_without_sentinel": claimed_existing_without_sentinel,
+            "matlab_version": matlab_version,
+        }
+
+    def _cleanup_failed_owned_start(self, engine: Any, record: dict[str, Any]) -> None:
+        cleanup_started = time.perf_counter()
+        warning_message = close_matlab_engine_best_effort(
+            engine,
+            consumer=f"MATLAB shared session '{self.session_name}' failed startup cleanup",
+        )
+        record["teardown_action"] = "cleanup_after_failed_start"
+        record["teardown_ms"] = _elapsed_ms(cleanup_started)
+        record["teardown_warning_count"] = 1 if warning_message else 0
+        record["teardown_warning_message"] = warning_message
+
+    def ensure_engine(
+        self,
+        *,
+        consumer: str,
+        runtime_dir: Path,
+        entrypoint: str,
+        startup_failure_prefix: str,
+        addpath_failure_prefix: str,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Attach/start the exact named session and verify it for one stage."""
+
+        runtime_dir = Path(runtime_dir)
+        if self.engine is not None:
+            record = self._base_acquire_record(consumer=consumer, runtime_dir=runtime_dir, entrypoint=entrypoint)
+            addpath_ms = self._apply_runtime_path(
+                self.engine,
+                runtime_dir,
+                addpath_failure_prefix=addpath_failure_prefix,
+            )
+            health = self._run_health_check(
+                self.engine,
+                runtime_dir=runtime_dir,
+                entrypoint=entrypoint,
+                mode=cast(str, self.mode),
+            )
+            record.update(
+                {
+                    "engine_acquire_mode": "owner_reuse",
+                    "shared_session_mode": self.mode,
+                    "attached_existing": self.mode == "attached_existing",
+                    "started_owned": self.mode == "started_owned",
+                    "addpath_ms": addpath_ms,
+                    "engine_bootstrap_ms": round(addpath_ms + float(health.get("health_check_duration_ms", 0.0)), 3),
+                    **health,
+                }
+            )
+            self.last_acquire_record = record
+            return self.engine, dict(record)
+
+        record = self._base_acquire_record(consumer=consumer, runtime_dir=runtime_dir, entrypoint=entrypoint)
+        engine_module: Any = None
+        factory_metrics: Mapping[str, Any] | None = None
+        try:
+            engine_module, factory_metrics = self.engine_module_loader(consumer)
+        except TypeError:
+            # Backward-compatible test seam for simple zero-argument factories.
+            engine_module, factory_metrics = cast(Any, self.engine_module_loader)()
+        if isinstance(factory_metrics, Mapping):
+            record.update({key: factory_metrics.get(key) for key in factory_metrics})
+
+        find_started = time.perf_counter()
+        try:
+            existing_names = tuple(str(name) for name in engine_module.find_matlab())
+        except Exception as exc:
+            raise RuntimeError(
+                _format_exception_message(
+                    f"Failed to list MATLAB shared sessions before using '{self.session_name}'",
+                    exc,
+                )
+            ) from exc
+        find_matlab_ms = _elapsed_ms(find_started)
+        record["find_matlab_ms"] = find_matlab_ms
+        record["available_shared_sessions"] = list(existing_names)
+
+        engine: Any
+        mode: str
+        connect_matlab_ms = 0.0
+        start_matlab_ms = 0.0
+        share_engine_ms = 0.0
+        if self.session_name in existing_names:
+            connect_started = time.perf_counter()
+            try:
+                engine = engine_module.connect_matlab(self.session_name)
+            except Exception as exc:
+                raise RuntimeError(
+                    _format_exception_message(
+                        f"Failed to connect to MATLAB shared session '{self.session_name}'",
+                        exc,
+                    )
+                ) from exc
+            connect_matlab_ms = _elapsed_ms(connect_started)
+            mode = "attached_existing"
+            engine_acquire_mode = "connect_existing"
+        else:
+            start_started = time.perf_counter()
+            try:
+                engine = engine_module.start_matlab()
+            except Exception as exc:
+                raise RuntimeError(
+                    _format_exception_message(
+                        startup_failure_prefix,
+                        exc,
+                    )
+                ) from exc
+            start_matlab_ms = _elapsed_ms(start_started)
+            mode = "started_owned"
+            engine_acquire_mode = "cold_start"
+            share_started = time.perf_counter()
+            try:
+                _share_engine_with_name(engine, self.session_name)
+            except Exception as exc:
+                self._cleanup_failed_owned_start(engine, record)
+                raise RuntimeError(
+                    _format_exception_message(
+                        f"Failed to share newly started MATLAB Engine as '{self.session_name}'",
+                        exc,
+                    )
+                ) from exc
+            share_engine_ms = _elapsed_ms(share_started)
+
+        addpath_ms = 0.0
+        try:
+            addpath_ms = self._apply_runtime_path(
+                engine,
+                runtime_dir,
+                addpath_failure_prefix=addpath_failure_prefix,
+            )
+            health = self._run_health_check(
+                engine,
+                runtime_dir=runtime_dir,
+                entrypoint=entrypoint,
+                mode=mode,
+            )
+        except Exception:
+            if mode == "started_owned":
+                self._cleanup_failed_owned_start(engine, record)
+            raise
+
+        record.update(
+            {
+                "shared_session_mode": mode,
+                "engine_acquire_mode": engine_acquire_mode,
+                "attached_existing": mode == "attached_existing",
+                "started_owned": mode == "started_owned",
+                "connect_matlab_ms": connect_matlab_ms,
+                "start_matlab_ms": start_matlab_ms,
+                "share_engine_ms": share_engine_ms,
+                "addpath_ms": addpath_ms,
+                **health,
+            }
+        )
+        record["engine_bootstrap_ms"] = round(
+            _metric_as_float(record.get("configure_environment_ms"))
+            + _metric_as_float(record.get("engine_module_import_ms"))
+            + _metric_as_float(record.get("factory_resolution_ms"))
+            + find_matlab_ms
+            + connect_matlab_ms
+            + start_matlab_ms
+            + share_engine_ms
+            + addpath_ms
+            + float(health.get("health_check_duration_ms", 0.0)),
+            3,
+        )
+        self.engine = engine
+        self.mode = mode
+        self.last_acquire_record = record
+        return self.engine, dict(record)
+
+    def close(self) -> dict[str, Any] | None:
+        """Close only PyStar-owned sessions; never quit attached sessions."""
+
+        if self.engine is None:
+            return None
+        record: dict[str, Any] = {
+            "schema_version": "1.0",
+            "measured_at": _iso_utc_now(),
+            "shared_session_name": self.session_name,
+            "shared_session_mode": self.mode,
+            "shared_session_owner_id": self.owner_id,
+            "shared_session_lifetime": self.lifetime,
+        }
+        teardown_started = time.perf_counter()
+        if self.mode == "started_owned":
+            warning_message = close_matlab_engine_best_effort(
+                self.engine,
+                consumer=f"MATLAB shared session '{self.session_name}'",
+            )
+            record["teardown_action"] = "quit_owned"
+            record["warning_message"] = warning_message
+            record["teardown_warning_count"] = 1 if warning_message else 0
+        else:
+            record["teardown_action"] = "borrowed_noop"
+            record["warning_message"] = None
+            record["teardown_warning_count"] = 0
+        record["teardown_ms"] = _elapsed_ms(teardown_started)
+        self.engine = None
+        self.mode = "inactive"
+        self._runtime_dirs_added.clear()
+        self.last_teardown = record
+        return dict(record)
+
+
 class MATLABSessionCapsule:
     """Lazy MATLAB Engine session wrapper shared by all MATLAB providers.
 
@@ -516,6 +1293,8 @@ class MATLABSessionCapsule:
         engine_factory_consumer: str | None = None,
         startup_failure_prefix: str,
         addpath_failure_prefix: str,
+        session_owner: MatlabSharedSessionOwner | None = None,
+        runtime_file_validator: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
     ) -> None:
         self.consumer = consumer
         self.runtime_dir = runtime_dir
@@ -524,6 +1303,8 @@ class MATLABSessionCapsule:
         self.engine_factory_consumer = engine_factory_consumer or consumer
         self.startup_failure_prefix = startup_failure_prefix
         self.addpath_failure_prefix = addpath_failure_prefix
+        self.session_owner = session_owner
+        self.runtime_file_validator = runtime_file_validator
         self.engine: Any = None
         self.session_lifecycle = create_matlab_session_lifecycle(
             consumer=consumer,
@@ -537,6 +1318,22 @@ class MATLABSessionCapsule:
         """Best-effort close and reset cached runtime validation state."""
 
         if self.engine is None:
+            self._validated_runtime_files = None
+            return
+
+        if self.session_owner is not None:
+            teardown_started = time.perf_counter()
+            teardown_details = record_matlab_session_teardown(
+                self.session_lifecycle,
+                teardown_ms=_elapsed_ms(teardown_started),
+                warning_message=None,
+            )
+            teardown_details["teardown_action"] = "borrowed_noop"
+            latest_owner_record = self.session_owner.last_acquire_record
+            if isinstance(latest_owner_record, Mapping):
+                _record_shared_session_on_lifecycle(self.session_lifecycle, latest_owner_record)
+            self.engine = None
+            self._last_engine_acquire = None
             self._validated_runtime_files = None
             return
 
@@ -566,6 +1363,28 @@ class MATLABSessionCapsule:
                 "session_bootstrap": None,
             }
             record_matlab_session_reuse(self.session_lifecycle)
+            return self.engine
+
+        if self.session_owner is not None:
+            if self._validated_runtime_files is None and self.runtime_file_validator is not None:
+                self.validate_runtime_files(self.runtime_file_validator)
+            engine, acquire_record = self.session_owner.ensure_engine(
+                consumer=self.consumer,
+                runtime_dir=self.runtime_dir,
+                entrypoint=self.entrypoint,
+                startup_failure_prefix=self.startup_failure_prefix,
+                addpath_failure_prefix=self.addpath_failure_prefix,
+            )
+            session_bootstrap = record_matlab_session_shared_owner_acquire(
+                self.session_lifecycle,
+                acquire_record,
+            )
+            engine_acquire_mode = str(acquire_record.get("engine_acquire_mode") or "owner_reuse")
+            self.engine = engine
+            self._last_engine_acquire = {
+                "engine_reused_this_call": engine_acquire_mode in {"connect_existing", "owner_reuse"},
+                "session_bootstrap": session_bootstrap,
+            }
             return self.engine
 
         factory_metrics: Mapping[str, Any] | None = None
@@ -734,6 +1553,11 @@ def snapshot_matlab_session_lifecycle(session: Mapping[str, Any]) -> dict[str, A
         "last_reuse": session.get("last_reuse"),
         "last_runtime_file_validation": session.get("last_runtime_file_validation"),
         "last_teardown": session.get("last_teardown"),
+        **(
+            {"shared_session": dict(session["shared_session"])}
+            if isinstance(session.get("shared_session"), Mapping)
+            else {}
+        ),
     }
 
 
