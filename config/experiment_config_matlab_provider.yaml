@@ -416,6 +416,9 @@ pipeline:
     # Experiment 1 使用 MATLAB-backed box_sum，并用 image_warp 应用 transform。
     method: "box_sum"
     provider: "matlab"
+    # 积分窗口尺寸 [Z, Y, X]，单位 pixel；这是完整窗口边长，不是半径。
+    # PyStar native 和 PyStar MATLAB provider 都按完整 box size 解释，当前 [3,3,3] 表示 3x3x3 小立方体积分。
+    # 若对齐 legacy STATES/core_matlab 的 voxel_size，要注意 MATLAB voxel_size 是 half-width：voxel_size [1,1,1] 等价这里的 integration_box [3,3,3]。
     integration_box: [3, 3, 3]
     handle_out_of_bounds: "pad_zero"
     transform_application_mode: "image_warp"
