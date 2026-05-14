@@ -35,9 +35,9 @@
 
 ## `providers`
 
-`providers.matlab` 记录 MATLAB provider seam 的 runtime 路径和入口函数。它用于开发验证和兼容性测试；默认 pipeline 仍使用 `provider: native`。
+`providers.matlab` 记录 MATLAB provider seam 的 runtime 路径和入口函数。默认 pipeline 仍使用 `provider: native`；当用户显式选择 MATLAB provider 且 runtime manifest、entrypoint、transform artifact、`flow_3d` sidecar、scope metadata 与 schema 合同都验证通过时，MATLAB provider 路线可以参与 release-valid `image_warp` provenance。
 
-如果手动启用 MATLAB provider，请把它视为实验功能。MATLAB provider 不做静默 fallback：MATLAB runtime 或 MATLAB Engine 不可用时应直接失败。
+MATLAB provider 不做静默 fallback：MATLAB runtime、MATLAB Engine、entrypoint、sidecar 或输出 schema 不可用/不合法时应直接失败，而不是自动回退到 native provider。
 
 `providers.matlab.shared_session` 是可选的 MATLAB Engine 复用配置，当前由 `scripts/batch_pystar.py` 使用：
 
@@ -105,6 +105,6 @@
 
 ## MATLAB provider 状态
 
-当前 PyStar 可以通过 MATLAB provider 调用 MATLAB-backed preprocessing/registration/spot finding/extraction seam；内部 benchmark 中，全 MATLAB-provider 路线已经能接近 STATE。这个能力仍处于测试阶段，不是默认生产路径，也不替代 Python-native 示例配置。
+当前 PyStar 可以通过 MATLAB provider 调用 MATLAB-backed preprocessing/registration/spot finding/extraction seam；内部 benchmark 中，全 MATLAB-provider 路线已经能接近 STATE。这个能力按合同验证发布：provider 名称本身不会自动把 release contract 降级为 `debug_only`，但 runtime manifest、transform manifest、`flow_3d` sidecar、field semantics、scope metadata、spot/intensity schema 任一不满足合同都会 fail loudly，`image_warp` 也仍要求 `release_gate.status == "valid"`。
 
-如果需要复现实验性 all-MATLAB provider 路线，请从 `experiment_config_matlab_provider.yaml` 开始改路径。该示例的算法参数对齐 2026-04-28 Experiment 1 MATLAB-provider as-run 配置；它保留 `scope_mode: full_fov`，但 local registration 使用 MATLAB subtile 4x4 tiling；这和“只处理一个 tile_local”不同，输出仍覆盖完整 Position。
+如果需要复现 all-MATLAB provider 路线，请从 `experiment_config_matlab_provider.yaml` 开始改路径。该示例的算法参数对齐 2026-04-28 Experiment 1 MATLAB-provider as-run 配置；它保留 `scope_mode: full_fov`，但 local registration 使用 MATLAB subtile 4x4 tiling；这和“只处理一个 tile_local”不同，输出仍覆盖完整 Position。`coordinate_mapping` 仍是 legacy diagnostic 路线，不随 MATLAB provider 的 `image_warp` 合同提升而变成 release-valid。

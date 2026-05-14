@@ -1,6 +1,6 @@
 # PyStar
 
-PyStar 是一个面向空间转录组图像处理的 Python 管道，覆盖从原始显微镜图像到解码结果的主要处理链路。当前发布口径以 **Python-native PyStar 流程** 为主线；仓库中同时保留 MATLAB 兼容/提供者相关实现。MATLAB provider 现在可以通过 PyStar 调用，并在内部 benchmark 中接近 STATE，但仍处于测试阶段，不属于默认生产工作流。
+PyStar 是一个面向空间转录组图像处理的 Python 管道，覆盖从原始显微镜图像到解码结果的主要处理链路。当前默认入口仍以 **Python-native PyStar 流程** 为主线；仓库中同时保留 MATLAB 兼容/提供者相关实现。MATLAB provider 可以通过 PyStar 调用，并可在 runtime manifest、transform artifact、sidecar、scope metadata 与 schema 合同全部验证通过时参与 release-valid `image_warp` 工作流。
 
 ## 当前支持状态
 
@@ -9,13 +9,14 @@ PyStar 是一个面向空间转录组图像处理的 Python 管道，覆盖从�
 - 当前推荐的 native spot finding baseline（`algorithm: peak_local_max`）
 - 本次同步纳入的非 MATLAB 运行时改进
 - 以 `config/experiment_config.yaml` 为示例入口、在本仓库内运行的 Python 管道
+- 基于合同验证的 MATLAB provider 路线：当 MATLAB runtime manifest、entrypoint、transform manifest、`flow_3d` sidecar、field semantics、scope metadata 与 spot/intensity schema 均通过 fail-loud 校验时，MATLAB preprocessing/registration/spot finding/extraction 可用于 release-valid `image_warp` provenance。
 
-### 实验性 / 暂不支持
-- `provider='matlab'` 的运行时调用路径（可以调用，但仍是 testing/experimental path）
-- MATLAB compatibility/provider 集成的生产化承诺
-- MATLAB-backed 的默认生产工作流、对外承诺或发布级支持
+### 仍需注意
+- Python-native 示例仍是默认入口；MATLAB-backed 路线需要用户显式配置 `provider: matlab` 并准备可用的 MATLAB Engine 与仓库内 runtime 资源。
+- `coordinate_mapping` 仍是 legacy diagnostic 路线，不随 MATLAB provider 的 `image_warp` 合同提升而变成 release-valid。
+- MATLAB provider 不做静默 fallback：MATLAB runtime、entrypoint、sidecar 或输出 schema 不满足合同时会直接失败，而不是自动回退到 native provider。
 
-> MATLAB 相关代码和 `matlab_runtime/` 资源保留在仓库中，目的是让开发与验证工作保持可见。它们可以被 PyStar provider seam 调用，但仍处于主动测试阶段，不应被视为当前 release-ready 能力。
+> MATLAB 相关代码和 `matlab_runtime/` 资源保留在仓库中，目的是让开发、验证和兼容性工作保持可见。它们可以被 PyStar provider seam 调用；release-valid 与否由持久化 artifact 合同决定，而不是由 provider 名称本身决定。
 
 ## 安装
 
@@ -41,12 +42,12 @@ pixi run --manifest-path env/pixi.toml -e pystar python -c "import pystar; print
 ### 1. 准备配置文件
 
 - 示例配置：`config/experiment_config.yaml`
-- MATLAB-provider parity 示例：`config/experiment_config_matlab_provider.yaml`（实验性；算法/provider/tiling 参数参照 2026-04-28 Experiment 1 MATLAB-provider as-run 配置，用于对齐 all-MATLAB/STATES 风格流程）
+- MATLAB-provider parity 示例：`config/experiment_config_matlab_provider.yaml`（算法/provider/tiling 参数参照 2026-04-28 Experiment 1 MATLAB-provider as-run 配置，用于对齐 all-MATLAB/STATES 风格流程；release-valid 取决于 artifact 合同校验）
 - 配置说明：`config/README.md`
 - 当前示例配置默认走 **Python-native** 主线（`provider: native`）
 - 示例配置里的 `dataset.raw_data_path`、`codebook.gene_list` 和 `pipeline.output.directory` 仍是集群上的站点路径；在你自己的环境中运行前，请先改成可访问的本地/集群路径
 - 当前示例使用 `pipeline.spot_finding.algorithm: peak_local_max`，参考阈值为 `threshold_rel: 0.1`
-- 若你手动启用 MATLAB provider，请将其视为测试功能，而不是默认生产路径；MATLAB-provider 示例中的 local registration 使用 full-FOV 覆盖下的 4x4 subtile tiling。示例中的数据路径仍是发布站点占位路径，运行前必须按实际数据修改。
+- 若你手动启用 MATLAB provider，请确认 MATLAB Engine、runtime manifest、entrypoint、transform sidecar 与 schema 合同都可用；MATLAB-provider 示例中的 local registration 使用 full-FOV 覆盖下的 4x4 subtile tiling。示例中的数据路径仍是发布站点占位路径，运行前必须按实际数据修改。
 
 ### 2. 运行完整单个 FOV 流程
 
@@ -112,7 +113,7 @@ repo-root/
 │   ├── matlab_registration.py
 │   ├── matlab_spot_finding.py
 │   └── matlab_extraction.py
-├── matlab_runtime/          # 实验性 MATLAB provider 运行时资源（非当前支持主线）
+├── matlab_runtime/          # MATLAB provider 运行时资源（release 合同由 artifact 校验决定）
 ├── config/
 ├── scripts/
 ├── env/
@@ -142,7 +143,7 @@ repo-root/
 可选/按需依赖：
 - cupy / dask-cuda（GPU 相关实验）
 - spotiflow（特定 spot-finding 算法）
-- MATLAB Engine for Python（仅实验性 provider seam）
+- MATLAB Engine for Python（仅在显式启用 MATLAB provider 时需要）
 
 ## MATLAB 相关说明
 
@@ -152,11 +153,11 @@ repo-root/
 - `scripts/check_matlab_engine.py`
 - `sitecustomize.py`
 
-这些内容用于**开发、验证和未来兼容性工作**。当前发布说明下：
+这些内容用于**开发、验证和兼容性工作**。当前发布说明下：
 - 它们可以通过 PyStar provider seam 被调用
-- 它们不是默认路径
-- 它们不是生产承诺
-- 它们失败时应显式报错，而不是静默回退成受支持路径
+- 它们不是默认路径，需要显式配置 MATLAB provider
+- 它们的 release-valid 状态由 runtime manifest、transform artifact、sidecar、field semantics、scope metadata 和 schema 合同决定
+- 它们失败时应显式报错，而不是静默回退成 native 路径
 
 ## 许可证
 
