@@ -23,6 +23,7 @@ import yaml
 
 from .infrastructure import ExperimentConfig
 from .io import (
+    MATLAB_STAGE_ARTIFACT_CONTRACT_SUPPORTED,
     MATLAB_STAGE_CONFIG_SURFACES,
     MATLAB_STAGE_PYTHON_OWNED_ARTIFACTS,
     get_fov_output_structure,
@@ -102,15 +103,10 @@ def write_preprocessing_provenance(base_dir: Path, fov_id: int, provenance: Mapp
             "artifact_owner": "python_pystar",
             "python_owned_artifacts": list(MATLAB_STAGE_PYTHON_OWNED_ARTIFACTS["preprocessing"]),
             "failure_contract": "fail_loud_no_fallback",
-            "current_support_status": "debug_only" if matlab_requested else "not_selected",
-            "promotion_blockers": (
-                [
-                    "representative_benchmark_recovery_pending",
-                    "production_verification_pending",
-                ]
-                if matlab_requested
-                else []
+            "current_support_status": (
+                MATLAB_STAGE_ARTIFACT_CONTRACT_SUPPORTED if matlab_requested else "not_selected"
             ),
+            "promotion_blockers": [],
         }
     merged_provenance["matlab_stage_contract"] = stage_contract
     temp_path.write_text(

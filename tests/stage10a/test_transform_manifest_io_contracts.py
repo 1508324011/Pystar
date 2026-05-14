@@ -21,6 +21,7 @@ from pystar.io import (
     materialize_round_transform_entry,
     save_transform_manifest,
 )
+from pystar.mining import SignalMiner
 
 
 FOV_ID = 7
@@ -82,7 +83,17 @@ def _build_transform_bundle(flow_3d: FloatArray) -> dict[object, object]:
     }
 
 
-def _build_minimal_config(*, output_dir: Path) -> ExperimentConfig:
+def _build_minimal_config(
+    *,
+    output_dir: Path,
+    preprocessing_provider: str = "native",
+    registration_global_provider: str = "native",
+    registration_local_provider: str = "native",
+    spot_finding_provider: str = "native",
+    extraction_provider: str = "native",
+    transform_application_mode: str = "image_warp",
+    local_method: str = "demons_3d",
+) -> ExperimentConfig:
     field_semantics = SimpleNamespace(
         representation="residual",
         composition="sequential_global_then_local",
@@ -91,28 +102,50 @@ def _build_minimal_config(*, output_dir: Path) -> ExperimentConfig:
     registration = SimpleNamespace(
         reference_round=1,
         field_semantics=field_semantics,
-        global_provider="native",
-        local_provider="native",
+        global_provider=registration_global_provider,
+        local_provider=registration_local_provider,
         enable_local=True,
         global_stage=SimpleNamespace(method="phase_corr_3d"),
-        local_method="demons_3d",
+        local_method=local_method,
     )
-    preprocessing = SimpleNamespace(sequence=[SimpleNamespace(method="synthetic_clean", provider="native")])
+    preprocessing = SimpleNamespace(
+        sequence=[SimpleNamespace(method="synthetic_clean", provider=preprocessing_provider)]
+    )
     pipeline = SimpleNamespace(
         scope_mode="full_fov",
         accelerator="cpu",
         field_semantics=field_semantics,
         preprocessing=preprocessing,
         registration=registration,
-        spot_finding=SimpleNamespace(provider="native"),
-        extraction=SimpleNamespace(provider="native", transform_application_mode="image_warp"),
+        spot_finding=SimpleNamespace(provider=spot_finding_provider),
+        extraction=SimpleNamespace(
+            provider=extraction_provider,
+            transform_application_mode=transform_application_mode,
+        ),
         output=SimpleNamespace(directory=str(output_dir)),
     )
-    pipeline.preprocessing_provider_mode = lambda: "native_only"
-    pipeline.registration_provider_mode = lambda: "native_only"
-    pipeline.uses_matlab_preprocessing = lambda: False
-    pipeline.uses_matlab_spot_finding = lambda: False
-    pipeline.uses_matlab_extraction = lambda: False
+    pipeline.preprocessing_providers_used = lambda: sorted(
+        {step.provider for step in pipeline.preprocessing.sequence}
+    )
+    pipeline.preprocessing_provider_mode = lambda: (
+        "native_only"
+        if set(pipeline.preprocessing_providers_used()) == {"native"}
+        else "matlab_only"
+        if set(pipeline.preprocessing_providers_used()) == {"matlab"}
+        else "mixed"
+    )
+    pipeline.registration_provider_mode = lambda: (
+        "native_only"
+        if registration.global_provider == "native" and registration.local_provider in {None, "native"}
+        else "matlab_only"
+        if registration.global_provider == "matlab" and registration.local_provider in {None, "matlab"}
+        else "mixed"
+    )
+    pipeline.uses_matlab_preprocessing = lambda: any(
+        step.provider == "matlab" for step in pipeline.preprocessing.sequence
+    )
+    pipeline.uses_matlab_spot_finding = lambda: pipeline.spot_finding.provider == "matlab"
+    pipeline.uses_matlab_extraction = lambda: pipeline.extraction.provider == "matlab"
     return cast(ExperimentConfig, cast(object, SimpleNamespace(pipeline=pipeline)))
 
 
@@ -180,6 +213,183 @@ def _descriptor(round_payload: dict[str, object]) -> dict[str, object]:
 
 def _provenance_payload(manifest: ManifestPayload) -> dict[str, object]:
     return cast(dict[str, object], manifest["_provenance"])
+
+
+def _release_gate(contract: dict[str, object]) -> dict[str, object]:
+    return cast(dict[str, object], contract["release_gate"])
+
+
+def _requested_intent(contract: dict[str, object]) -> dict[str, object]:
+    return cast(dict[str, object], contract["requested_intent"])
+
+
+def _assert_image_warp_contract_accepted_by_signal_miner(contract: dict[str, object]) -> None:
+    miner = cast(SignalMiner, SignalMiner.__new__(SignalMiner))
+    miner._validate_image_warp_contract(
+        FOV_ID,
+        {"_provenance": {"release_contract": contract}},
+    )
+
+
+def test_release_contract_all_matlab_image_warp_can_be_valid_when_artifacts_validate(tmp_path: Path) -> None:
+    flow_3d = np.arange(3 * 2 * 4 * 4, dtype=np.float32).reshape(3, 2, 4, 4)
+    transforms = _build_transform_bundle(flow_3d)
+    cfg = _build_minimal_config(
+        output_dir=tmp_path,
+        preprocessing_provider="matlab",
+        registration_global_provider="matlab",
+        registration_local_provider="matlab",
+        spot_finding_provider="matlab",
+        extraction_provider="matlab",
+    )
+
+    contract = cast(dict[str, object], build_release_contract(cfg, transforms))
+    gate = _release_gate(contract)
+    requested_intent = _requested_intent(contract)
+    execution_envelope = cast(dict[str, object], requested_intent["execution_envelope"])
+    registration_profile = cast(dict[str, object], requested_intent["registration_profile"])
+    stage_contracts = cast(dict[str, dict[str, object]], requested_intent["matlab_stage_contracts"])
+
+    assert gate["status"] == "valid"
+    assert gate["reasons"] == []
+    assert cast(dict[str, object], gate["gate0"])["passed"] is True
+    assert execution_envelope["preprocessing_backend"] == "matlab_extracted"
+    assert execution_envelope["registration_backend"] == "matlab_extracted"
+    assert registration_profile["supports_image_warp_mainline"] is True
+    assert registration_profile["declared_transform_capabilities"] == ["global_shift_3d", "flow_3d"]
+    for stage_name in ("preprocessing", "registration", "spot_finding", "extraction"):
+        assert stage_contracts[stage_name]["matlab_requested"] is True
+        assert stage_contracts[stage_name]["current_support_status"] == "artifact_contract_supported"
+        assert stage_contracts[stage_name]["promotion_blockers"] == []
+
+    _assert_image_warp_contract_accepted_by_signal_miner(contract)
+
+
+def test_release_contract_mixed_matlab_provider_image_warp_can_be_valid_when_artifacts_validate(tmp_path: Path) -> None:
+    flow_3d = np.arange(3 * 2 * 4 * 4, dtype=np.float32).reshape(3, 2, 4, 4)
+    transforms = _build_transform_bundle(flow_3d)
+    cfg = _build_minimal_config(
+        output_dir=tmp_path,
+        registration_global_provider="matlab",
+        registration_local_provider="native",
+    )
+
+    contract = cast(dict[str, object], build_release_contract(cfg, transforms))
+    gate = _release_gate(contract)
+    requested_intent = _requested_intent(contract)
+    execution_envelope = cast(dict[str, object], requested_intent["execution_envelope"])
+    stage_contracts = cast(dict[str, dict[str, object]], requested_intent["matlab_stage_contracts"])
+
+    assert gate["status"] == "valid"
+    assert gate["reasons"] == []
+    assert execution_envelope["registration_backend"] == "provider_dispatch"
+    assert stage_contracts["registration"]["matlab_requested"] is True
+    assert stage_contracts["registration"]["current_support_status"] == "artifact_contract_supported"
+    assert stage_contracts["registration"]["promotion_blockers"] == []
+
+    _assert_image_warp_contract_accepted_by_signal_miner(contract)
+
+
+def test_release_contract_rejects_unsupported_matlab_local_method_loudly(tmp_path: Path) -> None:
+    flow_3d = np.arange(3 * 2 * 4 * 4, dtype=np.float32).reshape(3, 2, 4, 4)
+    cfg = _build_minimal_config(
+        output_dir=tmp_path,
+        registration_global_provider="matlab",
+        registration_local_provider="matlab",
+        local_method="optical_flow",
+    )
+
+    with pytest.raises(ValueError, match="registration.local.provider='matlab'.*demons_3d"):
+        _ = build_release_contract(cfg, _build_transform_bundle(flow_3d))
+
+
+def test_release_contract_matlab_spot_finding_and_extraction_do_not_force_debug_only(tmp_path: Path) -> None:
+    flow_3d = np.arange(3 * 2 * 4 * 4, dtype=np.float32).reshape(3, 2, 4, 4)
+    cfg = _build_minimal_config(
+        output_dir=tmp_path,
+        spot_finding_provider="matlab",
+        extraction_provider="matlab",
+    )
+
+    contract = cast(dict[str, object], build_release_contract(cfg, _build_transform_bundle(flow_3d)))
+    gate = _release_gate(contract)
+    requested_intent = _requested_intent(contract)
+    stage_contracts = cast(dict[str, dict[str, object]], requested_intent["matlab_stage_contracts"])
+
+    assert gate["status"] == "valid"
+    assert gate["reasons"] == []
+    assert requested_intent["application_intent"] == (
+        "artifact_contract_image_warp_matlab_spot_finding_extraction_provider"
+    )
+    assert stage_contracts["registration"]["matlab_requested"] is False
+    for stage_name in ("spot_finding", "extraction"):
+        assert stage_contracts[stage_name]["matlab_requested"] is True
+        assert stage_contracts[stage_name]["current_support_status"] == "artifact_contract_supported"
+        assert stage_contracts[stage_name]["promotion_blockers"] == []
+
+    _assert_image_warp_contract_accepted_by_signal_miner(contract)
+
+
+def test_release_contract_invalid_matlab_image_warp_artifacts_remain_non_valid(tmp_path: Path) -> None:
+    transforms = _build_transform_bundle(np.zeros((3, 2, 4, 4), dtype=np.float32))
+    round_two = _round_entry(transforms, 2)
+    round_two["flow_3d"] = None
+    cfg = _build_minimal_config(
+        output_dir=tmp_path,
+        preprocessing_provider="matlab",
+        registration_global_provider="matlab",
+        registration_local_provider="matlab",
+        spot_finding_provider="matlab",
+        extraction_provider="matlab",
+    )
+
+    contract = cast(dict[str, object], build_release_contract(cfg, transforms))
+    gate = _release_gate(contract)
+
+    assert gate["status"] == "invalid"
+    assert cast(dict[str, object], gate["gate0"])["passed"] is False
+    assert "missing rounds: [2]" in cast(list[str], gate["reasons"])[0]
+    with pytest.raises(ValueError, match="status='invalid'"):
+        _assert_image_warp_contract_accepted_by_signal_miner(contract)
+
+
+def test_release_contract_invalid_matlab_field_semantics_remain_non_valid(tmp_path: Path) -> None:
+    transforms = _build_transform_bundle(np.zeros((3, 2, 4, 4), dtype=np.float32))
+    round_two = _round_entry(transforms, 2)
+    semantics = cast(dict[str, object], round_two["_semantics"])
+    semantics["representation"] = "total"
+    cfg = _build_minimal_config(
+        output_dir=tmp_path,
+        preprocessing_provider="matlab",
+        registration_global_provider="matlab",
+        registration_local_provider="matlab",
+        spot_finding_provider="matlab",
+        extraction_provider="matlab",
+    )
+
+    contract = cast(dict[str, object], build_release_contract(cfg, transforms))
+    gate = _release_gate(contract)
+
+    assert gate["status"] == "invalid"
+    assert "Persisted round-level _semantics do not match" in cast(list[str], gate["reasons"])[0]
+    with pytest.raises(ValueError, match="status='invalid'"):
+        _assert_image_warp_contract_accepted_by_signal_miner(contract)
+
+
+def test_release_contract_coordinate_mapping_stays_debug_only_and_signal_miner_rejects(tmp_path: Path) -> None:
+    flow_3d = np.arange(3 * 2 * 4 * 4, dtype=np.float32).reshape(3, 2, 4, 4)
+    cfg = _build_minimal_config(
+        output_dir=tmp_path,
+        transform_application_mode="coordinate_mapping",
+    )
+
+    contract = cast(dict[str, object], build_release_contract(cfg, _build_transform_bundle(flow_3d)))
+    gate = _release_gate(contract)
+
+    assert gate["status"] == "debug_only"
+    assert cast(dict[str, object], gate["gate0"])["required"] is False
+    with pytest.raises(ValueError, match="status='debug_only'"):
+        _assert_image_warp_contract_accepted_by_signal_miner(contract)
 
 
 def test_transform_manifest_public_io_preserves_legacy_shape_and_eager_lazy_flow_loading(tmp_path: Path) -> None:

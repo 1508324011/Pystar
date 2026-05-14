@@ -65,7 +65,16 @@ EXECUTION_ENVELOPE_ALLOWED_VALUES = {
     "accelerator": {"cpu"},
 }
 
-MATLAB_STAGE_SUPPORT_STATUSES = {"debug_only", "not_selected"}
+# New MATLAB-provider writes use a contract-based status.  ``debug_only`` stays
+# accepted for legacy manifests and explicit diagnostic-only provenance, but it
+# is no longer the automatic status for a stage merely because it selected a
+# MATLAB provider.
+MATLAB_STAGE_ARTIFACT_CONTRACT_SUPPORTED = "artifact_contract_supported"
+MATLAB_STAGE_SUPPORT_STATUSES = {
+    MATLAB_STAGE_ARTIFACT_CONTRACT_SUPPORTED,
+    "debug_only",
+    "not_selected",
+}
 MATLAB_STAGE_REQUIRED_PROMOTION_BLOCKERS = (
     "representative_benchmark_recovery_pending",
     "production_verification_pending",
@@ -132,11 +141,8 @@ def _build_matlab_stage_contract_entry(
         "failure_contract": "fail_loud_no_fallback",
     }
     if matlab_requested:
-        contract["current_support_status"] = "debug_only"
-        contract["promotion_blockers"] = [
-            "representative_benchmark_recovery_pending",
-            "production_verification_pending",
-        ]
+        contract["current_support_status"] = MATLAB_STAGE_ARTIFACT_CONTRACT_SUPPORTED
+        contract["promotion_blockers"] = []
     else:
         contract["current_support_status"] = "not_selected"
         contract["promotion_blockers"] = []
@@ -244,20 +250,30 @@ def _validate_matlab_stage_contracts(stage_contracts: Any) -> None:
 
         matlab_requested = bool(contract.get("matlab_requested"))
         if matlab_requested:
-            if current_support_status != "debug_only":
+            if current_support_status == MATLAB_STAGE_ARTIFACT_CONTRACT_SUPPORTED:
+                if promotion_blockers:
+                    raise ValueError(
+                        f"matlab_stage_contracts.{stage_name}.promotion_blockers must be empty "
+                        "when current_support_status='artifact_contract_supported'"
+                    )
+            elif current_support_status == "debug_only":
+                # Legacy/debug-only manifests remain readable, but new contract
+                # writes should not reach this branch unless a caller explicitly
+                # chose diagnostic-only provenance.
+                missing_blockers = [
+                    blocker
+                    for blocker in MATLAB_STAGE_REQUIRED_PROMOTION_BLOCKERS
+                    if blocker not in promotion_blockers
+                ]
+                if missing_blockers:
+                    raise ValueError(
+                        f"matlab_stage_contracts.{stage_name}.promotion_blockers is missing required blockers: "
+                        f"{missing_blockers}"
+                    )
+            else:
                 raise ValueError(
-                    f"matlab_stage_contracts.{stage_name}.current_support_status must stay 'debug_only' "
-                    "while the MATLAB provider seam remains benchmark-blocked"
-                )
-            missing_blockers = [
-                blocker
-                for blocker in MATLAB_STAGE_REQUIRED_PROMOTION_BLOCKERS
-                if blocker not in promotion_blockers
-            ]
-            if missing_blockers:
-                raise ValueError(
-                    f"matlab_stage_contracts.{stage_name}.promotion_blockers is missing required blockers: "
-                    f"{missing_blockers}"
+                    f"matlab_stage_contracts.{stage_name}.current_support_status must be "
+                    f"'artifact_contract_supported' or legacy 'debug_only' when matlab_requested=true"
                 )
         else:
             if current_support_status != "not_selected":
@@ -632,14 +648,14 @@ def derive_registration_profile(config: ExperimentConfig) -> Dict[str, Any]:
     if not reg_cfg.enable_local:
         if global_provider == "matlab":
             return {
-                "name": "matlab_global_shift_only_experimental",
+                "name": "matlab_global_shift_only",
                 "global_method": reg_cfg.global_stage.method,
                 "global_provider": global_provider,
                 "local_method": None,
                 "local_provider": None,
                 "declared_transform_capabilities": ["global_shift_3d"],
                 "supports_image_warp_mainline": False,
-                "backend_mode_status": "experimental_global_only",
+                "backend_mode_status": "global_shift_only",
             }
         return {
             "name": "global_shift_only",
@@ -653,15 +669,20 @@ def derive_registration_profile(config: ExperimentConfig) -> Dict[str, Any]:
         }
 
     if local_provider == "matlab":
+        if reg_cfg.local_method != "demons_3d":
+            raise ValueError(
+                "registration.local.provider='matlab' currently supports only "
+                "local_method='demons_3d' for release-valid image_warp contracts"
+            )
         return {
-            "name": "matlab_demons_3d_experimental",
+            "name": "matlab_demons_3d_provider",
             "global_method": reg_cfg.global_stage.method,
             "global_provider": global_provider,
             "local_method": reg_cfg.local_method,
             "local_provider": local_provider,
             "declared_transform_capabilities": ["global_shift_3d", "flow_3d"],
-            "supports_image_warp_mainline": False,
-            "backend_mode_status": "experimental_local_kernel_swap",
+            "supports_image_warp_mainline": True,
+            "backend_mode_status": MATLAB_STAGE_ARTIFACT_CONTRACT_SUPPORTED,
         }
 
     profile = REGISTRATION_PROFILE_FACTS.get(reg_cfg.local_method)
@@ -669,7 +690,7 @@ def derive_registration_profile(config: ExperimentConfig) -> Dict[str, Any]:
         raise ValueError(f"Unsupported registration profile for local method: {reg_cfg.local_method!r}")
     backend_mode_status = "phase1_mainline"
     if global_provider != "native":
-        backend_mode_status = "experimental_global_only"
+        backend_mode_status = MATLAB_STAGE_ARTIFACT_CONTRACT_SUPPORTED
 
     return {
         **profile,
@@ -954,11 +975,11 @@ def build_release_contract(config: ExperimentConfig, transforms: Mapping[Any, An
 
     reasons: List[str] = []
     status = "valid"
-    non_mainline_execution = not is_phase1_mainline_execution_envelope(execution_envelope)
     uses_matlab_preprocessing = config.pipeline.uses_matlab_preprocessing()
+    uses_matlab_spot_finding = config.pipeline.uses_matlab_spot_finding()
+    uses_matlab_extraction = config.pipeline.uses_matlab_extraction()
     uses_matlab_global = registration_profile.get("global_provider") == "matlab"
     uses_matlab_local = registration_profile.get("local_provider") == "matlab"
-    experimental_matlab_registration = uses_matlab_global or uses_matlab_local
     preprocessing_steps = [
         {
             "method": step.method,
@@ -968,15 +989,22 @@ def build_release_contract(config: ExperimentConfig, transforms: Mapping[Any, An
     ]
     if requested_mode == "coordinate_mapping":
         application_intent = "legacy_debug_path"
-    elif experimental_matlab_registration:
-        if uses_matlab_local:
-            application_intent = "experimental_local_flow_provider_seam"
-        elif uses_matlab_global and registration_profile.get("local_method") is not None:
-            application_intent = "experimental_mixed_provider_dispatch"
-        else:
-            application_intent = "experimental_global_shift_only_provider_seam"
-    elif non_mainline_execution:
-        application_intent = "non_mainline_image_warp_review"
+    elif uses_matlab_local:
+        application_intent = "artifact_contract_image_warp_matlab_local_provider"
+    elif uses_matlab_global and registration_profile.get("local_method") is not None:
+        application_intent = "artifact_contract_image_warp_mixed_provider_dispatch"
+    elif uses_matlab_global:
+        application_intent = "artifact_contract_image_warp_matlab_global_provider"
+    elif uses_matlab_preprocessing:
+        application_intent = "artifact_contract_image_warp_matlab_preprocessing_provider"
+    elif uses_matlab_spot_finding and uses_matlab_extraction:
+        application_intent = "artifact_contract_image_warp_matlab_spot_finding_extraction_provider"
+    elif uses_matlab_spot_finding:
+        application_intent = "artifact_contract_image_warp_matlab_spot_finding_provider"
+    elif uses_matlab_extraction:
+        application_intent = "artifact_contract_image_warp_matlab_extraction_provider"
+    elif not is_phase1_mainline_execution_envelope(execution_envelope):
+        application_intent = "artifact_contract_image_warp_provider_dispatch"
     else:
         application_intent = "formal_rc_mainline"
 
@@ -991,21 +1019,18 @@ def build_release_contract(config: ExperimentConfig, transforms: Mapping[Any, An
             reasons.append(
                 "image_warp mainline requires a registration profile that declares flow_3d capability"
             )
-            if not non_mainline_execution:
-                status = "invalid"
+            status = "invalid"
         if delivered_capability["flow_2d_rounds"]:
             reasons.append(
                 "image_warp mainline does not support flow_2d delivery; use coordinate_mapping for legacy diagnostics"
             )
-            if not non_mainline_execution:
-                status = "invalid"
+            status = "invalid"
         missing_rounds = delivered_capability["missing_flow_3d_rounds"]
         if missing_rounds:
             reasons.append(
                 f"image_warp mainline requires persisted flow_3d for every non-reference round; missing rounds: {missing_rounds}"
             )
-            if not non_mainline_execution:
-                status = "invalid"
+            status = "invalid"
 
     if not scope_contract["scope_valid"]:
         reasons.append(
@@ -1013,41 +1038,9 @@ def build_release_contract(config: ExperimentConfig, transforms: Mapping[Any, An
         )
         status = "invalid"
 
-    if uses_matlab_preprocessing:
-        reasons.append(
-            "preprocessing.sequence selects provider='matlab' as an explicit provider seam; canonical clean_data artifacts remain Python-owned and this run stays debug_only until representative benchmark recovery and production verification widen the support promise"
-        )
-        if status == "valid":
-            status = "debug_only"
-
-    if non_mainline_execution:
-        reasons.append(
-            "Execution envelope is non-mainline for Phase 1 RC: "
-            f"preprocessing_backend={execution_envelope['preprocessing_backend']!r}, "
-            f"registration_backend={execution_envelope['registration_backend']!r}, "
-            f"accelerator={execution_envelope['accelerator']!r}"
-        )
-        if status == "valid":
-            status = "debug_only"
-
-    if experimental_matlab_registration:
-        if uses_matlab_local:
-            reasons.append(
-                "registration method/provider intent uses an experimental MATLAB kernel-swap seam; "
-                "Python-owned manifests/provenance remain authoritative and this run is not a Phase 1 mainline claim"
-            )
-        elif uses_matlab_global and registration_profile.get("local_method") is not None:
-            reasons.append(
-                "registration method/provider intent mixes MATLAB global alignment with native local refinement; "
-                "provider_dispatch remains experimental/debug_only and Python-owned manifests/provenance remain authoritative"
-            )
-        else:
-            reasons.append(
-                "registration method/provider intent uses an experimental MATLAB global-shift-only seam; "
-                "Python-owned manifests/provenance remain authoritative and local flow artifacts are not yet produced"
-            )
-        if status == "valid":
-            status = "debug_only"
+    if not field_semantics_contract["validation"]["valid"]:
+        reasons.extend(field_semantics_contract["validation"]["errors"])
+        status = "invalid"
 
     expected_flow_3d_rounds = [
         round_id
@@ -1099,17 +1092,17 @@ def build_release_contract(config: ExperimentConfig, transforms: Mapping[Any, An
 def validate_execution_envelope(envelope: Dict[str, str]) -> None:
     """
     Validate that execution envelope uses explicitly supported values.
-    Phase 1 RC mainline remains fixed by RC_FACTS, but non-mainline execution
-    envelopes such as matlab_extracted preprocessing are still allowed as
-    explicit debug/non-mainline runs.
+    Phase 1 RC native facts remain fixed by RC_FACTS; MATLAB/provider-dispatch
+    envelopes are also legal provenance when the artifact contracts validate.
     """
 
     for key, allowed_values in EXECUTION_ENVELOPE_ALLOWED_VALUES.items():
         actual_value = envelope.get(key)
-        assert actual_value in allowed_values, (
-            f"Execution envelope mismatch: '{key}' is '{actual_value}', "
-            f"expected one of {sorted(allowed_values)}"
-        )
+        if actual_value not in allowed_values:
+            raise ValueError(
+                f"Execution envelope mismatch: '{key}' is '{actual_value}', "
+                f"expected one of {sorted(allowed_values)}"
+            )
 
 
 def is_phase1_mainline_execution_envelope(envelope: Mapping[str, str]) -> bool:
@@ -2048,7 +2041,7 @@ def build_provenance_summary_markdown(
                 "",
                 "### MATLAB Stage Contract Note",
                 "- These rows describe stage-promotion / support state, not bundle-level transform legality.",
-                "- A bundle-level `Release Status = valid` does not promote any MATLAB-requested stage beyond `debug_only`; promotion still requires representative benchmark recovery and production verification.",
+                "- MATLAB-requested stages can participate in release-valid image_warp workflows when runtime manifests, transform artifacts, sidecars, scope metadata, and schema contracts validate.",
             ]
         )
 
