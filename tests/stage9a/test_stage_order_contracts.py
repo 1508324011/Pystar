@@ -190,15 +190,21 @@ def test_batch_runner_uses_canonical_stage_labels_without_control_flow_rewrite()
     expected_fragments = [
         'log_stage_start(logger, "preprocessing")',
         "sanitize_fov(current_fov)",
+        'record_stage_timing("preprocessing"',
         'log_stage_start(logger, "registration")',
         "data_xr = loader.load_fov(current_fov)",
         "reg_engine.register_fov(data_xr, current_fov)",
+        'record_stage_timing("registration"',
         'log_stage_start(logger, "spot_finding")',
         "find_spots_in_fov(current_fov)",
+        'record_stage_timing("spot_finding"',
         'log_stage_start(logger, "signal_extraction")',
         "mine_fov(current_fov)",
+        'record_stage_timing("signal_extraction"',
         'log_stage_start(logger, "decoding")',
         "decode_fov(current_fov)",
+        'record_stage_timing("decoding"',
+        "write_performance_telemetry(",
     ]
 
     fragment_positions = [source.index(fragment) for fragment in expected_fragments]

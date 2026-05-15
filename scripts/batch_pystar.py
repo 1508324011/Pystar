@@ -14,12 +14,12 @@ from pystar.infrastructure import ExperimentConfig, load_config
 from pystar._stage_contracts import get_stage_spec
 from pystar.io import ImageLoader, get_fov_output_structure
 from pystar.matlab_engine_bootstrap import MatlabSharedSessionOwner, should_use_shared_matlab_session
+from pystar._performance_telemetry import record_stage_timing, utc_now_iso, write_performance_telemetry
 from pystar.preprocessing import DataSanitizer
 from pystar.registration import RegistrationEngine
 from pystar.spot_finding import SpotFinder
 from pystar.mining import SignalMiner
 from pystar.decoding import Decoder
-
 
 def log_stage_start(logger: logging.Logger, stage_id: str) -> None:
     """Render the canonical stage label without changing runner control flow."""
@@ -89,6 +89,8 @@ def main():
     logger.info(f"{'='*40}")
 
     start_time_global = time.time()
+    run_started_at_utc = utc_now_iso()
+    stage_timings: list[dict[str, object]] = []
 
     try:
         matlab_session_owner_cm = nullcontext(None)
@@ -101,7 +103,9 @@ def main():
             log_stage_start(logger, "preprocessing")
             sanitizer = DataSanitizer(cfg, matlab_session_owner=matlab_session_owner)
             _ = sanitizer.sanitize_fov(current_fov)
-            logger.info(f"    Done in {time.time() - t0:.2f}s")
+            elapsed_ms = (time.time() - t0) * 1000.0
+            stage_timings.append(record_stage_timing("preprocessing", elapsed_ms))
+            logger.info(f"    Done in {elapsed_ms / 1000.0:.2f}s")
 
             # === Stage 2: Registration ===
             t0 = time.time()
@@ -116,7 +120,9 @@ def main():
             reg_engine = RegistrationEngine(cfg, matlab_session_owner=matlab_session_owner)
             # 跑配准
             _ = reg_engine.register_fov(data_xr, current_fov)
-            logger.info(f"    Done in {time.time() - t0:.2f}s")
+            elapsed_ms = (time.time() - t0) * 1000.0
+            stage_timings.append(record_stage_timing("registration", elapsed_ms))
+            logger.info(f"    Done in {elapsed_ms / 1000.0:.2f}s")
 
             # 显式清理，防止 Dask 图过大
             del data_xr
@@ -127,26 +133,42 @@ def main():
             log_stage_start(logger, "spot_finding")
             finder = SpotFinder(cfg, matlab_session_owner=matlab_session_owner)
             _ = finder.find_spots_in_fov(current_fov)
-            logger.info(f"    Done in {time.time() - t0:.2f}s")
+            elapsed_ms = (time.time() - t0) * 1000.0
+            stage_timings.append(record_stage_timing("spot_finding", elapsed_ms))
+            logger.info(f"    Done in {elapsed_ms / 1000.0:.2f}s")
 
             # === Stage 4: Mining ===
             t0 = time.time()
             log_stage_start(logger, "signal_extraction")
             miner = SignalMiner(cfg, matlab_session_owner=matlab_session_owner)
             _ = miner.mine_fov(current_fov)
-            logger.info(f"    Done in {time.time() - t0:.2f}s")
+            elapsed_ms = (time.time() - t0) * 1000.0
+            stage_timings.append(record_stage_timing("signal_extraction", elapsed_ms))
+            logger.info(f"    Done in {elapsed_ms / 1000.0:.2f}s")
 
             # === Stage 5: Decoding ===
             t0 = time.time()
             log_stage_start(logger, "decoding")
             decoder = Decoder(cfg)
             _ = decoder.decode_fov(current_fov)
-            logger.info(f"    Done in {time.time() - t0:.2f}s")
+            elapsed_ms = (time.time() - t0) * 1000.0
+            stage_timings.append(record_stage_timing("decoding", elapsed_ms))
+            logger.info(f"    Done in {elapsed_ms / 1000.0:.2f}s")
 
         total_time = time.time() - start_time_global
+        telemetry_path = write_performance_telemetry(
+            config=cfg,
+            fov_id=current_fov,
+            stage_timings=stage_timings,
+            run_started_at_utc=run_started_at_utc,
+            run_finished_at_utc=utc_now_iso(),
+            total_elapsed_ms=total_time * 1000.0,
+            require_completed_outputs=True,
+        )
         logger.info(f"{'='*40}")
         logger.info(f" SUCCESS: FOV {current_fov} processing complete.")
         logger.info(f" Total Time: {total_time/60:.2f} minutes")
+        logger.info(f" Performance telemetry: {telemetry_path}")
         logger.info(f"{'='*40}")
 
     except Exception as e:
