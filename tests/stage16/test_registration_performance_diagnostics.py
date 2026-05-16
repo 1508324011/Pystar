@@ -73,6 +73,25 @@ def _session_lifecycle_summary() -> dict[str, Any]:
     }
 
 
+def _matlab_internal_metadata(
+    *,
+    total_duration_ms: float = 100.0,
+    steps: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "round_id": 2,
+        "reference_round": 1,
+        "total_duration_ms": total_duration_ms,
+        "steps": steps
+        if steps is not None
+        else [
+            {"name": "new_LoadMultipageTiff", "duration_ms": 10.0, "details": {"input_count": 2}},
+            {"name": "imregdemons", "duration_ms": 80.0, "details": {"iterations": 50}},
+            {"name": "save_local_flow_mat", "duration_ms": 5.0, "details": {"format": "mat_v7"}},
+        ],
+    }
+
+
 def _providers(provider_mode: str = "native_only") -> dict[str, Any]:
     return {
         "stage_id": "registration",
@@ -181,6 +200,38 @@ def test_matlab_boundary_instrumentation_is_aggregated_without_matlab() -> None:
     assert local_record["session_lifecycle_summary"]["session_count"] == 1
 
 
+def test_global_matlab_steps_do_not_create_local_internal_timing() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    recorder.start_round(2, is_reference_round=False)
+    recorder.record_local_registration(
+        2,
+        elapsed_wall_ms=30.0,
+        provider="matlab",
+        method="demons_3d",
+        status="accepted",
+        final_corr=0.92,
+        backend_metadata={
+            "matlab_metadata": {
+                "round_id": 2,
+                "reference_round": 1,
+                "total_duration_ms": 30.0,
+                "steps": [{"name": "pystar_phasecorr_global_shift", "duration_ms": 25.0}],
+            },
+            "local_flow": {
+                "boundary_instrumentation": _boundary_trace(
+                    stage_name="matlab_registration_local",
+                    matlab_call_ms=60.0,
+                ),
+            },
+        },
+    )
+
+    payload = recorder.build_payload()
+
+    assert "matlab_internal_timing" not in payload["rounds"][0]["local_registration"]
+    assert payload["summary"]["matlab_internal_timing_status"] == "absent"
+
+
 def test_tiled_matlab_local_diagnostics_preserve_tile_identity_and_boundary_mapping() -> None:
     recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
     recorder.start_round(2, is_reference_round=False)
@@ -224,6 +275,233 @@ def test_tiled_matlab_local_diagnostics_preserve_tile_identity_and_boundary_mapp
     assert payload["summary"]["tile_count"] == 1
     assert payload["summary"]["matlab_local_boundary_call_count"] == 1
     assert payload["summary"]["slowest_tiles"][0]["tile_index"] == 3
+
+
+def test_matlab_local_internal_steps_normalize_and_aggregate_without_matlab() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    recorder.start_round(2, is_reference_round=False)
+    boundary = _boundary_trace(stage_name="matlab_registration_local", matlab_call_ms=106.0)
+    recorder.record_local_registration(
+        2,
+        elapsed_wall_ms=120.0,
+        provider="matlab",
+        method="demons_3d",
+        status="accepted",
+        final_corr=0.92,
+        backend_metadata={
+            "local_flow": {
+                "matlab_metadata": _matlab_internal_metadata(),
+                "boundary_instrumentation": boundary,
+            }
+        },
+    )
+
+    payload = recorder.build_payload()
+    local_record = payload["rounds"][0]["local_registration"]
+    internal = local_record["matlab_internal_timing"]
+    summary = payload["summary"]
+
+    assert internal["source"] == "matlab_metadata.steps"
+    assert internal["total_duration_ms"] == 100.0
+    assert internal["step_total_duration_ms"] == 95.0
+    assert internal["unaccounted_duration_ms"] == 5.0
+    assert internal["boundary_matlab_call_ms"] == 106.0
+    assert internal["boundary_minus_matlab_total_ms"] == 6.0
+    assert internal["dominant_step"] == {"name": "imregdemons", "duration_ms": 80.0}
+    assert summary["matlab_internal_timing_status"] == "present"
+    assert summary["matlab_internal_call_count"] == 1
+    assert summary["matlab_internal_total_duration_ms"] == 100.0
+    assert summary["matlab_internal_step_totals_ms"] == {
+        "imregdemons": 80.0,
+        "new_LoadMultipageTiff": 10.0,
+        "save_local_flow_mat": 5.0,
+    }
+    assert summary["matlab_internal_unaccounted_total_ms"] == 5.0
+    assert summary["matlab_boundary_minus_internal_total_ms"] == 6.0
+    assert summary["matlab_internal_dominant_step_counts"] == {"imregdemons": 1}
+    assert summary["slowest_rounds"][0]["matlab_internal_total_duration_ms"] == 100.0
+
+
+def test_tiled_matlab_internal_steps_preserve_dominant_step_and_aggregate() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    recorder.start_round(2, is_reference_round=False)
+
+    tile_identity = {
+        "tile_index": 3,
+        "grid_position_yx": [0, 2],
+        "grid_shape_yx": [2, 2],
+        "region_origin_zyx": [0, 10, 20],
+        "region_shape_zyx": [4, 30, 40],
+        "write_origin_zyx": [0, 12, 22],
+        "write_shape_zyx": [4, 26, 36],
+        "write_offset_zyx": [0, 2, 2],
+    }
+    recorder.record_tiled_local_tile(
+        2,
+        tile_identity=tile_identity,
+        total_elapsed_wall_ms=150.0,
+        extraction_elapsed_wall_ms=5.0,
+        backend_call_elapsed_wall_ms=140.0,
+        flow_validation_elapsed_wall_ms=5.0,
+        boundary_instrumentation=_boundary_trace(stage_name="matlab_registration_local", matlab_call_ms=121.0),
+        normalized_result={"flow_3d_shape": [3, 4, 30, 40], "flow_3d_dtype": "float32"},
+        matlab_metadata=_matlab_internal_metadata(total_duration_ms=118.0),
+    )
+    recorder.record_tiled_local_summary(
+        2,
+        layout_summary={"enabled": True, "grid_shape_yx": [2, 2], "tile_count": 4},
+        stitch_elapsed_wall_ms=6.0,
+    )
+
+    payload = recorder.build_payload()
+    tile = payload["rounds"][0]["tiled_local"]["tiles"][0]
+    summary = payload["summary"]
+    slow_tile = summary["slowest_tiles"][0]
+
+    assert tile["matlab_internal_timing"]["total_duration_ms"] == 118.0
+    assert tile["matlab_internal_timing"]["unaccounted_duration_ms"] == 23.0
+    assert tile["matlab_internal_timing"]["boundary_minus_matlab_total_ms"] == 3.0
+    assert tile["matlab_internal_timing"]["dominant_step"]["name"] == "imregdemons"
+    assert summary["matlab_internal_call_count"] == 1
+    assert summary["matlab_internal_step_totals_ms"]["imregdemons"] == 80.0
+    assert summary["slowest_rounds"][0]["matlab_internal_total_duration_ms"] == 118.0
+    assert slow_tile["tile_index"] == 3
+    assert slow_tile["matlab_internal_total_duration_ms"] == 118.0
+    assert slow_tile["matlab_internal_dominant_step"] == {"name": "imregdemons", "duration_ms": 80.0}
+
+
+def test_missing_matlab_internal_steps_remain_valid_and_absent() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    recorder.start_round(2, is_reference_round=False)
+    recorder.record_local_registration(
+        2,
+        elapsed_wall_ms=30.0,
+        provider="matlab",
+        method="demons_3d",
+        status="accepted",
+        final_corr=0.92,
+        backend_metadata={
+            "local_flow": {
+                "matlab_metadata": {"round_id": 2, "reference_round": 1, "total_duration_ms": 100.0},
+                "boundary_instrumentation": _boundary_trace(stage_name="matlab_registration_local", matlab_call_ms=60.0),
+            }
+        },
+    )
+
+    payload = recorder.build_payload()
+
+    assert "matlab_internal_timing" not in payload["rounds"][0]["local_registration"]
+    assert payload["summary"]["matlab_internal_timing_status"] == "absent"
+    assert payload["summary"]["matlab_internal_call_count"] == 0
+    assert payload["summary"]["matlab_internal_step_totals_ms"] == {}
+
+
+def test_internal_timing_without_boundary_reports_null_closure_delta() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    recorder.start_round(2, is_reference_round=False)
+    recorder.record_local_registration(
+        2,
+        elapsed_wall_ms=120.0,
+        provider="matlab",
+        method="demons_3d",
+        status="accepted",
+        final_corr=0.92,
+        backend_metadata={"local_flow": {"matlab_metadata": _matlab_internal_metadata()}},
+    )
+
+    payload = recorder.build_payload()
+    internal = payload["rounds"][0]["local_registration"]["matlab_internal_timing"]
+
+    assert internal["boundary_matlab_call_ms"] is None
+    assert internal["boundary_minus_matlab_total_ms"] is None
+    assert payload["summary"]["matlab_boundary_minus_internal_total_ms"] is None
+
+
+def test_step_durations_exceeding_total_fail_loudly() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    recorder.start_round(2, is_reference_round=False)
+
+    with pytest.raises(ValueError, match="unaccounted_duration_ms.*step durations exceed"):
+        recorder.record_local_registration(
+            2,
+            elapsed_wall_ms=30.0,
+            provider="matlab",
+            method="demons_3d",
+            status="accepted",
+            final_corr=0.92,
+            backend_metadata={
+                "local_flow": {
+                    "matlab_metadata": _matlab_internal_metadata(
+                        total_duration_ms=10.0,
+                        steps=[{"name": "imregdemons", "duration_ms": 11.0}],
+                    ),
+                }
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("steps", "match"),
+    [
+        ([{"duration_ms": 1.0}], "name"),
+        ([{"name": "imregdemons"}], "duration_ms"),
+        ([{"name": "imregdemons", "duration_ms": -1.0}], "finite and non-negative|non-negative elapsed_wall_ms"),
+        ([{"name": "imregdemons", "duration_ms": float("nan")}], "finite and non-negative"),
+        ([{"name": "imregdemons", "duration_ms": float("inf")}], "finite and non-negative"),
+        ([{"name": "imregdemons", "duration_ms": 1.0, "details": "bad"}], "details"),
+    ],
+)
+def test_malformed_matlab_internal_steps_fail_loudly(steps: list[dict[str, Any]], match: str) -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    recorder.start_round(2, is_reference_round=False)
+
+    with pytest.raises(ValueError, match=match):
+        recorder.record_local_registration(
+            2,
+            elapsed_wall_ms=30.0,
+            provider="matlab",
+            method="demons_3d",
+            status="accepted",
+            final_corr=0.92,
+            backend_metadata={
+                "local_flow": {
+                    "matlab_metadata": _matlab_internal_metadata(steps=steps),
+                    "boundary_instrumentation": _boundary_trace(stage_name="matlab_registration_local", matlab_call_ms=60.0),
+                }
+            },
+        )
+
+
+def test_present_malformed_matlab_internal_block_fails_payload_validation() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    payload = recorder.build_payload()
+    malformed = cast(dict[str, Any], dict(payload))
+    malformed["rounds"] = [
+        {
+            "round_id": 2,
+            "is_reference_round": False,
+            "status": "completed",
+            "local_registration": {
+                "phase_id": "local_registration",
+                "elapsed_wall_ms": 1.0,
+                "status": "completed",
+                "matlab_internal_timing": {
+                    "source": "matlab_metadata.steps",
+                    "status": "present",
+                    "total_duration_ms": 1.0,
+                    "step_total_duration_ms": 1.0,
+                    "unaccounted_duration_ms": 0.0,
+                    "boundary_matlab_call_ms": None,
+                    "boundary_minus_matlab_total_ms": None,
+                    "steps": [{"name": "imregdemons", "duration_ms": True}],
+                    "dominant_step": {"name": "imregdemons", "duration_ms": 1.0},
+                },
+            },
+        }
+    ]
+
+    with pytest.raises(ValueError, match="matlab_internal_timing.*duration_ms"):
+        validate_registration_performance_payload(malformed, expected_fov_id=FOV_ID)
 
 
 def test_elapsed_timing_validation_rejects_negative_nan_and_infinite_values() -> None:

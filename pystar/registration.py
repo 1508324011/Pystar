@@ -871,6 +871,7 @@ def _run_tiled_matlab_demons_registration(
             boundary = tile_backend_metadata.get("boundary_instrumentation")
             session_lifecycle = tile_backend_metadata.get("session_lifecycle")
             session_lifecycle_summary = tile_backend_metadata.get("session_lifecycle_summary")
+            matlab_metadata = tile_backend_metadata.get("matlab_metadata")
             diagnostics.record_tiled_local_tile(
                 round_id,
                 tile_identity=tile.as_dict(),
@@ -890,6 +891,7 @@ def _run_tiled_matlab_demons_registration(
                     else None
                 ),
                 normalized_result=tile_normalized,
+                matlab_metadata=(cast(Mapping[str, Any], matlab_metadata) if isinstance(matlab_metadata, Mapping) else None),
             )
 
     stitch_started = diagnostics_timer_start()

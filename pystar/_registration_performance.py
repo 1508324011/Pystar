@@ -51,6 +51,15 @@ def _validate_elapsed_ms(value: Any, *, field_name: str) -> float:
     return round(elapsed, 3)
 
 
+def _validate_finite_number(value: Any, *, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be a finite numeric value")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} must be finite")
+    return round(number, 3)
+
+
 def _validate_status(value: Any, *, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty status string")
@@ -100,13 +109,21 @@ def _to_float_list(value: Any) -> list[float] | None:
     return [float(item) for item in cast(list[float], array.reshape(-1).tolist())]
 
 
-def _extract_boundary_instrumentation(metadata: Mapping[str, Any] | None) -> dict[str, Any] | None:
+def _extract_boundary_instrumentation(
+    metadata: Mapping[str, Any] | None,
+    *,
+    prefer_local_flow: bool = False,
+) -> dict[str, Any] | None:
     if not isinstance(metadata, Mapping):
         return None
+    local_flow = metadata.get("local_flow")
+    if prefer_local_flow and isinstance(local_flow, Mapping):
+        nested = local_flow.get("boundary_instrumentation")
+        if isinstance(nested, Mapping):
+            return dict(nested)
     direct = metadata.get("boundary_instrumentation")
     if isinstance(direct, Mapping):
         return dict(direct)
-    local_flow = metadata.get("local_flow")
     if isinstance(local_flow, Mapping):
         nested = local_flow.get("boundary_instrumentation")
         if isinstance(nested, Mapping):
@@ -114,13 +131,21 @@ def _extract_boundary_instrumentation(metadata: Mapping[str, Any] | None) -> dic
     return None
 
 
-def _extract_session_lifecycle_summary(metadata: Mapping[str, Any] | None) -> dict[str, Any] | None:
+def _extract_session_lifecycle_summary(
+    metadata: Mapping[str, Any] | None,
+    *,
+    prefer_local_flow: bool = False,
+) -> dict[str, Any] | None:
     if not isinstance(metadata, Mapping):
         return None
+    local_flow = metadata.get("local_flow")
+    if prefer_local_flow and isinstance(local_flow, Mapping):
+        nested = local_flow.get("session_lifecycle_summary")
+        if isinstance(nested, Mapping):
+            return dict(nested)
     direct = metadata.get("session_lifecycle_summary")
     if isinstance(direct, Mapping):
         return dict(direct)
-    local_flow = metadata.get("local_flow")
     if isinstance(local_flow, Mapping):
         nested = local_flow.get("session_lifecycle_summary")
         if isinstance(nested, Mapping):
@@ -128,17 +153,53 @@ def _extract_session_lifecycle_summary(metadata: Mapping[str, Any] | None) -> di
     return None
 
 
-def _extract_session_lifecycle(metadata: Mapping[str, Any] | None) -> dict[str, Any] | None:
+def _extract_session_lifecycle(
+    metadata: Mapping[str, Any] | None,
+    *,
+    prefer_local_flow: bool = False,
+) -> dict[str, Any] | None:
     if not isinstance(metadata, Mapping):
         return None
+    local_flow = metadata.get("local_flow")
+    if prefer_local_flow and isinstance(local_flow, Mapping):
+        nested = local_flow.get("session_lifecycle")
+        if isinstance(nested, Mapping):
+            return dict(nested)
     direct = metadata.get("session_lifecycle")
     if isinstance(direct, Mapping):
         return dict(direct)
-    local_flow = metadata.get("local_flow")
     if isinstance(local_flow, Mapping):
         nested = local_flow.get("session_lifecycle")
         if isinstance(nested, Mapping):
             return dict(nested)
+    return None
+
+
+def _is_local_matlab_metadata(metadata: Mapping[str, Any]) -> bool:
+    return any(
+        key in metadata
+        for key in (
+            "flow_storage_format",
+            "flow_variable",
+            "flow_layout",
+            "flow_shape_yxz_component",
+        )
+    )
+
+
+def _extract_matlab_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Return MATLAB local-call metadata without mistaking global metadata for local timing."""
+
+    if not isinstance(metadata, Mapping):
+        return None
+    local_flow = metadata.get("local_flow")
+    if isinstance(local_flow, Mapping):
+        nested = local_flow.get("matlab_metadata")
+        if isinstance(nested, Mapping):
+            return dict(nested)
+    direct = metadata.get("matlab_metadata")
+    if isinstance(direct, Mapping) and _is_local_matlab_metadata(direct):
+        return dict(direct)
     return None
 
 
@@ -162,6 +223,175 @@ def _validate_boundary_instrumentation(boundary: Mapping[str, Any], *, field_nam
     total_duration = boundary.get("total_duration_ms")
     if total_duration is not None:
         _ = _validate_elapsed_ms(total_duration, field_name=f"{field_name}.total_duration_ms")
+
+
+def _boundary_matlab_call_ms(boundary: Mapping[str, Any] | None, *, field_name: str) -> float | None:
+    if not isinstance(boundary, Mapping):
+        return None
+    seam_costs = _boundary_seam_costs(boundary)
+    if "matlab_call_ms" not in seam_costs:
+        return None
+    return _validate_elapsed_ms(
+        seam_costs.get("matlab_call_ms"),
+        field_name=f"{field_name}.seam_costs_ms.matlab_call_ms",
+    )
+
+
+def normalize_matlab_internal_timing(
+    matlab_metadata: Mapping[str, Any] | None,
+    *,
+    boundary_instrumentation: Mapping[str, Any] | None = None,
+    field_name: str = "matlab_metadata",
+) -> dict[str, Any] | None:
+    """Normalize MATLAB local demons ``metadata.steps`` into diagnostics shape.
+
+    Missing ``steps`` means older/native metadata did not claim internal timing and
+    remains compatible.  Present-but-malformed timing fails loudly with the
+    offending field path.
+    """
+
+    if not isinstance(matlab_metadata, Mapping):
+        return None
+    if "steps" not in matlab_metadata or matlab_metadata.get("steps") is None:
+        return None
+
+    steps_value = matlab_metadata.get("steps")
+    if not isinstance(steps_value, Sequence) or isinstance(steps_value, (str, bytes)) or not steps_value:
+        raise ValueError(f"{field_name}.steps must be a non-empty sequence of timing mappings")
+
+    normalized_steps: list[dict[str, Any]] = []
+    for index, raw_step in enumerate(steps_value):
+        step_field = f"{field_name}.steps[{index}]"
+        if not isinstance(raw_step, Mapping):
+            raise ValueError(f"{step_field} must be a mapping")
+        name = raw_step.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"{step_field}.name must be a non-empty string")
+        duration_ms = _validate_elapsed_ms(
+            raw_step.get("duration_ms"),
+            field_name=f"{step_field}.duration_ms",
+        )
+        step: dict[str, Any] = {
+            "name": name.strip(),
+            "duration_ms": duration_ms,
+        }
+        if "details" in raw_step:
+            details = raw_step.get("details")
+            if not isinstance(details, Mapping):
+                raise ValueError(f"{step_field}.details must be a mapping when present")
+            step["details"] = dict(details)
+        normalized_steps.append(step)
+
+    total_duration_ms = _validate_elapsed_ms(
+        matlab_metadata.get("total_duration_ms"),
+        field_name=f"{field_name}.total_duration_ms",
+    )
+    step_total_duration_ms = round(sum(float(step["duration_ms"]) for step in normalized_steps), 3)
+    unaccounted_duration_ms = round(total_duration_ms - step_total_duration_ms, 3)
+    if unaccounted_duration_ms < 0:
+        raise ValueError(
+            f"{field_name}.unaccounted_duration_ms must be finite and non-negative; "
+            "step durations exceed total_duration_ms"
+        )
+    boundary_call_ms = _boundary_matlab_call_ms(
+        boundary_instrumentation,
+        field_name=f"{field_name}.boundary_instrumentation",
+    )
+    boundary_delta = None if boundary_call_ms is None else round(boundary_call_ms - total_duration_ms, 3)
+    dominant_step = max(normalized_steps, key=lambda step: float(step["duration_ms"]))
+
+    return {
+        "source": "matlab_metadata.steps",
+        "status": "present",
+        "total_duration_ms": total_duration_ms,
+        "step_total_duration_ms": step_total_duration_ms,
+        "unaccounted_duration_ms": unaccounted_duration_ms,
+        "boundary_matlab_call_ms": boundary_call_ms,
+        "boundary_minus_matlab_total_ms": boundary_delta,
+        "steps": normalized_steps,
+        "dominant_step": {
+            "name": dominant_step["name"],
+            "duration_ms": dominant_step["duration_ms"],
+        },
+    }
+
+
+def _validate_matlab_internal_timing_block(value: Any, *, field_name: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping")
+    source = value.get("source")
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError(f"{field_name}.source must be a non-empty string")
+    if "status" in value:
+        _ = _validate_status(value.get("status"), field_name=f"{field_name}.status")
+    _ = _validate_elapsed_ms(value.get("total_duration_ms"), field_name=f"{field_name}.total_duration_ms")
+    _ = _validate_elapsed_ms(value.get("step_total_duration_ms"), field_name=f"{field_name}.step_total_duration_ms")
+    _ = _validate_elapsed_ms(value.get("unaccounted_duration_ms"), field_name=f"{field_name}.unaccounted_duration_ms")
+    boundary_call = value.get("boundary_matlab_call_ms")
+    if boundary_call is not None:
+        _ = _validate_elapsed_ms(boundary_call, field_name=f"{field_name}.boundary_matlab_call_ms")
+    boundary_delta = value.get("boundary_minus_matlab_total_ms")
+    if boundary_delta is not None:
+        _ = _validate_finite_number(boundary_delta, field_name=f"{field_name}.boundary_minus_matlab_total_ms")
+
+    steps = value.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ValueError(f"{field_name}.steps must be a non-empty list")
+    normalized_steps: list[dict[str, Any]] = []
+    for index, raw_step in enumerate(steps):
+        step_field = f"{field_name}.steps[{index}]"
+        if not isinstance(raw_step, Mapping):
+            raise ValueError(f"{step_field} must be a mapping")
+        name = raw_step.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"{step_field}.name must be a non-empty string")
+        duration_ms = _validate_elapsed_ms(raw_step.get("duration_ms"), field_name=f"{step_field}.duration_ms")
+        if "details" in raw_step and not isinstance(raw_step.get("details"), Mapping):
+            raise ValueError(f"{step_field}.details must be a mapping when present")
+        normalized_steps.append({"name": name.strip(), "duration_ms": duration_ms})
+
+    expected_step_total = round(sum(float(step["duration_ms"]) for step in normalized_steps), 3)
+    actual_step_total = _validate_elapsed_ms(
+        value.get("step_total_duration_ms"),
+        field_name=f"{field_name}.step_total_duration_ms",
+    )
+    if actual_step_total != expected_step_total:
+        raise ValueError(
+            f"{field_name}.step_total_duration_ms must equal the sum of step durations "
+            f"({expected_step_total:.3f}); got {actual_step_total:.3f}"
+        )
+
+    expected_unaccounted = round(
+        _validate_elapsed_ms(value.get("total_duration_ms"), field_name=f"{field_name}.total_duration_ms")
+        - expected_step_total,
+        3,
+    )
+    actual_unaccounted = _validate_elapsed_ms(
+        value.get("unaccounted_duration_ms"),
+        field_name=f"{field_name}.unaccounted_duration_ms",
+    )
+    if actual_unaccounted != expected_unaccounted:
+        raise ValueError(
+            f"{field_name}.unaccounted_duration_ms must equal total_duration_ms - step_total_duration_ms "
+            f"({expected_unaccounted:.3f}); got {actual_unaccounted:.3f}"
+        )
+
+    dominant_step = value.get("dominant_step")
+    if not isinstance(dominant_step, Mapping):
+        raise ValueError(f"{field_name}.dominant_step must be a mapping")
+    dominant_name = dominant_step.get("name")
+    if not isinstance(dominant_name, str) or not dominant_name.strip():
+        raise ValueError(f"{field_name}.dominant_step.name must be a non-empty string")
+    dominant_duration_ms = _validate_elapsed_ms(
+        dominant_step.get("duration_ms"),
+        field_name=f"{field_name}.dominant_step.duration_ms",
+    )
+    expected_dominant_step = max(normalized_steps, key=lambda step: float(step["duration_ms"]))
+    if dominant_name.strip() != expected_dominant_step["name"] or dominant_duration_ms != expected_dominant_step["duration_ms"]:
+        raise ValueError(
+            f"{field_name}.dominant_step must match the longest step {expected_dominant_step['name']!r} "
+            f"at {expected_dominant_step['duration_ms']:.3f} ms"
+        )
 
 
 def _sum_numeric_mapping(target: dict[str, float], source: Mapping[str, Any]) -> None:
@@ -342,13 +572,20 @@ class RegistrationPerformanceRecorder:
             record["skip_reason"] = skip_reason
         if final_corr is not None:
             record["final_corr"] = float(final_corr)
-        boundary = _extract_boundary_instrumentation(metadata)
+        boundary = _extract_boundary_instrumentation(metadata, prefer_local_flow=True)
         if boundary is not None:
             record["boundary_instrumentation"] = boundary
-        session_lifecycle = _extract_session_lifecycle(metadata)
+        matlab_internal_timing = normalize_matlab_internal_timing(
+            _extract_matlab_metadata(metadata),
+            boundary_instrumentation=boundary,
+            field_name=f"round {round_id}.local_registration.matlab_metadata",
+        )
+        if matlab_internal_timing is not None:
+            record["matlab_internal_timing"] = matlab_internal_timing
+        session_lifecycle = _extract_session_lifecycle(metadata, prefer_local_flow=True)
         if session_lifecycle is not None:
             record["session_lifecycle"] = session_lifecycle
-        session_summary = _extract_session_lifecycle_summary(metadata)
+        session_summary = _extract_session_lifecycle_summary(metadata, prefer_local_flow=True)
         if session_summary is not None:
             record["session_lifecycle_summary"] = session_summary
         round_entry = self._round(round_id)
@@ -404,6 +641,7 @@ class RegistrationPerformanceRecorder:
         session_lifecycle: Mapping[str, Any] | None = None,
         session_lifecycle_summary: Mapping[str, Any] | None = None,
         normalized_result: Mapping[str, Any] | None = None,
+        matlab_metadata: Mapping[str, Any] | None = None,
     ) -> None:
         round_entry = self._round(round_id)
         tiled: dict[str, Any] | None = cast(dict[str, Any] | None, round_entry.get("tiled_local"))
@@ -425,6 +663,13 @@ class RegistrationPerformanceRecorder:
         }
         if boundary_instrumentation is not None:
             tile_record["boundary_instrumentation"] = dict(boundary_instrumentation)
+        matlab_internal_timing = normalize_matlab_internal_timing(
+            matlab_metadata,
+            boundary_instrumentation=boundary_instrumentation,
+            field_name=f"round {round_id}.tiled_local.tile {tile_identity.get('tile_index', '?')}.matlab_metadata",
+        )
+        if matlab_internal_timing is not None:
+            tile_record["matlab_internal_timing"] = matlab_internal_timing
         if session_lifecycle is not None:
             tile_record["session_lifecycle"] = dict(session_lifecycle)
         if session_lifecycle_summary is not None:
@@ -646,6 +891,102 @@ def _flow_sidecar_summary(rounds: Sequence[Mapping[str, Any]]) -> dict[str, Any]
     }
 
 
+def _iter_matlab_internal_timing_blocks(
+    rounds: Sequence[Mapping[str, Any]],
+) -> list[tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any] | None]]:
+    blocks: list[tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any] | None]] = []
+    for round_entry in rounds:
+        local_registration = round_entry.get("local_registration")
+        if isinstance(local_registration, Mapping):
+            internal = local_registration.get("matlab_internal_timing")
+            if isinstance(internal, Mapping):
+                blocks.append((round_entry, internal, None))
+
+        tiled = round_entry.get("tiled_local")
+        if not isinstance(tiled, Mapping):
+            continue
+        tiles = tiled.get("tiles")
+        if not isinstance(tiles, Sequence) or isinstance(tiles, (str, bytes)):
+            continue
+        for tile in tiles:
+            if not isinstance(tile, Mapping):
+                continue
+            internal = tile.get("matlab_internal_timing")
+            if isinstance(internal, Mapping):
+                blocks.append((round_entry, internal, tile))
+    return blocks
+
+
+def _matlab_internal_timing_summary(rounds: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    call_count = 0
+    total_duration_ms = 0.0
+    step_totals_ms: dict[str, float] = {}
+    unaccounted_total_ms = 0.0
+    boundary_minus_total_ms = 0.0
+    boundary_delta_count = 0
+    dominant_counts: dict[str, int] = {}
+    dominant_totals_ms: dict[str, float] = {}
+
+    for _round_entry, internal, _tile in _iter_matlab_internal_timing_blocks(rounds):
+        _validate_matlab_internal_timing_block(internal, field_name="matlab_internal_timing")
+        call_count += 1
+        total_duration_ms = round(total_duration_ms + float(internal["total_duration_ms"]), 3)
+        unaccounted_total_ms = round(unaccounted_total_ms + float(internal["unaccounted_duration_ms"]), 3)
+        boundary_delta = internal.get("boundary_minus_matlab_total_ms")
+        if boundary_delta is not None:
+            boundary_minus_total_ms = round(boundary_minus_total_ms + float(boundary_delta), 3)
+            boundary_delta_count += 1
+        steps = internal.get("steps")
+        if isinstance(steps, Sequence) and not isinstance(steps, (str, bytes)):
+            for raw_step in steps:
+                if not isinstance(raw_step, Mapping):
+                    continue
+                name = raw_step.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                duration_ms = _validate_elapsed_ms(
+                    raw_step.get("duration_ms"),
+                    field_name=f"matlab_internal_timing.steps.{name}.duration_ms",
+                )
+                step_totals_ms[name] = round(step_totals_ms.get(name, 0.0) + duration_ms, 3)
+        dominant = internal.get("dominant_step")
+        if isinstance(dominant, Mapping):
+            name = dominant.get("name")
+            if isinstance(name, str) and name.strip():
+                duration_ms = _validate_elapsed_ms(
+                    dominant.get("duration_ms"),
+                    field_name=f"matlab_internal_timing.dominant_step.{name}.duration_ms",
+                )
+                dominant_counts[name] = dominant_counts.get(name, 0) + 1
+                dominant_totals_ms[name] = round(dominant_totals_ms.get(name, 0.0) + duration_ms, 3)
+
+    boundary_minus_internal_total_ms = (
+        round(boundary_minus_total_ms, 3)
+        if call_count == 0 or boundary_delta_count == call_count
+        else None
+    )
+    return {
+        "matlab_internal_timing_status": "present" if call_count else "absent",
+        "matlab_internal_call_count": int(call_count),
+        "matlab_internal_total_duration_ms": round(total_duration_ms, 3),
+        "matlab_internal_step_totals_ms": {key: round(value, 3) for key, value in sorted(step_totals_ms.items())},
+        "matlab_internal_unaccounted_total_ms": round(unaccounted_total_ms, 3),
+        "matlab_boundary_minus_internal_total_ms": boundary_minus_internal_total_ms,
+        "matlab_internal_dominant_step_counts": dict(sorted(dominant_counts.items())),
+        "matlab_internal_dominant_step_totals_ms": {
+            key: round(value, 3) for key, value in sorted(dominant_totals_ms.items())
+        },
+    }
+
+
+def _round_matlab_internal_total(round_entry: Mapping[str, Any]) -> float:
+    total = 0.0
+    for _candidate_round, internal, _tile in _iter_matlab_internal_timing_blocks([round_entry]):
+        _validate_matlab_internal_timing_block(internal, field_name="round.matlab_internal_timing")
+        total = round(total + float(internal["total_duration_ms"]), 3)
+    return total
+
+
 def _slowest_tiles(rounds: Sequence[Mapping[str, Any]], *, limit: int = 10) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for round_entry in rounds:
@@ -666,16 +1007,20 @@ def _slowest_tiles(rounds: Sequence[Mapping[str, Any]], *, limit: int = 10) -> l
             elapsed = _timing_elapsed(total_record)
             if elapsed is None:
                 continue
-            rows.append(
-                {
-                    "round_id": round_id,
-                    "tile_index": tile.get("tile_index"),
-                    "grid_position_yx": tile.get("grid_position_yx"),
-                    "region_origin_zyx": tile.get("region_origin_zyx"),
-                    "region_shape_zyx": tile.get("region_shape_zyx"),
-                    "elapsed_wall_ms": elapsed,
-                }
-            )
+            row = {
+                "round_id": round_id,
+                "tile_index": tile.get("tile_index"),
+                "grid_position_yx": tile.get("grid_position_yx"),
+                "region_origin_zyx": tile.get("region_origin_zyx"),
+                "region_shape_zyx": tile.get("region_shape_zyx"),
+                "elapsed_wall_ms": elapsed,
+            }
+            internal = tile.get("matlab_internal_timing")
+            if isinstance(internal, Mapping):
+                _validate_matlab_internal_timing_block(internal, field_name="slowest_tiles[].matlab_internal_timing")
+                row["matlab_internal_total_duration_ms"] = internal.get("total_duration_ms")
+                row["matlab_internal_dominant_step"] = internal.get("dominant_step")
+            rows.append(row)
     return sorted(rows, key=lambda item: (-float(item["elapsed_wall_ms"]), int(item.get("round_id") or 0)))[:limit]
 
 
@@ -703,12 +1048,14 @@ def _build_summary(
 
     boundary_summary = summarize_matlab_boundary_traces(boundary_traces) if boundary_traces else None
     flow_summary = _flow_sidecar_summary(rounds)
+    matlab_internal_summary = _matlab_internal_timing_summary(rounds)
     round_totals = [
         {
             "round_id": int(round_entry.get("round_id", -1)),
             "is_reference_round": bool(round_entry.get("is_reference_round", False)),
             "status": round_entry.get("status"),
             "total_elapsed_wall_ms": _round_total_elapsed(round_entry),
+            "matlab_internal_total_duration_ms": _round_matlab_internal_total(round_entry),
         }
         for round_entry in rounds
     ]
@@ -738,6 +1085,7 @@ def _build_summary(
             key: round(value, 3) for key, value in sorted(seam_cost_totals.items())
         },
         "matlab_boundary_summary": boundary_summary,
+        **matlab_internal_summary,
         "flow_sidecar_count": flow_summary["flow_sidecar_count"],
         "flow_sidecar_total_bytes": flow_summary["flow_sidecar_total_bytes"],
         "flow_sidecars": flow_summary["flow_sidecars"],
@@ -820,6 +1168,12 @@ def _validate_nested_timings(round_entry: Mapping[str, Any], *, field_name: str)
                         boundary,
                         field_name=f"{field_name}.tiled_local.tiles[{index}].boundary_instrumentation",
                     )
+                internal = tile.get("matlab_internal_timing")
+                if internal is not None:
+                    _validate_matlab_internal_timing_block(
+                        internal,
+                        field_name=f"{field_name}.tiled_local.tiles[{index}].matlab_internal_timing",
+                    )
                 timings = tile.get("timings")
                 if not isinstance(timings, Mapping):
                     raise ValueError(f"{field_name}.tiled_local.tiles[{index}].timings must be a mapping")
@@ -892,6 +1246,12 @@ def validate_registration_performance_payload(
                         boundary,
                         field_name=f"rounds[{index}].{boundary_key}.boundary_instrumentation",
                     )
+                internal = maybe_record.get("matlab_internal_timing")
+                if internal is not None:
+                    _validate_matlab_internal_timing_block(
+                        internal,
+                        field_name=f"rounds[{index}].{boundary_key}.matlab_internal_timing",
+                    )
         _validate_nested_timings(round_entry, field_name=f"rounds[{index}]")
 
     manifest = payload.get("manifest")
@@ -948,6 +1308,69 @@ def validate_registration_performance_payload(
         raise ValueError("Registration diagnostics summary.nested_phase_totals_ms must be a mapping")
     if not isinstance(summary.get("matlab_boundary_seam_cost_totals_ms"), Mapping):
         raise ValueError("Registration diagnostics summary.matlab_boundary_seam_cost_totals_ms must be a mapping")
+    stage17_summary_fields = (
+        "matlab_internal_timing_status",
+        "matlab_internal_call_count",
+        "matlab_internal_total_duration_ms",
+        "matlab_internal_step_totals_ms",
+        "matlab_internal_unaccounted_total_ms",
+        "matlab_boundary_minus_internal_total_ms",
+        "matlab_internal_dominant_step_counts",
+        "matlab_internal_dominant_step_totals_ms",
+    )
+    present_stage17_fields = [field for field in stage17_summary_fields if field in summary]
+    if present_stage17_fields:
+        missing_stage17_fields = [field for field in stage17_summary_fields if field not in summary]
+        if missing_stage17_fields:
+            raise ValueError(
+                "Registration diagnostics summary has partial MATLAB internal timing fields; missing: "
+                + ", ".join(missing_stage17_fields)
+            )
+        internal_count = summary.get("matlab_internal_call_count")
+        if isinstance(internal_count, bool) or not isinstance(internal_count, int) or internal_count < 0:
+            raise ValueError("Registration diagnostics summary.matlab_internal_call_count must be a non-negative integer")
+        internal_status = summary.get("matlab_internal_timing_status")
+        if internal_status not in {"present", "absent"}:
+            raise ValueError("Registration diagnostics summary.matlab_internal_timing_status must be 'present' or 'absent'")
+        _ = _validate_elapsed_ms(
+            summary.get("matlab_internal_total_duration_ms"),
+            field_name="summary.matlab_internal_total_duration_ms",
+        )
+        _ = _validate_elapsed_ms(
+            summary.get("matlab_internal_unaccounted_total_ms"),
+            field_name="summary.matlab_internal_unaccounted_total_ms",
+        )
+        summary_boundary_delta = summary.get("matlab_boundary_minus_internal_total_ms")
+        if summary_boundary_delta is not None:
+            _ = _validate_finite_number(
+                summary_boundary_delta,
+                field_name="summary.matlab_boundary_minus_internal_total_ms",
+            )
+        if not isinstance(summary.get("matlab_internal_step_totals_ms"), Mapping):
+            raise ValueError("Registration diagnostics summary.matlab_internal_step_totals_ms must be a mapping")
+        for step_name, duration_ms in cast(Mapping[str, Any], summary.get("matlab_internal_step_totals_ms")).items():
+            if not isinstance(step_name, str) or not step_name.strip():
+                raise ValueError("Registration diagnostics summary.matlab_internal_step_totals_ms keys must be non-empty strings")
+            _ = _validate_elapsed_ms(
+                duration_ms,
+                field_name=f"summary.matlab_internal_step_totals_ms.{step_name}",
+            )
+        if not isinstance(summary.get("matlab_internal_dominant_step_counts"), Mapping):
+            raise ValueError("Registration diagnostics summary.matlab_internal_dominant_step_counts must be a mapping")
+        for step_name, count in cast(Mapping[str, Any], summary.get("matlab_internal_dominant_step_counts")).items():
+            if not isinstance(step_name, str) or not step_name.strip():
+                raise ValueError("Registration diagnostics summary.matlab_internal_dominant_step_counts keys must be non-empty strings")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError(f"Registration diagnostics summary.matlab_internal_dominant_step_counts.{step_name} must be a non-negative integer")
+        if not isinstance(summary.get("matlab_internal_dominant_step_totals_ms"), Mapping):
+            raise ValueError("Registration diagnostics summary.matlab_internal_dominant_step_totals_ms must be a mapping")
+        for step_name, duration_ms in cast(Mapping[str, Any], summary.get("matlab_internal_dominant_step_totals_ms")).items():
+            if not isinstance(step_name, str) or not step_name.strip():
+                raise ValueError("Registration diagnostics summary.matlab_internal_dominant_step_totals_ms keys must be non-empty strings")
+            _ = _validate_elapsed_ms(
+                duration_ms,
+                field_name=f"summary.matlab_internal_dominant_step_totals_ms.{step_name}",
+            )
     if not isinstance(summary.get("flow_sidecars"), list):
         raise ValueError("Registration diagnostics summary.flow_sidecars must be a list")
     if not isinstance(summary.get("slowest_rounds"), list):
