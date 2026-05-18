@@ -31,6 +31,13 @@ from ._registration_performance import (
     diagnostics_timer_start,
     elapsed_ms_since,
 )
+from ._registration_tile_executor import (
+    ExecutorCallable,
+    MatlabLocalTileResult,
+    build_matlab_local_tile_execution_plan,
+    normalize_matlab_local_tile_results,
+    run_matlab_local_tile_process_parallel,
+)
 from .tiling import (
     TileLayout,
     TileSpec,
@@ -810,6 +817,7 @@ def _run_tiled_native_demons_registration(
 def _run_tiled_matlab_demons_registration(
     *,
     backend: MATLABGlobalRegistrationBackend,
+    config: ExperimentConfig,
     ref_volume_zyx: FloatArray,
     mov_volume_zyx: FloatArray,
     fov_id: int,
@@ -818,50 +826,164 @@ def _run_tiled_matlab_demons_registration(
     scope_descriptor: Dict[str, Any],
     layout: TileLayout,
     diagnostics: Optional[RegistrationPerformanceRecorder] = None,
+    executor: Optional[ExecutorCallable] = None,
 ) -> Tuple[FloatArray, Dict[str, Any]]:
+    parallel_config = config.pipeline.registration.matlab_local_parallel
+    parallel_enabled = bool(parallel_config.enabled)
+    worker_count = int(parallel_config.workers) if parallel_enabled else 1
+    requested_mode = "process_parallel" if parallel_enabled else "serial"
+    strict_equivalence_audit = bool(parallel_config.strict_equivalence_audit)
+
     print(
         "     [Tiling] MATLAB demons_3d on "
-        f"{layout.tile_count} tiles ({layout.grid_shape_yx[0]}x{layout.grid_shape_yx[1]}, source={layout.grid_source})"
+        f"{layout.tile_count} tiles ({layout.grid_shape_yx[0]}x{layout.grid_shape_yx[1]}, source={layout.grid_source}, "
+        f"execution={requested_mode})"
     )
 
+    if parallel_enabled and layout.tile_count < 2:
+        raise ValueError("registration.matlab_local_parallel.enabled=true requires a multi-tile MATLAB local layout")
+
+    if not parallel_enabled:
+        tile_outputs: list[tuple[TileSpec, FloatArray]] = []
+        tile_summaries: list[Dict[str, Any]] = []
+        for tile in layout.tiles:
+            tile_total_started = diagnostics_timer_start()
+            tile_label = f"tile {tile.tile_index}/{layout.tile_count}"
+            print(
+                f"       [Tiling] {tile_label} | origin={tile.region_origin_zyx} shape={tile.region_shape_zyx}"
+            )
+            tile_extract_started = diagnostics_timer_start()
+            ref_tile = np.asarray(extract_tile(ref_volume_zyx, tile), dtype=np.float32)
+            mov_tile = np.asarray(extract_tile(mov_volume_zyx, tile), dtype=np.float32)
+            tile_extract_ms = elapsed_ms_since(tile_extract_started)
+            backend_call_started = diagnostics_timer_start()
+            local_result = backend.compute_local_flow(
+                ref_tile,
+                mov_tile,
+                fov_id=fov_id,
+                round_id=int(round_id),
+                reference_round=int(reference_round),
+                scope_descriptor=scope_descriptor,
+                compute_tile=tile.as_dict(),
+            )
+            backend_call_ms = elapsed_ms_since(backend_call_started)
+            validation_started = diagnostics_timer_start()
+            flow_tile = np.asarray(local_result["flow_3d"], dtype=np.float32)
+            if flow_tile.shape != (3, *tile.region_shape_zyx):
+                raise ValueError(
+                    "MATLAB tiled local registration returned flow_3d with incompatible tile shape: "
+                    f"expected {(3, *tile.region_shape_zyx)}, got {flow_tile.shape} for tile {tile.tile_index}"
+                )
+            flow_validation_ms = elapsed_ms_since(validation_started)
+
+            tile_outputs.append((tile, flow_tile))
+            tile_backend_metadata = cast(Dict[str, Any], local_result.get("backend_metadata", {}))
+            tile_normalized = cast(Dict[str, Any], tile_backend_metadata.get("normalized_result", {}))
+            tile_summaries.append(
+                {
+                    **tile.as_dict(),
+                    "provider": "matlab",
+                    "status": "completed",
+                    "mean_abs_displacement": float(tile_normalized.get("mean_abs_displacement", float(np.abs(flow_tile).mean()))),
+                }
+            )
+            if diagnostics is not None:
+                boundary = tile_backend_metadata.get("boundary_instrumentation")
+                session_lifecycle = tile_backend_metadata.get("session_lifecycle")
+                session_lifecycle_summary = tile_backend_metadata.get("session_lifecycle_summary")
+                matlab_metadata = tile_backend_metadata.get("matlab_metadata")
+                diagnostics.record_tiled_local_tile(
+                    round_id,
+                    tile_identity=tile.as_dict(),
+                    total_elapsed_wall_ms=elapsed_ms_since(tile_total_started),
+                    extraction_elapsed_wall_ms=tile_extract_ms,
+                    backend_call_elapsed_wall_ms=backend_call_ms,
+                    flow_validation_elapsed_wall_ms=flow_validation_ms,
+                    boundary_instrumentation=(cast(Mapping[str, Any], boundary) if isinstance(boundary, Mapping) else None),
+                    session_lifecycle=(
+                        cast(Mapping[str, Any], session_lifecycle)
+                        if isinstance(session_lifecycle, Mapping)
+                        else None
+                    ),
+                    session_lifecycle_summary=(
+                        cast(Mapping[str, Any], session_lifecycle_summary)
+                        if isinstance(session_lifecycle_summary, Mapping)
+                        else None
+                    ),
+                    normalized_result=tile_normalized,
+                    matlab_metadata=(cast(Mapping[str, Any], matlab_metadata) if isinstance(matlab_metadata, Mapping) else None),
+                )
+
+        stitch_started = diagnostics_timer_start()
+        stitched = np.asarray(
+            stitch_tiles(tile_outputs, full_shape_zyx=layout.full_volume_shape_zyx),
+            dtype=np.float32,
+        )
+        stitch_ms = elapsed_ms_since(stitch_started)
+        tiling_summary = _build_tiling_summary(layout, tile_summaries)
+        if diagnostics is not None:
+            diagnostics.record_tiled_local_summary(
+                round_id,
+                layout_summary=tiling_summary,
+                stitch_elapsed_wall_ms=stitch_ms,
+            )
+        return stitched, tiling_summary
+
+    extraction_started = diagnostics_timer_start()
+    plan = build_matlab_local_tile_execution_plan(
+        config=config,
+        ref_volume_zyx=ref_volume_zyx,
+        mov_volume_zyx=mov_volume_zyx,
+        fov_id=int(fov_id),
+        round_id=int(round_id),
+        reference_round=int(reference_round),
+        scope_descriptor=scope_descriptor,
+        layout=layout,
+        worker_count=worker_count,
+        execution_mode=requested_mode,
+        strict_equivalence_audit=strict_equivalence_audit,
+    )
+    total_extraction_ms = elapsed_ms_since(extraction_started)
+    extraction_by_tile = round(total_extraction_ms / max(1, len(plan.jobs)), 3)
+    for job in plan.jobs:
+        tile_label = f"tile {job.tile_index}/{layout.tile_count}"
+        print(
+            f"       [Tiling] {tile_label} | origin={job.tile.region_origin_zyx} shape={job.tile.region_shape_zyx}"
+        )
+
+    raw_results: Sequence[MatlabLocalTileResult] = (executor or run_matlab_local_tile_process_parallel)(plan)
+
+    ordered_results, execution_report = normalize_matlab_local_tile_results(
+        raw_results,
+        layout=layout,
+        requested_mode=requested_mode,
+        effective_mode=requested_mode,
+        worker_count=worker_count,
+        strict_equivalence_audit=strict_equivalence_audit,
+    )
     tile_outputs: list[tuple[TileSpec, FloatArray]] = []
     tile_summaries: list[Dict[str, Any]] = []
-    for tile in layout.tiles:
-        tile_total_started = diagnostics_timer_start()
-        tile_label = f"tile {tile.tile_index}/{layout.tile_count}"
-        print(
-            f"       [Tiling] {tile_label} | origin={tile.region_origin_zyx} shape={tile.region_shape_zyx}"
-        )
-        tile_extract_started = diagnostics_timer_start()
-        ref_tile = np.asarray(extract_tile(ref_volume_zyx, tile), dtype=np.float32)
-        mov_tile = np.asarray(extract_tile(mov_volume_zyx, tile), dtype=np.float32)
-        tile_extract_ms = elapsed_ms_since(tile_extract_started)
-        backend_call_started = diagnostics_timer_start()
-        local_result = backend.compute_local_flow(
-            ref_tile,
-            mov_tile,
-            fov_id=fov_id,
-            round_id=int(round_id),
-            reference_round=int(reference_round),
-            scope_descriptor=scope_descriptor,
-            compute_tile=tile.as_dict(),
-        )
-        backend_call_ms = elapsed_ms_since(backend_call_started)
-        validation_started = diagnostics_timer_start()
-        flow_tile = np.asarray(local_result["flow_3d"], dtype=np.float32)
-        if flow_tile.shape != (3, *tile.region_shape_zyx):
-            raise ValueError(
-                "MATLAB tiled local registration returned flow_3d with incompatible tile shape: "
-                f"expected {(3, *tile.region_shape_zyx)}, got {flow_tile.shape} for tile {tile.tile_index}"
-            )
-        flow_validation_ms = elapsed_ms_since(validation_started)
-
-        tile_outputs.append((tile, flow_tile))
-        tile_backend_metadata = cast(Dict[str, Any], local_result.get("backend_metadata", {}))
+    for result in ordered_results:
+        if result.flow_tile is None:
+            raise RuntimeError(f"MATLAB local tile executor produced no flow for tile {result.tile_index}")
+        flow_tile = np.asarray(result.flow_tile, dtype=np.float32)
+        if strict_equivalence_audit:
+            ref_audit = result.extracted_ref_tile
+            mov_audit = result.extracted_mov_tile
+            if ref_audit is not None:
+                expected_ref_tile = np.asarray(extract_tile(ref_volume_zyx, result.tile), dtype=np.float32)
+                if not np.array_equal(expected_ref_tile, np.asarray(ref_audit, dtype=np.float32)):
+                    raise ValueError(f"MATLAB local tile strict equivalence audit failed for reference tile {result.tile_index}")
+            if mov_audit is not None:
+                expected_mov_tile = np.asarray(extract_tile(mov_volume_zyx, result.tile), dtype=np.float32)
+                if not np.array_equal(expected_mov_tile, np.asarray(mov_audit, dtype=np.float32)):
+                    raise ValueError(f"MATLAB local tile strict equivalence audit failed for moving tile {result.tile_index}")
+        tile_outputs.append((result.tile, flow_tile))
+        tile_backend_metadata = dict(result.backend_metadata)
         tile_normalized = cast(Dict[str, Any], tile_backend_metadata.get("normalized_result", {}))
         tile_summaries.append(
             {
-                **tile.as_dict(),
+                **result.tile.as_dict(),
                 "provider": "matlab",
                 "status": "completed",
                 "mean_abs_displacement": float(tile_normalized.get("mean_abs_displacement", float(np.abs(flow_tile).mean()))),
@@ -874,11 +996,15 @@ def _run_tiled_matlab_demons_registration(
             matlab_metadata = tile_backend_metadata.get("matlab_metadata")
             diagnostics.record_tiled_local_tile(
                 round_id,
-                tile_identity=tile.as_dict(),
-                total_elapsed_wall_ms=elapsed_ms_since(tile_total_started),
-                extraction_elapsed_wall_ms=tile_extract_ms,
-                backend_call_elapsed_wall_ms=backend_call_ms,
-                flow_validation_elapsed_wall_ms=flow_validation_ms,
+                tile_identity=result.tile.as_dict(),
+                total_elapsed_wall_ms=result.total_elapsed_wall_ms,
+                extraction_elapsed_wall_ms=(
+                    result.extraction_elapsed_wall_ms
+                    if float(result.extraction_elapsed_wall_ms) > 0.0
+                    else extraction_by_tile
+                ),
+                backend_call_elapsed_wall_ms=result.backend_call_elapsed_wall_ms,
+                flow_validation_elapsed_wall_ms=result.flow_validation_elapsed_wall_ms,
                 boundary_instrumentation=(cast(Mapping[str, Any], boundary) if isinstance(boundary, Mapping) else None),
                 session_lifecycle=(
                     cast(Mapping[str, Any], session_lifecycle)
@@ -901,6 +1027,7 @@ def _run_tiled_matlab_demons_registration(
     )
     stitch_ms = elapsed_ms_since(stitch_started)
     tiling_summary = _build_tiling_summary(layout, tile_summaries)
+    tiling_summary["execution"] = execution_report.to_dict()
     if diagnostics is not None:
         diagnostics.record_tiled_local_summary(
             round_id,
@@ -1852,6 +1979,7 @@ class RegistrationEngine:
         else:
             flow_3d, tiling_summary = _run_tiled_matlab_demons_registration(
                 backend=matlab_backend,
+                config=self.cfg,
                 ref_volume_zyx=context.ref_scope_3d,
                 mov_volume_zyx=mov_shifted_3d,
                 fov_id=context.fov_id,
@@ -1875,6 +2003,9 @@ class RegistrationEngine:
                     'mean_abs_displacement': float(np.abs(flow_3d).mean()),
                 },
             }
+            tiling_execution = tiling_summary.get('execution') if isinstance(tiling_summary, Mapping) else None
+            if isinstance(tiling_execution, Mapping):
+                local_backend_details['execution'] = dict(tiling_execution)
 
         shape_validation_started = diagnostics_timer_start()
         expected_shape = (3, *mov_shifted_3d.shape)
@@ -1938,6 +2069,9 @@ class RegistrationEngine:
             backend_metadata['local_flow'].update(local_backend_metadata)
             if tiling_summary is not None:
                 backend_metadata['local_flow']['tiling'] = tiling_summary
+                tiling_execution = tiling_summary.get('execution')
+                if isinstance(tiling_execution, Mapping):
+                    backend_metadata['local_flow']['execution'] = dict(tiling_execution)
 
         return _LocalRegistrationOutcome(
             flow_2d=None,

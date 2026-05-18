@@ -43,6 +43,7 @@ from .matlab_runtime import (
     validate_configured_entrypoint_contract,
     validate_runtime_step_metadata,
     write_staged_3d_volume_tiff,
+    sha256_file,
 )
 
 
@@ -169,6 +170,9 @@ def build_matlab_local_registration_plan(
     )
     plan.update(
         {
+            "provider": "matlab",
+            "method": "demons_3d",
+            "coverage_mode": plan.get("scope_mode"),
             "local_method": "demons_3d",
             "iterations": int(reg_cfg.demons_3d.num_iter),
             "accumulated_field_smoothing": float(reg_cfg.demons_3d.smoothing_sigma),
@@ -179,6 +183,15 @@ def build_matlab_local_registration_plan(
     if reg_cfg.demons_3d.pyramid_levels is not None:
         plan["pyramid_levels"] = int(reg_cfg.demons_3d.pyramid_levels)
     return plan
+
+
+def _runtime_manifest_identity(runtime_manifest_path: Path) -> Dict[str, str]:
+    """Return stable runtime manifest identity for request equivalence evidence."""
+
+    return {
+        "path": str(runtime_manifest_path),
+        "sha256": sha256_file(runtime_manifest_path),
+    }
 
 
 def resolve_matlab_registration_runtime_path(config: ExperimentConfig) -> Path:
@@ -816,18 +829,29 @@ class MATLABRegistrationBackend:
 
         ref_volume = self._normalize_input_volume(reference_volume)
         mov_volume = self._normalize_input_volume(moving_volume)
+        reference_volume_shape_zyx = [int(value) for value in ref_volume.shape]
+        moving_volume_shape_zyx = [int(value) for value in mov_volume.shape]
         request_payload = build_matlab_local_registration_plan(
             self.config,
             fov_id=fov_id,
             round_id=round_id,
             reference_round=reference_round,
             scope_descriptor=scope_descriptor,
-            volume_shape_zyx=(int(ref_volume.shape[0]), int(ref_volume.shape[1]), int(ref_volume.shape[2])),
+            volume_shape_zyx=tuple(reference_volume_shape_zyx),
             compute_tile=compute_tile,
         )
+        request_payload["reference_volume_shape_zyx"] = reference_volume_shape_zyx
+        request_payload["moving_volume_shape_zyx"] = moving_volume_shape_zyx
 
         runtime_validation_started = time.perf_counter()
         runtime_files, runtime_validation_details = self._resolve_runtime_file_records()
+        runtime_manifest_path = self.runtime_dir / MATLAB_REGISTRATION_RUNTIME_MANIFEST_NAME
+        request_payload["runtime"] = {
+            "runtime_path": str(self.runtime_dir),
+            "runtime_manifest": str(runtime_manifest_path),
+            "runtime_manifest_sha256": _runtime_manifest_identity(runtime_manifest_path)["sha256"],
+            "entrypoint": self.local_entrypoint,
+        }
         record_matlab_boundary_phase(
             boundary_trace,
             phase_name="runtime_file_validation",
