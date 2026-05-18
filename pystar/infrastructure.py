@@ -642,6 +642,35 @@ class RegistrationGuardsConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra='forbid')
 
+
+class MatlabLocalParallelConfig(BaseModel):
+    """Opt-in process-level execution for MATLAB local demons tiles.
+
+    This does not change demons parameters or tiling geometry.  It only controls
+    whether already-independent MATLAB local demons tile jobs may be scheduled in
+    separate worker processes.
+    """
+
+    enabled: bool = False
+    workers: int = 2
+    strict_equivalence_audit: bool = True
+
+    @model_validator(mode='before')
+    @classmethod
+    def reject_bool_worker_values(cls, data: Any) -> Any:
+        if isinstance(data, dict) and isinstance(data.get("workers"), bool):
+            raise ValueError("registration.matlab_local_parallel.workers must be an integer, not a boolean")
+        return data
+
+    @model_validator(mode='after')
+    def validate_parallel_workers(self) -> 'MatlabLocalParallelConfig':
+        if self.enabled and (isinstance(self.workers, bool) or int(self.workers) <= 0):
+            raise ValueError("registration.matlab_local_parallel.workers must be a positive integer when enabled")
+        return self
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+
 class RegistrationConfig(BaseModel):
     """Full registration configuration used by `RegistrationEngine`.
 
@@ -657,6 +686,7 @@ class RegistrationConfig(BaseModel):
     global_stage: GlobalRegistrationStageConfig = Field(default_factory=GlobalRegistrationStageConfig, alias="global")
     local: LocalRegistrationStageConfig = Field(default_factory=LocalRegistrationStageConfig)
     guards: RegistrationGuardsConfig = Field(default_factory=RegistrationGuardsConfig)
+    matlab_local_parallel: MatlabLocalParallelConfig = Field(default_factory=MatlabLocalParallelConfig)
 
     # 位移场语义：registration producer 对外声明当前 field 的表示/组合方式
     field_semantics: FieldSemanticsConfig = Field(default_factory=FieldSemanticsConfig)
@@ -727,6 +757,21 @@ class RegistrationConfig(BaseModel):
     def align_guard_defaults(self) -> 'RegistrationConfig':
         if self.min_correlation != self.guards.skip_if_global_corr_below:
             self.min_correlation = self.guards.skip_if_global_corr_below
+        if self.matlab_local_parallel.enabled:
+            if not self.local.enabled:
+                raise ValueError(
+                    "registration.matlab_local_parallel.enabled=true requires registration.local.enabled=true"
+                )
+            if self.local.provider != "matlab" or self.local.method != "demons_3d":
+                raise ValueError(
+                    "registration.matlab_local_parallel.enabled=true requires "
+                    "registration.local.provider='matlab' and registration.local.method='demons_3d'"
+                )
+            if not self.local.params.demons_3d.use_tiling:
+                raise ValueError(
+                    "registration.matlab_local_parallel.enabled=true requires "
+                    "registration.local.params.demons_3d.use_tiling=true"
+                )
         return self
 
     model_config = ConfigDict(extra='ignore', populate_by_name=True)
