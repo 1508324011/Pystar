@@ -1020,20 +1020,23 @@ def _round_entry(manifest_payload: Mapping[Any, Any], round_id: int) -> Mapping[
     raise KeyError(f"Transform manifest has no round entry for round {round_id}")
 
 
-def _strip_volatile_payload(value: Any) -> Any:
+def _strip_volatile_payload(value: Any, *, path: tuple[str, ...] = ()) -> Any:
     if isinstance(value, Mapping):
         normalized: dict[str, Any] = {}
         for key, item in value.items():
             key_str = str(key)
             key_lower = key_str.lower()
+            child_path = (*path, key_str)
+            if child_path == ("_semantics", "recorded_at"):
+                continue
             if key_lower in _VOLATILE_PAYLOAD_KEYS or key_lower.endswith("_ms") or "timing" in key_lower:
                 continue
-            normalized[key_str] = _strip_volatile_payload(item)
+            normalized[key_str] = _strip_volatile_payload(item, path=child_path)
         return normalized
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, (list, tuple)):
-        return [_strip_volatile_payload(item) for item in value]
+        return [_strip_volatile_payload(item, path=path) for item in value]
     if isinstance(value, np.integer):
         return int(value)
     if isinstance(value, np.floating):

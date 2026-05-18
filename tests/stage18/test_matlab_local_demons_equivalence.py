@@ -349,7 +349,28 @@ def _release_contract() -> dict[str, Any]:
     }
 
 
-def _round_entry(descriptor: dict[str, Any], *, semantics_status: str) -> dict[str, Any]:
+def _round_entry(
+    descriptor: dict[str, Any],
+    *,
+    semantics_status: str,
+    semantics_recorded_at: str | None = None,
+    scope_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    scope = {
+        "coverage_mode": "full_fov",
+        "region_origin_zyx": [0, 0, 0],
+        "region_shape_zyx": list(FULL_SHAPE_ZYX),
+        "full_volume_shape_zyx": list(FULL_SHAPE_ZYX),
+    }
+    if scope_overrides is not None:
+        scope.update(scope_overrides)
+    semantics = {
+        "representation": "total",
+        "composition": "sequential_global_then_local",
+        "status": semantics_status,
+    }
+    if semantics_recorded_at is not None:
+        semantics["recorded_at"] = semantics_recorded_at
     return {
         "global_shift_3d": np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
         "global_corr": 0.9,
@@ -357,22 +378,21 @@ def _round_entry(descriptor: dict[str, Any], *, semantics_status: str) -> dict[s
         "flow_3d": descriptor,
         "final_corr": 0.91,
         "round_id": ROUND_ID,
-        "_scope": {
-            "coverage_mode": "full_fov",
-            "region_origin_zyx": [0, 0, 0],
-            "region_shape_zyx": list(FULL_SHAPE_ZYX),
-            "full_volume_shape_zyx": list(FULL_SHAPE_ZYX),
-        },
-        "_semantics": {
-            "representation": "total",
-            "composition": "sequential_global_then_local",
-            "status": semantics_status,
-        },
+        "_scope": scope,
+        "_semantics": semantics,
         "backend_metadata": {"elapsed_wall_ms": 123.0},
     }
 
 
-def _write_transform_bundle(base_dir: Path, *, flow: NDArray[np.float32], semantics_status: str = "settled") -> Path:
+def _write_transform_bundle(
+    base_dir: Path,
+    *,
+    flow: NDArray[np.float32],
+    semantics_status: str = "settled",
+    semantics_recorded_at: str | None = None,
+    scope_overrides: dict[str, Any] | None = None,
+    contract_overrides: dict[str, Any] | None = None,
+) -> Path:
     _ = get_fov_output_structure(base_dir, FOV_ID)
     manifest_path = get_transform_manifest_path(base_dir, FOV_ID)
     sidecar_name = get_flow_3d_sidecar_filename(FOV_ID, ROUND_ID)
@@ -385,8 +405,15 @@ def _write_transform_bundle(base_dir: Path, *, flow: NDArray[np.float32], semant
         "dtype": str(flow.dtype),
     }
     contract = _release_contract()
+    if contract_overrides is not None:
+        contract.update(contract_overrides)
     payload = {
-        ROUND_ID: _round_entry(descriptor, semantics_status=semantics_status),
+        ROUND_ID: _round_entry(
+            descriptor,
+            semantics_status=semantics_status,
+            semantics_recorded_at=semantics_recorded_at,
+            scope_overrides=scope_overrides,
+        ),
         "_contract": contract,
         "_provenance": {
             "release_contract": contract,
@@ -440,6 +467,89 @@ def test_transform_artifact_comparison_detects_sidecar_and_manifest_semantic_dri
     assert drifted.sidecar_contract_equal is True
     assert drifted.manifest_semantics_equal is False
     assert any("round entry semantic payload drifted" in diff for diff in drifted.differences)
+
+
+def test_transform_artifact_comparison_ignores_only_semantics_recorded_at(tmp_path: Path) -> None:
+    flow = np.zeros((3, *FULL_SHAPE_ZYX), dtype=np.float32)
+    _write_transform_bundle(
+        tmp_path / "baseline",
+        flow=flow,
+        semantics_recorded_at="2026-05-18T05:20:11.723409+00:00",
+    )
+    _write_transform_bundle(
+        tmp_path / "candidate",
+        flow=flow,
+        semantics_recorded_at="2026-05-18T08:18:13.522107+00:00",
+    )
+
+    equivalent = compare_transform_artifacts(
+        tmp_path / "baseline",
+        tmp_path / "candidate",
+        fov_id=FOV_ID,
+        round_id=ROUND_ID,
+    )
+
+    assert equivalent.passed is True
+    assert equivalent.sidecar_contract_equal is True
+    assert equivalent.manifest_semantics_equal is True
+
+    _write_transform_bundle(
+        tmp_path / "candidate",
+        flow=flow,
+        semantics_recorded_at="2026-05-18T08:18:13.522107+00:00",
+        semantics_status="provisional",
+    )
+    drifted = compare_transform_artifacts(
+        tmp_path / "baseline",
+        tmp_path / "candidate",
+        fov_id=FOV_ID,
+        round_id=ROUND_ID,
+    )
+
+    assert drifted.passed is False
+    assert drifted.sidecar_contract_equal is True
+    assert drifted.manifest_semantics_equal is False
+    assert any("round entry semantic payload drifted" in diff for diff in drifted.differences)
+
+
+def test_transform_artifact_comparison_detects_scope_and_contract_drift(tmp_path: Path) -> None:
+    flow = np.zeros((3, *FULL_SHAPE_ZYX), dtype=np.float32)
+    _write_transform_bundle(tmp_path / "baseline", flow=flow)
+    _write_transform_bundle(
+        tmp_path / "candidate",
+        flow=flow,
+        scope_overrides={"region_origin_zyx": [0, 1, 0]},
+    )
+
+    scope_drifted = compare_transform_artifacts(
+        tmp_path / "baseline",
+        tmp_path / "candidate",
+        fov_id=FOV_ID,
+        round_id=ROUND_ID,
+    )
+
+    assert scope_drifted.passed is False
+    assert scope_drifted.sidecar_contract_equal is True
+    assert scope_drifted.manifest_semantics_equal is False
+    assert any("round entry semantic payload drifted" in diff for diff in scope_drifted.differences)
+
+    _write_transform_bundle(
+        tmp_path / "candidate",
+        flow=flow,
+        contract_overrides={"scope_status": "mismatch"},
+    )
+    contract_drifted = compare_transform_artifacts(
+        tmp_path / "baseline",
+        tmp_path / "candidate",
+        fov_id=FOV_ID,
+        round_id=ROUND_ID,
+    )
+
+    assert contract_drifted.passed is False
+    assert contract_drifted.sidecar_contract_equal is True
+    assert contract_drifted.manifest_semantics_equal is False
+    assert any("top-level _contract payload drifted" in diff for diff in contract_drifted.differences)
+    assert any("_provenance.release_contract payload drifted" in diff for diff in contract_drifted.differences)
 
 
 def test_equivalence_report_writer_uses_json_safe_report_shape(tmp_path: Path) -> None:
