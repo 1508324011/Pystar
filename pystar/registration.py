@@ -3,7 +3,7 @@
 import hashlib
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import numpy as np
 import xarray as xr
@@ -912,6 +912,7 @@ def _run_tiled_matlab_demons_registration(
                     ),
                     normalized_result=tile_normalized,
                     matlab_metadata=(cast(Mapping[str, Any], matlab_metadata) if isinstance(matlab_metadata, Mapping) else None),
+                    worker_lifecycle=None,
                 )
 
         stitch_started = diagnostics_timer_start()
@@ -1018,6 +1019,11 @@ def _run_tiled_matlab_demons_registration(
                 ),
                 normalized_result=tile_normalized,
                 matlab_metadata=(cast(Mapping[str, Any], matlab_metadata) if isinstance(matlab_metadata, Mapping) else None),
+                worker_lifecycle=(
+                    cast(Mapping[str, Any], result.worker_lifecycle)
+                    if isinstance(result.worker_lifecycle, Mapping)
+                    else None
+                ),
             )
 
     stitch_started = diagnostics_timer_start()
@@ -1033,6 +1039,7 @@ def _run_tiled_matlab_demons_registration(
             round_id,
             layout_summary=tiling_summary,
             stitch_elapsed_wall_ms=stitch_ms,
+            execution_report=execution_report.to_dict(),
         )
     return stitched, tiling_summary
 

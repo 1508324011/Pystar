@@ -82,7 +82,31 @@ def _backend_metadata(tile: TileSpec, flow: np.ndarray) -> dict[str, Any]:
     }
 
 
-def _result(tile: TileSpec, *, flow: np.ndarray | None = None, status: str = "completed") -> MatlabLocalTileResult:
+def _worker_lifecycle(tile: TileSpec, *, status: str = "completed") -> dict[str, Any]:
+    return {
+        "worker_process_pid": 4300 + int(tile.tile_index % 2),
+        "tile_index": int(tile.tile_index),
+        "status": status,
+        "backend_construct_ms": 2.0,
+        "matlab_session_start_or_attach_ms": 1.0,
+        "runtime_validation_ms": 0.5,
+        "matlab_addpath_or_bootstrap_ms": 0.25,
+        "input_staging_ms": 3.0,
+        "matlab_call_ms": 20.0 + float(tile.tile_index),
+        "mat_output_load_ms": 4.0,
+        "result_validation_ms": 1.0,
+        "backend_close_ms": 0.75,
+        "total_tile_wall_ms": 40.0 + float(tile.tile_index),
+    }
+
+
+def _result(
+    tile: TileSpec,
+    *,
+    flow: np.ndarray | None = None,
+    status: str = "completed",
+    worker_lifecycle: dict[str, Any] | None = None,
+) -> MatlabLocalTileResult:
     flow_tile = _flow_tile(tile) if flow is None and status == "completed" else flow
     return MatlabLocalTileResult(
         tile=tile,
@@ -92,6 +116,7 @@ def _result(tile: TileSpec, *, flow: np.ndarray | None = None, status: str = "co
         extraction_elapsed_wall_ms=1.0,
         backend_call_elapsed_wall_ms=8.0,
         flow_validation_elapsed_wall_ms=1.0,
+        worker_lifecycle=_worker_lifecycle(tile, status=status) if worker_lifecycle is None else worker_lifecycle,
         status=status,
         error=None if status == "completed" else "synthetic failure",
     )
@@ -321,6 +346,9 @@ def test_parallel_results_are_restored_by_tile_index_before_stitching() -> None:
 
     assert [result.tile_index for result in ordered] == [1, 2, 3, 4]
     assert report.to_dict()["tile_indices"] == [1, 2, 3, 4]
+    assert report.to_dict()["worker_lifecycle"]["status"] == "present"
+    assert report.to_dict()["worker_lifecycle"]["worker_process_count"] == 2
+    assert report.to_dict()["worker_lifecycle"]["worker_tile_counts"] == {"4300": 2, "4301": 2}
     stitched = stitch_tiles([(result.tile, cast(np.ndarray, result.flow_tile)) for result in ordered], full_shape_zyx=FULL_SHAPE_ZYX)
     expected = stitch_tiles([(tile, _flow_tile(tile)) for tile in layout.tiles], full_shape_zyx=FULL_SHAPE_ZYX)
     np.testing.assert_array_equal(stitched, expected)
@@ -334,6 +362,23 @@ def test_parallel_worker_failure_fails_loudly_without_serial_fallback() -> None:
     with pytest.raises(RuntimeError, match="MATLAB local tile executor failed"):
         _ = normalize_matlab_local_tile_results(
             failed_results,
+            layout=layout,
+            requested_mode="process_parallel",
+            effective_mode="process_parallel",
+            worker_count=2,
+            strict_equivalence_audit=True,
+        )
+
+
+def test_parallel_result_missing_lifecycle_telemetry_fails_loudly() -> None:
+    layout = _layout()
+    missing_lifecycle = [_result(layout.tiles[0], worker_lifecycle=None)]
+    missing_lifecycle[0] = replace(missing_lifecycle[0], worker_lifecycle=None)
+    missing_lifecycle.extend(_result(tile) for tile in layout.tiles[1:])
+
+    with pytest.raises(RuntimeError, match="missing worker lifecycle telemetry"):
+        _ = normalize_matlab_local_tile_results(
+            missing_lifecycle,
             layout=layout,
             requested_mode="process_parallel",
             effective_mode="process_parallel",
@@ -393,6 +438,8 @@ def test_synthetic_parallel_path_uses_executor_and_stage18a_equivalence() -> Non
     expected = stitch_tiles([(tile, _flow_tile(tile)) for tile in layout.tiles], full_shape_zyx=FULL_SHAPE_ZYX)
     np.testing.assert_array_equal(flow, expected)
     assert summary["execution"]["requested_mode"] == "process_parallel"
+    assert summary["execution"]["worker_lifecycle"]["status"] == "present"
+    assert summary["execution"]["worker_lifecycle"]["worker_process_count"] == 2
     assert [tile_summary["tile_index"] for tile_summary in summary["tiles"]] == [1, 2, 3, 4]
 
     serial_rows = [

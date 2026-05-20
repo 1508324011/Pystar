@@ -11,7 +11,9 @@ provider routing, or diagnostics schemas.
 
 from __future__ import annotations
 
+import math
 import multiprocessing as mp
+import os
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -23,6 +25,7 @@ from numpy.typing import NDArray
 
 from .matlab_registration import MATLABRegistrationBackend
 from .tiling import TileLayout, TileSpec, extract_tile
+from ._registration_worker_lifecycle import WORKER_LIFECYCLE_MS_FIELDS, WORKER_LIFECYCLE_REQUIRED_FIELDS
 
 
 FloatArray = NDArray[np.float32]
@@ -59,6 +62,7 @@ class MatlabLocalTileResult:
     flow_validation_elapsed_wall_ms: float
     extracted_ref_tile: FloatArray | None = None
     extracted_mov_tile: FloatArray | None = None
+    worker_lifecycle: dict[str, Any] | None = None
     status: str = "completed"
     error: str | None = None
     traceback: str | None = None
@@ -90,6 +94,7 @@ class TileExecutionReport:
     strict_equivalence_audit: bool
     tile_indices: tuple[int, ...]
     failures: tuple[dict[str, Any], ...]
+    worker_lifecycle: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,6 +105,7 @@ class TileExecutionReport:
             "strict_equivalence_audit": bool(self.strict_equivalence_audit),
             "tile_indices": [int(value) for value in self.tile_indices],
             "failures": [dict(item) for item in self.failures],
+            "worker_lifecycle": dict(self.worker_lifecycle or {"status": "absent"}),
         }
 
 
@@ -108,6 +114,187 @@ ExecutorCallable = Callable[[TileExecutionPlan], Sequence[MatlabLocalTileResult]
 
 def _elapsed_ms_since(started: float) -> float:
     return round((time.perf_counter() - started) * 1000.0, 3)
+
+
+def _coerce_non_negative_ms(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        return 0.0
+    return round(number, 3)
+
+
+def _mapping_value(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _boundary_instrumentation(metadata: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    if not isinstance(metadata, Mapping):
+        return {}
+    boundary = metadata.get("boundary_instrumentation")
+    return _mapping_value(boundary)
+
+
+def _boundary_seam_costs(boundary: Mapping[str, Any]) -> Mapping[str, Any]:
+    seam_costs = boundary.get("seam_costs_ms")
+    if isinstance(seam_costs, Mapping):
+        return seam_costs
+    aggregate = boundary.get("aggregate_seam_costs_ms")
+    if isinstance(aggregate, Mapping):
+        return aggregate
+    return {}
+
+
+def _boundary_phase_timings(boundary: Mapping[str, Any]) -> Mapping[str, Any]:
+    return _mapping_value(boundary.get("phase_timings_ms"))
+
+
+def _boundary_engine_bootstrap_details(boundary: Mapping[str, Any]) -> Mapping[str, Any]:
+    phase_details = _mapping_value(boundary.get("phase_details"))
+    return _mapping_value(phase_details.get("engine_bootstrap"))
+
+
+def _session_start_or_attach_ms(engine_bootstrap: Mapping[str, Any]) -> float:
+    return round(
+        sum(
+            _coerce_non_negative_ms(engine_bootstrap.get(key))
+            for key in ("start_matlab_ms", "connect_matlab_ms")
+        ),
+        3,
+    )
+
+
+def _matlab_addpath_or_bootstrap_ms(engine_bootstrap: Mapping[str, Any], seam_costs: Mapping[str, Any]) -> float:
+    addpath_ms = _coerce_non_negative_ms(engine_bootstrap.get("addpath_ms"))
+    if addpath_ms > 0.0:
+        return addpath_ms
+    return _coerce_non_negative_ms(seam_costs.get("engine_bootstrap_ms"))
+
+
+def _build_worker_lifecycle(
+    *,
+    worker_process_pid: int,
+    tile_index: int,
+    backend_construct_ms: float,
+    backend_metadata: Mapping[str, Any] | None,
+    backend_close_ms: float,
+    total_tile_wall_ms: float,
+    status: str,
+) -> dict[str, Any]:
+    boundary = _boundary_instrumentation(backend_metadata)
+    seam_costs = _boundary_seam_costs(boundary)
+    phase_timings = _boundary_phase_timings(boundary)
+    engine_bootstrap = _boundary_engine_bootstrap_details(boundary)
+    lifecycle = {
+        "worker_process_pid": int(worker_process_pid),
+        "tile_index": int(tile_index),
+        "status": str(status),
+        "backend_construct_ms": _coerce_non_negative_ms(backend_construct_ms),
+        "matlab_session_start_or_attach_ms": _session_start_or_attach_ms(engine_bootstrap),
+        "runtime_validation_ms": _coerce_non_negative_ms(seam_costs.get("runtime_file_validation_ms")),
+        "matlab_addpath_or_bootstrap_ms": _matlab_addpath_or_bootstrap_ms(engine_bootstrap, seam_costs),
+        "input_staging_ms": _coerce_non_negative_ms(seam_costs.get("input_staging_ms")),
+        "matlab_call_ms": _coerce_non_negative_ms(seam_costs.get("matlab_call_ms")),
+        "mat_output_load_ms": _coerce_non_negative_ms(phase_timings.get("mat_output_load")),
+        "result_validation_ms": _coerce_non_negative_ms(seam_costs.get("result_validation_ms")),
+        "backend_close_ms": _coerce_non_negative_ms(backend_close_ms),
+        "total_tile_wall_ms": _coerce_non_negative_ms(total_tile_wall_ms),
+    }
+    return lifecycle
+
+
+def _validate_worker_lifecycle(lifecycle: Mapping[str, Any], *, tile_index: int) -> None:
+    missing = [key for key in WORKER_LIFECYCLE_REQUIRED_FIELDS if key not in lifecycle]
+    if missing:
+        raise ValueError(
+            f"MATLAB local tile worker lifecycle telemetry is missing fields for tile {tile_index}: "
+            + ", ".join(missing)
+        )
+    lifecycle_tile_index = lifecycle.get("tile_index")
+    if isinstance(lifecycle_tile_index, bool) or not isinstance(lifecycle_tile_index, int):
+        raise ValueError("MATLAB local tile worker lifecycle tile_index must be an integer")
+    if int(lifecycle_tile_index) != int(tile_index):
+        raise ValueError(
+            "MATLAB local tile worker lifecycle tile_index mismatch: "
+            f"expected {tile_index}, got {lifecycle_tile_index}"
+        )
+    worker_process_pid = lifecycle.get("worker_process_pid")
+    if isinstance(worker_process_pid, bool) or not isinstance(worker_process_pid, int) or worker_process_pid <= 0:
+        raise ValueError("MATLAB local tile worker lifecycle worker_process_pid must be a positive integer")
+    for key in WORKER_LIFECYCLE_MS_FIELDS:
+        value = lifecycle.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"MATLAB local tile worker lifecycle {key} must be finite and non-negative")
+        number = float(value)
+        if not math.isfinite(number) or number < 0:
+            raise ValueError(f"MATLAB local tile worker lifecycle {key} must be finite and non-negative")
+
+
+def _summarize_worker_lifecycle(results: Sequence[MatlabLocalTileResult]) -> dict[str, Any]:
+    lifecycles: list[Mapping[str, Any]] = []
+    for result in results:
+        lifecycle = result.worker_lifecycle
+        if isinstance(lifecycle, Mapping):
+            _validate_worker_lifecycle(lifecycle, tile_index=result.tile_index)
+            lifecycles.append(lifecycle)
+    if not lifecycles:
+        return {
+            "status": "absent",
+            "worker_process_count": 0,
+            "worker_process_ids": [],
+            "worker_tile_counts": {},
+            "worker_overhead_totals_ms": {key: 0.0 for key in WORKER_LIFECYCLE_MS_FIELDS},
+            "worker_overhead_percentages": {key: 0.0 for key in WORKER_LIFECYCLE_MS_FIELDS},
+            "slowest_workers": [],
+        }
+
+    totals = {key: 0.0 for key in WORKER_LIFECYCLE_MS_FIELDS}
+    by_pid: dict[int, dict[str, Any]] = {}
+    for lifecycle in lifecycles:
+        pid = int(lifecycle["worker_process_pid"])
+        worker = by_pid.setdefault(
+            pid,
+            {"worker_process_pid": pid, "tile_count": 0, "total_tile_wall_ms": 0.0, "max_tile_wall_ms": 0.0},
+        )
+        worker["tile_count"] = int(worker["tile_count"]) + 1
+        tile_wall = _coerce_non_negative_ms(lifecycle.get("total_tile_wall_ms"))
+        worker["total_tile_wall_ms"] = round(float(worker["total_tile_wall_ms"]) + tile_wall, 3)
+        worker["max_tile_wall_ms"] = round(max(float(worker["max_tile_wall_ms"]), tile_wall), 3)
+        for key in WORKER_LIFECYCLE_MS_FIELDS:
+            totals[key] = round(totals[key] + _coerce_non_negative_ms(lifecycle.get(key)), 3)
+
+    total_tile_wall = totals["total_tile_wall_ms"]
+    percentages = {
+        key: round((value / total_tile_wall * 100.0), 3) if total_tile_wall > 0.0 else 0.0
+        for key, value in totals.items()
+    }
+    slowest_workers = []
+    for worker in by_pid.values():
+        tile_count = int(worker["tile_count"])
+        total_wall = _coerce_non_negative_ms(worker["total_tile_wall_ms"])
+        slowest_workers.append(
+            {
+                "worker_process_pid": int(worker["worker_process_pid"]),
+                "tile_count": tile_count,
+                "total_tile_wall_ms": total_wall,
+                "mean_tile_wall_ms": round(total_wall / tile_count, 3) if tile_count else 0.0,
+                "max_tile_wall_ms": _coerce_non_negative_ms(worker["max_tile_wall_ms"]),
+            }
+        )
+
+    return {
+        "status": "present",
+        "worker_process_count": len(by_pid),
+        "worker_process_ids": sorted(by_pid),
+        "worker_tile_counts": {str(pid): int(row["tile_count"]) for pid, row in sorted(by_pid.items())},
+        "worker_overhead_totals_ms": {key: round(value, 3) for key, value in totals.items()},
+        "worker_overhead_percentages": percentages,
+        "slowest_workers": sorted(
+            slowest_workers,
+            key=lambda item: (-float(item["total_tile_wall_ms"]), int(item["worker_process_pid"])),
+        ),
+    }
 
 
 def build_matlab_local_tile_execution_plan(
@@ -176,10 +363,18 @@ def _run_matlab_local_tile_job(job: MatlabLocalTileJob) -> MatlabLocalTileResult
     """Worker function: create a backend/session boundary and compute one tile."""
 
     total_started = time.perf_counter()
-    backend_call_started = time.perf_counter()
     backend: MATLABRegistrationBackend | None = None
+    backend_construct_ms = 0.0
+    backend_call_ms = 0.0
+    backend_close_ms = 0.0
+    backend_metadata: dict[str, Any] = {}
+    worker_pid = int(os.getpid())
     try:
+        backend_construct_started = time.perf_counter()
         backend = MATLABRegistrationBackend(job.config)
+        backend_construct_ms = _elapsed_ms_since(backend_construct_started)
+
+        backend_call_started = time.perf_counter()
         local_result = backend.compute_local_flow(
             job.ref_tile,
             job.mov_tile,
@@ -190,6 +385,7 @@ def _run_matlab_local_tile_job(job: MatlabLocalTileJob) -> MatlabLocalTileResult
             compute_tile=job.tile.as_dict(),
         )
         backend_call_ms = _elapsed_ms_since(backend_call_started)
+        backend_metadata = cast(dict[str, Any], dict(local_result.get("backend_metadata", {})))
 
         validation_started = time.perf_counter()
         flow_tile = np.asarray(local_result["flow_3d"], dtype=np.float32)
@@ -200,25 +396,58 @@ def _run_matlab_local_tile_job(job: MatlabLocalTileJob) -> MatlabLocalTileResult
                 f"expected {expected_shape}, got {flow_tile.shape} for tile {job.tile_index}"
             )
         flow_validation_ms = _elapsed_ms_since(validation_started)
-        backend_metadata = cast(dict[str, Any], dict(local_result.get("backend_metadata", {})))
+        if backend is not None:
+            backend_close_started = time.perf_counter()
+            backend.close()
+            backend = None
+            backend_close_ms = _elapsed_ms_since(backend_close_started)
+        total_elapsed_ms = _elapsed_ms_since(total_started)
+        worker_lifecycle = _build_worker_lifecycle(
+            worker_process_pid=worker_pid,
+            tile_index=job.tile_index,
+            backend_construct_ms=backend_construct_ms,
+            backend_metadata=backend_metadata,
+            backend_close_ms=backend_close_ms,
+            total_tile_wall_ms=total_elapsed_ms,
+            status="completed",
+        )
         return MatlabLocalTileResult(
             tile=job.tile,
             flow_tile=flow_tile,
             backend_metadata=backend_metadata,
-            total_elapsed_wall_ms=_elapsed_ms_since(total_started),
+            total_elapsed_wall_ms=total_elapsed_ms,
             extraction_elapsed_wall_ms=0.0,
             backend_call_elapsed_wall_ms=backend_call_ms,
             flow_validation_elapsed_wall_ms=flow_validation_ms,
+            worker_lifecycle=worker_lifecycle,
         )
     except Exception as exc:  # pragma: no cover - exact MATLAB failures depend on local install
+        if backend is not None:
+            backend_close_started = time.perf_counter()
+            try:
+                backend.close()
+            finally:
+                backend = None
+                backend_close_ms = _elapsed_ms_since(backend_close_started)
+        total_elapsed_ms = _elapsed_ms_since(total_started)
+        worker_lifecycle = _build_worker_lifecycle(
+            worker_process_pid=worker_pid,
+            tile_index=job.tile_index,
+            backend_construct_ms=backend_construct_ms,
+            backend_metadata=backend_metadata,
+            backend_close_ms=backend_close_ms,
+            total_tile_wall_ms=total_elapsed_ms,
+            status="failed",
+        )
         return MatlabLocalTileResult(
             tile=job.tile,
             flow_tile=None,
-            backend_metadata={},
-            total_elapsed_wall_ms=_elapsed_ms_since(total_started),
+            backend_metadata=backend_metadata,
+            total_elapsed_wall_ms=total_elapsed_ms,
             extraction_elapsed_wall_ms=0.0,
-            backend_call_elapsed_wall_ms=_elapsed_ms_since(backend_call_started),
+            backend_call_elapsed_wall_ms=backend_call_ms,
             flow_validation_elapsed_wall_ms=0.0,
+            worker_lifecycle=worker_lifecycle,
             status="failed",
             error=f"{exc.__class__.__name__}: {exc}",
             traceback=traceback.format_exc(),
@@ -258,6 +487,21 @@ def run_matlab_local_tile_process_parallel(plan: TileExecutionPlan) -> tuple[Mat
                         extraction_elapsed_wall_ms=0.0,
                         backend_call_elapsed_wall_ms=0.0,
                         flow_validation_elapsed_wall_ms=0.0,
+                        worker_lifecycle={
+                            "worker_process_pid": int(os.getpid()),
+                            "tile_index": int(tile.tile_index),
+                            "status": "failed",
+                            "backend_construct_ms": 0.0,
+                            "matlab_session_start_or_attach_ms": 0.0,
+                            "runtime_validation_ms": 0.0,
+                            "matlab_addpath_or_bootstrap_ms": 0.0,
+                            "input_staging_ms": 0.0,
+                            "matlab_call_ms": 0.0,
+                            "mat_output_load_ms": 0.0,
+                            "result_validation_ms": 0.0,
+                            "backend_close_ms": 0.0,
+                            "total_tile_wall_ms": 0.0,
+                        },
                         status="failed",
                         error=f"{exc.__class__.__name__}: {exc}",
                         traceback=traceback.format_exc(),
@@ -300,6 +544,7 @@ def run_matlab_local_tile_serial(plan: TileExecutionPlan, backend: MATLABRegistr
                 extraction_elapsed_wall_ms=0.0,
                 backend_call_elapsed_wall_ms=backend_call_ms,
                 flow_validation_elapsed_wall_ms=_elapsed_ms_since(validation_started),
+                worker_lifecycle=None,
             )
         )
     return tuple(results)
@@ -408,6 +653,19 @@ def normalize_matlab_local_tile_results(
                     "traceback": result.traceback,
                 }
             )
+        if effective_mode == "process_parallel":
+            if not isinstance(result.worker_lifecycle, Mapping):
+                failures.append(
+                    {
+                        "tile_index": tile_index,
+                        "error": "missing worker lifecycle telemetry",
+                    }
+                )
+            else:
+                try:
+                    _validate_worker_lifecycle(result.worker_lifecycle, tile_index=tile_index)
+                except ValueError as exc:
+                    failures.append({"tile_index": tile_index, "error": str(exc)})
 
     for tile_index in expected_indices:
         if tile_index not in by_index:
@@ -421,6 +679,7 @@ def normalize_matlab_local_tile_results(
         strict_equivalence_audit=bool(strict_equivalence_audit),
         tile_indices=expected_indices,
         failures=tuple(failures),
+        worker_lifecycle=_summarize_worker_lifecycle(tuple(by_index[tile_index] for tile_index in expected_indices if tile_index in by_index)),
     )
     if failures:
         raise RuntimeError(f"MATLAB local tile executor failed: {report.to_dict()}")

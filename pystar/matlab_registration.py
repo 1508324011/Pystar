@@ -837,7 +837,11 @@ class MATLABRegistrationBackend:
             round_id=round_id,
             reference_round=reference_round,
             scope_descriptor=scope_descriptor,
-            volume_shape_zyx=tuple(reference_volume_shape_zyx),
+            volume_shape_zyx=(
+                int(reference_volume_shape_zyx[0]),
+                int(reference_volume_shape_zyx[1]),
+                int(reference_volume_shape_zyx[2]),
+            ),
             compute_tile=compute_tile,
         )
         request_payload["reference_volume_shape_zyx"] = reference_volume_shape_zyx
@@ -953,11 +957,6 @@ class MATLABRegistrationBackend:
                 tmpdir_path=tmpdir_path,
                 expected_shape_zyx=(int(ref_volume.shape[0]), int(ref_volume.shape[1]), int(ref_volume.shape[2])),
             )
-            flow_3d = self._load_local_flow_zyx(
-                validated_flow_output_path,
-                metadata,
-                round_id=round_id,
-            )
             record_matlab_boundary_phase(
                 boundary_trace,
                 phase_name="result_validation",
@@ -965,8 +964,20 @@ class MATLABRegistrationBackend:
                 seam_cost_key="result_validation_ms",
                 details={
                     "reported_step_count": len(metadata.get("steps", [])) if isinstance(metadata.get("steps"), list) else 0,
-                    "flow_shape": [int(value) for value in flow_3d.shape],
+                    "validated_flow_output_name": validated_flow_output_path.name,
                 },
+            )
+            mat_output_load_started = time.perf_counter()
+            flow_3d = self._load_local_flow_zyx(
+                validated_flow_output_path,
+                metadata,
+                round_id=round_id,
+            )
+            record_matlab_boundary_phase(
+                boundary_trace,
+                phase_name="mat_output_load",
+                duration_ms=round((time.perf_counter() - mat_output_load_started) * 1000.0, 3),
+                details={"flow_shape": [int(value) for value in flow_3d.shape]},
             )
 
         finalized_boundary_trace = finalize_matlab_boundary_trace(
