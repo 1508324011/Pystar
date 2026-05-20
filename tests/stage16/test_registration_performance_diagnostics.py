@@ -92,6 +92,24 @@ def _matlab_internal_metadata(
     }
 
 
+def _worker_lifecycle(*, tile_index: int, worker_process_pid: int, total_tile_wall_ms: float) -> dict[str, Any]:
+    return {
+        "worker_process_pid": worker_process_pid,
+        "tile_index": tile_index,
+        "status": "completed",
+        "backend_construct_ms": 2.0,
+        "matlab_session_start_or_attach_ms": 1.0,
+        "runtime_validation_ms": 0.5,
+        "matlab_addpath_or_bootstrap_ms": 0.25,
+        "input_staging_ms": 3.0,
+        "matlab_call_ms": 20.0,
+        "mat_output_load_ms": 4.0,
+        "result_validation_ms": 1.0,
+        "backend_close_ms": 0.75,
+        "total_tile_wall_ms": total_tile_wall_ms,
+    }
+
+
 def _providers(provider_mode: str = "native_only") -> dict[str, Any]:
     return {
         "stage_id": "registration",
@@ -246,6 +264,7 @@ def test_tiled_matlab_local_diagnostics_preserve_tile_identity_and_boundary_mapp
             "write_origin_zyx": [0, 12, 22],
             "write_shape_zyx": [4, 26, 36],
             "write_offset_zyx": [0, 2, 2],
+            "full_volume_shape_zyx": [4, 60, 80],
         },
         total_elapsed_wall_ms=50.0,
         extraction_elapsed_wall_ms=5.0,
@@ -335,6 +354,7 @@ def test_tiled_matlab_internal_steps_preserve_dominant_step_and_aggregate() -> N
         "write_origin_zyx": [0, 12, 22],
         "write_shape_zyx": [4, 26, 36],
         "write_offset_zyx": [0, 2, 2],
+        "full_volume_shape_zyx": [4, 60, 80],
     }
     recorder.record_tiled_local_tile(
         2,
@@ -368,6 +388,110 @@ def test_tiled_matlab_internal_steps_preserve_dominant_step_and_aggregate() -> N
     assert slow_tile["tile_index"] == 3
     assert slow_tile["matlab_internal_total_duration_ms"] == 118.0
     assert slow_tile["matlab_internal_dominant_step"] == {"name": "imregdemons", "duration_ms": 80.0}
+
+
+def test_tiled_process_parallel_worker_lifecycle_persists_and_aggregates_without_matlab() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    recorder.start_round(2, is_reference_round=False)
+
+    for tile_index, worker_pid, total_ms in ((1, 4101, 40.0), (2, 4102, 60.0)):
+        recorder.record_tiled_local_tile(
+            2,
+            tile_identity={
+                "tile_index": tile_index,
+                "grid_position_yx": [0, tile_index - 1],
+                "grid_shape_yx": [1, 2],
+                "region_origin_zyx": [0, 0, 20 * (tile_index - 1)],
+                "region_shape_zyx": [4, 30, 40],
+                "write_origin_zyx": [0, 0, 20 * (tile_index - 1)],
+                "write_shape_zyx": [4, 30, 40],
+                "write_offset_zyx": [0, 0, 0],
+                "full_volume_shape_zyx": [4, 30, 80],
+            },
+            total_elapsed_wall_ms=total_ms,
+            extraction_elapsed_wall_ms=5.0,
+            backend_call_elapsed_wall_ms=total_ms - 10.0,
+            flow_validation_elapsed_wall_ms=5.0,
+            boundary_instrumentation=_boundary_trace(stage_name="matlab_registration_local", matlab_call_ms=20.0),
+            normalized_result={"flow_3d_shape": [3, 4, 30, 40], "flow_3d_dtype": "float32"},
+            worker_lifecycle=_worker_lifecycle(
+                tile_index=tile_index,
+                worker_process_pid=worker_pid,
+                total_tile_wall_ms=total_ms,
+            ),
+        )
+    recorder.record_tiled_local_summary(
+        2,
+        layout_summary={"enabled": True, "grid_shape_yx": [1, 2], "tile_count": 2},
+        stitch_elapsed_wall_ms=6.0,
+        execution_report={
+            "requested_mode": "process_parallel",
+            "effective_mode": "process_parallel",
+            "worker_count": 2,
+            "tile_count": 2,
+            "strict_equivalence_audit": True,
+            "tile_indices": [1, 2],
+            "failures": [],
+            "worker_lifecycle": {
+                "status": "present",
+                "worker_process_count": 2,
+                "worker_process_ids": [4101, 4102],
+                "worker_tile_counts": {"4101": 1, "4102": 1},
+                "worker_overhead_totals_ms": {
+                    "backend_construct_ms": 4.0,
+                    "matlab_session_start_or_attach_ms": 2.0,
+                    "runtime_validation_ms": 1.0,
+                    "matlab_addpath_or_bootstrap_ms": 0.5,
+                    "input_staging_ms": 6.0,
+                    "matlab_call_ms": 40.0,
+                    "mat_output_load_ms": 8.0,
+                    "result_validation_ms": 2.0,
+                    "backend_close_ms": 1.5,
+                    "total_tile_wall_ms": 100.0,
+                },
+                "worker_overhead_percentages": {
+                    "backend_construct_ms": 4.0,
+                    "matlab_session_start_or_attach_ms": 2.0,
+                    "runtime_validation_ms": 1.0,
+                    "matlab_addpath_or_bootstrap_ms": 0.5,
+                    "input_staging_ms": 6.0,
+                    "matlab_call_ms": 40.0,
+                    "mat_output_load_ms": 8.0,
+                    "result_validation_ms": 2.0,
+                    "backend_close_ms": 1.5,
+                    "total_tile_wall_ms": 100.0,
+                },
+                "slowest_workers": [
+                    {
+                        "worker_process_pid": 4102,
+                        "tile_count": 1,
+                        "total_tile_wall_ms": 60.0,
+                        "mean_tile_wall_ms": 60.0,
+                        "max_tile_wall_ms": 60.0,
+                    }
+                ],
+            },
+        },
+    )
+
+    payload = recorder.build_payload()
+    tiled = payload["rounds"][0]["tiled_local"]
+    first_tile = tiled["tiles"][0]
+    summary = payload["summary"]
+
+    assert tiled["execution"]["requested_mode"] == "process_parallel"
+    assert tiled["execution"]["worker_lifecycle"]["worker_process_count"] == 2
+    assert first_tile["worker_lifecycle"]["worker_process_pid"] == 4101
+    assert first_tile["worker_lifecycle"]["backend_construct_ms"] == 2.0
+    assert summary["tiled_local_execution_status"] == "present"
+    assert summary["tiled_local_worker_lifecycle_status"] == "present"
+    assert summary["tiled_local_worker_process_count"] == 2
+    assert summary["tiled_local_worker_tile_counts"] == {"4101": 1, "4102": 1}
+    assert summary["tiled_local_worker_overhead_totals_ms"]["total_tile_wall_ms"] == 100.0
+    assert summary["tiled_local_worker_overhead_totals_ms"]["matlab_call_ms"] == 40.0
+    assert summary["tiled_local_worker_overhead_percentages"]["matlab_call_ms"] == 40.0
+    assert summary["tiled_local_slowest_workers"][0]["worker_process_pid"] == 4102
+    assert summary["tiled_local_slowest_worker_tiles"][0]["tile_index"] == 2
 
 
 def test_missing_matlab_internal_steps_remain_valid_and_absent() -> None:
@@ -501,6 +625,152 @@ def test_present_malformed_matlab_internal_block_fails_payload_validation() -> N
     ]
 
     with pytest.raises(ValueError, match="matlab_internal_timing.*duration_ms"):
+        validate_registration_performance_payload(malformed, expected_fov_id=FOV_ID)
+
+
+def test_present_malformed_worker_lifecycle_block_fails_payload_validation() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    recorder.start_round(2, is_reference_round=False)
+    recorder.record_tiled_local_tile(
+        2,
+        tile_identity={
+            "tile_index": 3,
+            "grid_position_yx": [0, 2],
+            "grid_shape_yx": [2, 2],
+            "region_origin_zyx": [0, 10, 20],
+            "region_shape_zyx": [4, 30, 40],
+            "write_origin_zyx": [0, 12, 22],
+            "write_shape_zyx": [4, 26, 36],
+            "write_offset_zyx": [0, 2, 2],
+            "full_volume_shape_zyx": [4, 60, 80],
+        },
+        total_elapsed_wall_ms=50.0,
+        extraction_elapsed_wall_ms=5.0,
+        backend_call_elapsed_wall_ms=40.0,
+        flow_validation_elapsed_wall_ms=5.0,
+        worker_lifecycle=_worker_lifecycle(tile_index=3, worker_process_pid=4103, total_tile_wall_ms=50.0),
+    )
+    payload = recorder.build_payload()
+    malformed = cast(dict[str, Any], dict(payload))
+    rounds = cast(list[dict[str, Any]], malformed["rounds"])
+    tiled = cast(dict[str, Any], rounds[0]["tiled_local"])
+    tile = cast(dict[str, Any], tiled["tiles"][0])
+    lifecycle = cast(dict[str, Any], dict(tile["worker_lifecycle"]))
+    lifecycle["backend_construct_ms"] = -1.0
+    tile["worker_lifecycle"] = lifecycle
+
+    with pytest.raises(ValueError, match="worker_lifecycle.*backend_construct_ms"):
+        validate_registration_performance_payload(malformed, expected_fov_id=FOV_ID)
+
+
+def test_tiled_local_tile_identity_drift_fails_payload_validation() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    recorder.start_round(2, is_reference_round=False)
+    recorder.record_tiled_local_tile(
+        2,
+        tile_identity={
+            "tile_index": 3,
+            "grid_position_yx": [0, 2],
+            "grid_shape_yx": [2, 2],
+            "region_origin_zyx": [0, 10, 20],
+            "region_shape_zyx": [4, 30, 40],
+            "write_origin_zyx": [0, 12, 22],
+            "write_shape_zyx": [4, 26, 36],
+            "write_offset_zyx": [0, 2, 2],
+            "full_volume_shape_zyx": [4, 60, 80],
+        },
+        total_elapsed_wall_ms=50.0,
+        extraction_elapsed_wall_ms=5.0,
+        backend_call_elapsed_wall_ms=40.0,
+        flow_validation_elapsed_wall_ms=5.0,
+    )
+    payload = recorder.build_payload()
+    malformed = cast(dict[str, Any], dict(payload))
+    rounds = cast(list[dict[str, Any]], malformed["rounds"])
+    tiled = cast(dict[str, Any], rounds[0]["tiled_local"])
+    tile = cast(dict[str, Any], tiled["tiles"][0])
+    del tile["write_offset_zyx"]
+
+    with pytest.raises(ValueError, match="write_offset_zyx"):
+        validate_registration_performance_payload(malformed, expected_fov_id=FOV_ID)
+
+
+def test_tiled_local_execution_failures_fail_payload_validation() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    recorder.start_round(2, is_reference_round=False)
+    recorder.record_tiled_local_tile(
+        2,
+        tile_identity={
+            "tile_index": 1,
+            "grid_position_yx": [0, 0],
+            "grid_shape_yx": [1, 1],
+            "region_origin_zyx": [0, 0, 0],
+            "region_shape_zyx": [4, 30, 40],
+            "write_origin_zyx": [0, 0, 0],
+            "write_shape_zyx": [4, 30, 40],
+            "write_offset_zyx": [0, 0, 0],
+            "full_volume_shape_zyx": [4, 30, 40],
+        },
+        total_elapsed_wall_ms=50.0,
+        extraction_elapsed_wall_ms=5.0,
+        backend_call_elapsed_wall_ms=40.0,
+        flow_validation_elapsed_wall_ms=5.0,
+        worker_lifecycle=_worker_lifecycle(tile_index=1, worker_process_pid=4101, total_tile_wall_ms=50.0),
+    )
+    recorder.record_tiled_local_summary(
+        2,
+        layout_summary={"enabled": True, "grid_shape_yx": [1, 1], "tile_count": 1},
+        stitch_elapsed_wall_ms=6.0,
+        execution_report={
+            "requested_mode": "process_parallel",
+            "effective_mode": "process_parallel",
+            "worker_count": 1,
+            "tile_count": 1,
+            "strict_equivalence_audit": True,
+            "tile_indices": [1],
+            "failures": [],
+            "worker_lifecycle": {
+                "status": "present",
+                "worker_process_count": 1,
+                "worker_process_ids": [4101],
+                "worker_tile_counts": {"4101": 1},
+                "worker_overhead_totals_ms": {
+                    "backend_construct_ms": 2.0,
+                    "matlab_session_start_or_attach_ms": 1.0,
+                    "runtime_validation_ms": 0.5,
+                    "matlab_addpath_or_bootstrap_ms": 0.25,
+                    "input_staging_ms": 3.0,
+                    "matlab_call_ms": 20.0,
+                    "mat_output_load_ms": 4.0,
+                    "result_validation_ms": 1.0,
+                    "backend_close_ms": 0.75,
+                    "total_tile_wall_ms": 50.0,
+                },
+                "worker_overhead_percentages": {
+                    "backend_construct_ms": 4.0,
+                    "matlab_session_start_or_attach_ms": 2.0,
+                    "runtime_validation_ms": 1.0,
+                    "matlab_addpath_or_bootstrap_ms": 0.5,
+                    "input_staging_ms": 6.0,
+                    "matlab_call_ms": 40.0,
+                    "mat_output_load_ms": 8.0,
+                    "result_validation_ms": 2.0,
+                    "backend_close_ms": 1.5,
+                    "total_tile_wall_ms": 100.0,
+                },
+                "slowest_workers": [],
+            },
+        },
+    )
+    payload = recorder.build_payload()
+    malformed = cast(dict[str, Any], dict(payload))
+    rounds = cast(list[dict[str, Any]], malformed["rounds"])
+    tiled = cast(dict[str, Any], rounds[0]["tiled_local"])
+    execution = cast(dict[str, Any], dict(tiled["execution"]))
+    execution["failures"] = [{"tile_index": 1, "error": "synthetic worker failure"}]
+    tiled["execution"] = execution
+
+    with pytest.raises(ValueError, match="failures must be empty"):
         validate_registration_performance_payload(malformed, expected_fov_id=FOV_ID)
 
 

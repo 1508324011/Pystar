@@ -20,6 +20,7 @@ from typing import Any, cast
 import numpy as np
 
 from ._io_paths import get_fov_output_structure
+from ._registration_worker_lifecycle import WORKER_LIFECYCLE_MS_FIELDS, WORKER_LIFECYCLE_REQUIRED_FIELDS
 from ._stage_contracts import get_stage_spec
 from .matlab_engine_bootstrap import MATLAB_BOUNDARY_SEAM_COST_KEYS, summarize_matlab_boundary_traces
 from .serialization import write_backend_metadata
@@ -28,7 +29,6 @@ from .serialization import write_backend_metadata
 REGISTRATION_PERFORMANCE_SCHEMA_NAME = "pystar_registration_performance_diagnostics"
 REGISTRATION_PERFORMANCE_SCHEMA_VERSION = 1
 REGISTRATION_PERFORMANCE_STAGE_ID = "registration"
-
 
 def diagnostics_timer_start() -> float:
     """Return a high-resolution timer token for registration diagnostics."""
@@ -223,6 +223,181 @@ def _validate_boundary_instrumentation(boundary: Mapping[str, Any], *, field_nam
     total_duration = boundary.get("total_duration_ms")
     if total_duration is not None:
         _ = _validate_elapsed_ms(total_duration, field_name=f"{field_name}.total_duration_ms")
+
+
+def _validate_worker_lifecycle(value: Any, *, field_name: str, tile_index: int | None = None) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping")
+    missing = [key for key in WORKER_LIFECYCLE_REQUIRED_FIELDS if key not in value]
+    if missing:
+        raise ValueError(f"{field_name} is missing required fields: " + ", ".join(missing))
+    lifecycle_tile_index = value.get("tile_index")
+    if isinstance(lifecycle_tile_index, bool) or not isinstance(lifecycle_tile_index, int):
+        raise ValueError(f"{field_name}.tile_index must be an integer")
+    if tile_index is not None and int(lifecycle_tile_index) != int(tile_index):
+        raise ValueError(
+            f"{field_name}.tile_index mismatch: expected {int(tile_index)}, got {lifecycle_tile_index}"
+        )
+    worker_process_pid = value.get("worker_process_pid")
+    if isinstance(worker_process_pid, bool) or not isinstance(worker_process_pid, int) or worker_process_pid <= 0:
+        raise ValueError(f"{field_name}.worker_process_pid must be a positive integer")
+    normalized: dict[str, Any] = {
+        "worker_process_pid": int(worker_process_pid),
+        "tile_index": int(lifecycle_tile_index),
+    }
+    if "status" in value:
+        normalized["status"] = _validate_status(value.get("status"), field_name=f"{field_name}.status")
+    for key in WORKER_LIFECYCLE_MS_FIELDS:
+        normalized[key] = _validate_elapsed_ms(value.get(key), field_name=f"{field_name}.{key}")
+    return normalized
+
+
+def _validate_int_field(value: Any, *, field_name: str, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{field_name} must be an integer")
+    number = int(value)
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{field_name} must be >= {minimum}")
+    return number
+
+
+def _validate_int_sequence(
+    value: Any,
+    *,
+    field_name: str,
+    length: int,
+    minimum: int | None = None,
+) -> list[int]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError(f"{field_name} must be a length-{length} integer sequence")
+    if len(value) != length:
+        raise ValueError(f"{field_name} must be a length-{length} integer sequence")
+    return [
+        _validate_int_field(item, field_name=f"{field_name}[{index}]", minimum=minimum)
+        for index, item in enumerate(value)
+    ]
+
+
+def _validate_tiled_local_tile_identity(value: Mapping[str, Any], *, field_name: str) -> int:
+    tile_index = _validate_int_field(value.get("tile_index"), field_name=f"{field_name}.tile_index", minimum=1)
+    _validate_int_sequence(value.get("grid_position_yx"), field_name=f"{field_name}.grid_position_yx", length=2, minimum=0)
+    _validate_int_sequence(value.get("grid_shape_yx"), field_name=f"{field_name}.grid_shape_yx", length=2, minimum=1)
+    _validate_int_sequence(value.get("region_origin_zyx"), field_name=f"{field_name}.region_origin_zyx", length=3, minimum=0)
+    _validate_int_sequence(value.get("region_shape_zyx"), field_name=f"{field_name}.region_shape_zyx", length=3, minimum=1)
+    _validate_int_sequence(value.get("write_origin_zyx"), field_name=f"{field_name}.write_origin_zyx", length=3, minimum=0)
+    _validate_int_sequence(value.get("write_shape_zyx"), field_name=f"{field_name}.write_shape_zyx", length=3, minimum=1)
+    _validate_int_sequence(value.get("write_offset_zyx"), field_name=f"{field_name}.write_offset_zyx", length=3, minimum=0)
+    _validate_int_sequence(value.get("full_volume_shape_zyx"), field_name=f"{field_name}.full_volume_shape_zyx", length=3, minimum=1)
+    return tile_index
+
+
+def _validate_execution_worker_lifecycle_summary(value: Any, *, field_name: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping")
+    status = value.get("status")
+    if status not in {"present", "absent"}:
+        raise ValueError(f"{field_name}.status must be 'present' or 'absent'")
+    worker_process_count = value.get("worker_process_count")
+    if isinstance(worker_process_count, bool) or not isinstance(worker_process_count, int) or worker_process_count < 0:
+        raise ValueError(f"{field_name}.worker_process_count must be a non-negative integer")
+    worker_process_ids = value.get("worker_process_ids")
+    if not isinstance(worker_process_ids, list):
+        raise ValueError(f"{field_name}.worker_process_ids must be a list")
+    for index, pid in enumerate(worker_process_ids):
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise ValueError(f"{field_name}.worker_process_ids[{index}] must be a positive integer")
+    worker_tile_counts = value.get("worker_tile_counts")
+    if not isinstance(worker_tile_counts, Mapping):
+        raise ValueError(f"{field_name}.worker_tile_counts must be a mapping")
+    for pid, count in worker_tile_counts.items():
+        if not isinstance(pid, str) or not pid:
+            raise ValueError(f"{field_name}.worker_tile_counts keys must be non-empty strings")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"{field_name}.worker_tile_counts.{pid} must be a non-negative integer")
+    for mapping_name in ("worker_overhead_totals_ms", "worker_overhead_percentages"):
+        mapping = value.get(mapping_name)
+        if not isinstance(mapping, Mapping):
+            raise ValueError(f"{field_name}.{mapping_name} must be a mapping")
+        for key in WORKER_LIFECYCLE_MS_FIELDS:
+            if key not in mapping:
+                raise ValueError(f"{field_name}.{mapping_name} is missing {key}")
+            if mapping_name == "worker_overhead_totals_ms":
+                _ = _validate_elapsed_ms(mapping.get(key), field_name=f"{field_name}.{mapping_name}.{key}")
+            else:
+                percentage = _validate_finite_number(mapping.get(key), field_name=f"{field_name}.{mapping_name}.{key}")
+                if percentage < 0:
+                    raise ValueError(f"{field_name}.{mapping_name}.{key} must be non-negative")
+    slowest_workers = value.get("slowest_workers")
+    if not isinstance(slowest_workers, list):
+        raise ValueError(f"{field_name}.slowest_workers must be a list")
+    for index, worker in enumerate(slowest_workers):
+        if not isinstance(worker, Mapping):
+            raise ValueError(f"{field_name}.slowest_workers[{index}] must be a mapping")
+        pid = worker.get("worker_process_pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise ValueError(f"{field_name}.slowest_workers[{index}].worker_process_pid must be a positive integer")
+        count = worker.get("tile_count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"{field_name}.slowest_workers[{index}].tile_count must be a non-negative integer")
+        for key in ("total_tile_wall_ms", "mean_tile_wall_ms", "max_tile_wall_ms"):
+            if key in worker:
+                _ = _validate_elapsed_ms(worker.get(key), field_name=f"{field_name}.slowest_workers[{index}].{key}")
+
+
+def _validate_tiled_local_execution_report(
+    value: Any,
+    *,
+    field_name: str,
+    tile_indices: Sequence[int],
+) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping")
+    requested_mode = value.get("requested_mode")
+    if requested_mode not in {"serial", "process_parallel"}:
+        raise ValueError(f"{field_name}.requested_mode must be 'serial' or 'process_parallel'")
+    effective_mode = value.get("effective_mode")
+    if effective_mode not in {"serial", "process_parallel"}:
+        raise ValueError(f"{field_name}.effective_mode must be 'serial' or 'process_parallel'")
+    worker_count = value.get("worker_count")
+    if isinstance(worker_count, bool) or not isinstance(worker_count, int) or worker_count <= 0:
+        raise ValueError(f"{field_name}.worker_count must be a positive integer")
+    tile_count = value.get("tile_count")
+    if isinstance(tile_count, bool) or not isinstance(tile_count, int) or tile_count < 0:
+        raise ValueError(f"{field_name}.tile_count must be a non-negative integer")
+    if int(tile_count) != len(tile_indices):
+        raise ValueError(
+            f"{field_name}.tile_count mismatch: expected {len(tile_indices)} recorded tiles, got {tile_count}"
+        )
+    if not isinstance(value.get("strict_equivalence_audit"), bool):
+        raise ValueError(f"{field_name}.strict_equivalence_audit must be a boolean")
+    raw_tile_indices = value.get("tile_indices")
+    if not isinstance(raw_tile_indices, list):
+        raise ValueError(f"{field_name}.tile_indices must be a list")
+    normalized_indices: list[int] = []
+    for index, raw_index in enumerate(raw_tile_indices):
+        normalized_indices.append(
+            _validate_int_field(raw_index, field_name=f"{field_name}.tile_indices[{index}]", minimum=1)
+        )
+    if len(normalized_indices) != len(set(normalized_indices)):
+        raise ValueError(f"{field_name}.tile_indices must not contain duplicate tile identities")
+    if tuple(normalized_indices) != tuple(tile_indices):
+        raise ValueError(
+            f"{field_name}.tile_indices must match recorded tile order: expected {list(tile_indices)}, got {normalized_indices}"
+        )
+    failures = value.get("failures")
+    if not isinstance(failures, list):
+        raise ValueError(f"{field_name}.failures must be a list")
+    if failures:
+        raise ValueError(f"{field_name}.failures must be empty for persisted successful diagnostics")
+    lifecycle_summary = value.get("worker_lifecycle")
+    if not isinstance(lifecycle_summary, Mapping):
+        raise ValueError(f"{field_name}.worker_lifecycle must be a mapping")
+    _validate_execution_worker_lifecycle_summary(
+        lifecycle_summary,
+        field_name=f"{field_name}.worker_lifecycle",
+    )
+    if effective_mode == "process_parallel" and lifecycle_summary.get("status") != "present":
+        raise ValueError(f"{field_name}.worker_lifecycle.status must be 'present' for process_parallel execution")
 
 
 def _boundary_matlab_call_ms(boundary: Mapping[str, Any] | None, *, field_name: str) -> float | None:
@@ -619,6 +794,7 @@ class RegistrationPerformanceRecorder:
         *,
         layout_summary: Mapping[str, Any],
         stitch_elapsed_wall_ms: float,
+        execution_report: Mapping[str, Any] | None = None,
     ) -> None:
         round_entry = self._round(round_id)
         tiled: dict[str, Any] | None = cast(dict[str, Any] | None, round_entry.get("tiled_local"))
@@ -627,6 +803,8 @@ class RegistrationPerformanceRecorder:
             round_entry["tiled_local"] = tiled
         tiled["layout"] = dict(layout_summary)
         tiled["stitch"] = timing_record("tiled_local_stitch", stitch_elapsed_wall_ms)
+        if execution_report is not None:
+            tiled["execution"] = dict(execution_report)
 
     def record_tiled_local_tile(
         self,
@@ -642,6 +820,7 @@ class RegistrationPerformanceRecorder:
         session_lifecycle_summary: Mapping[str, Any] | None = None,
         normalized_result: Mapping[str, Any] | None = None,
         matlab_metadata: Mapping[str, Any] | None = None,
+        worker_lifecycle: Mapping[str, Any] | None = None,
     ) -> None:
         round_entry = self._round(round_id)
         tiled: dict[str, Any] | None = cast(dict[str, Any] | None, round_entry.get("tiled_local"))
@@ -676,6 +855,12 @@ class RegistrationPerformanceRecorder:
             tile_record["session_lifecycle_summary"] = dict(session_lifecycle_summary)
         if normalized_result is not None:
             tile_record["normalized_result"] = dict(normalized_result)
+        if worker_lifecycle is not None:
+            tile_record["worker_lifecycle"] = _validate_worker_lifecycle(
+                worker_lifecycle,
+                field_name=f"round {round_id}.tiled_local.tile {tile_identity.get('tile_index', '?')}.worker_lifecycle",
+                tile_index=int(tile_identity["tile_index"]) if isinstance(tile_identity.get("tile_index"), int) else None,
+            )
         tiles.append(tile_record)
 
     def record_final_qc(
@@ -979,6 +1164,150 @@ def _matlab_internal_timing_summary(rounds: Sequence[Mapping[str, Any]]) -> dict
     }
 
 
+def _iter_tiled_local_executions(rounds: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    executions: list[Mapping[str, Any]] = []
+    for round_entry in rounds:
+        tiled = round_entry.get("tiled_local")
+        if not isinstance(tiled, Mapping):
+            continue
+        execution = tiled.get("execution")
+        if isinstance(execution, Mapping):
+            executions.append(execution)
+    return executions
+
+
+def _iter_worker_lifecycles(rounds: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    lifecycles: list[Mapping[str, Any]] = []
+    for round_entry in rounds:
+        tiled = round_entry.get("tiled_local")
+        if not isinstance(tiled, Mapping):
+            continue
+        tiles = tiled.get("tiles")
+        if not isinstance(tiles, Sequence) or isinstance(tiles, (str, bytes)):
+            continue
+        for tile in tiles:
+            if not isinstance(tile, Mapping):
+                continue
+            lifecycle = tile.get("worker_lifecycle")
+            if isinstance(lifecycle, Mapping):
+                lifecycles.append(lifecycle)
+    return lifecycles
+
+
+def _worker_lifecycle_summary(rounds: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    executions = _iter_tiled_local_executions(rounds)
+    lifecycles = _iter_worker_lifecycles(rounds)
+    execution_modes = sorted(
+        {
+            str(execution.get("effective_mode"))
+            for execution in executions
+            if isinstance(execution.get("effective_mode"), str) and str(execution.get("effective_mode")).strip()
+        }
+    )
+    requested_modes = sorted(
+        {
+            str(execution.get("requested_mode"))
+            for execution in executions
+            if isinstance(execution.get("requested_mode"), str) and str(execution.get("requested_mode")).strip()
+        }
+    )
+    worker_count_set: set[int] = set()
+    for execution in executions:
+        raw_worker_count = execution.get("worker_count")
+        if isinstance(raw_worker_count, int) and not isinstance(raw_worker_count, bool):
+            worker_count_set.add(int(raw_worker_count))
+    worker_counts = sorted(worker_count_set)
+    strict_flags = sorted(
+        {
+            bool(execution.get("strict_equivalence_audit"))
+            for execution in executions
+            if isinstance(execution.get("strict_equivalence_audit"), bool)
+        }
+    )
+    failures: list[Any] = []
+    tile_indices: list[int] = []
+    for execution in executions:
+        execution_failures = execution.get("failures")
+        if isinstance(execution_failures, Sequence) and not isinstance(execution_failures, (str, bytes)):
+            failures.extend(list(execution_failures))
+        raw_indices = execution.get("tile_indices")
+        if isinstance(raw_indices, Sequence) and not isinstance(raw_indices, (str, bytes)):
+            for raw_index in raw_indices:
+                if isinstance(raw_index, int) and not isinstance(raw_index, bool):
+                    tile_indices.append(int(raw_index))
+
+    totals = {key: 0.0 for key in WORKER_LIFECYCLE_MS_FIELDS}
+    by_pid: dict[int, dict[str, Any]] = {}
+    slowest_tiles: list[dict[str, Any]] = []
+    for lifecycle in lifecycles:
+        normalized = _validate_worker_lifecycle(lifecycle, field_name="worker_lifecycle_summary.worker_lifecycle")
+        pid = int(normalized["worker_process_pid"])
+        tile_index = int(normalized["tile_index"])
+        worker = by_pid.setdefault(
+            pid,
+            {"worker_process_pid": pid, "tile_count": 0, "total_tile_wall_ms": 0.0, "max_tile_wall_ms": 0.0},
+        )
+        worker["tile_count"] = int(worker["tile_count"]) + 1
+        tile_wall = float(normalized["total_tile_wall_ms"])
+        worker["total_tile_wall_ms"] = round(float(worker["total_tile_wall_ms"]) + tile_wall, 3)
+        worker["max_tile_wall_ms"] = round(max(float(worker["max_tile_wall_ms"]), tile_wall), 3)
+        slowest_tiles.append(
+            {
+                "worker_process_pid": pid,
+                "tile_index": tile_index,
+                "total_tile_wall_ms": tile_wall,
+                "backend_construct_ms": normalized["backend_construct_ms"],
+                "matlab_call_ms": normalized["matlab_call_ms"],
+                "backend_close_ms": normalized["backend_close_ms"],
+            }
+        )
+        for key in WORKER_LIFECYCLE_MS_FIELDS:
+            totals[key] = round(totals[key] + float(normalized[key]), 3)
+
+    total_tile_wall = totals["total_tile_wall_ms"]
+    percentages = {
+        key: round((value / total_tile_wall * 100.0), 3) if total_tile_wall > 0 else 0.0
+        for key, value in totals.items()
+    }
+    slowest_workers = []
+    for pid, row in sorted(by_pid.items()):
+        tile_count = int(row["tile_count"])
+        total_wall = round(float(row["total_tile_wall_ms"]), 3)
+        slowest_workers.append(
+            {
+                "worker_process_pid": int(pid),
+                "tile_count": tile_count,
+                "total_tile_wall_ms": total_wall,
+                "mean_tile_wall_ms": round(total_wall / tile_count, 3) if tile_count else 0.0,
+                "max_tile_wall_ms": round(float(row["max_tile_wall_ms"]), 3),
+            }
+        )
+
+    return {
+        "tiled_local_execution_status": "present" if executions else "absent",
+        "tiled_local_execution_modes": execution_modes,
+        "tiled_local_requested_modes": requested_modes,
+        "tiled_local_worker_counts": worker_counts,
+        "tiled_local_strict_equivalence_audit_values": strict_flags,
+        "tiled_local_execution_tile_indices": tile_indices,
+        "tiled_local_execution_failure_count": len(failures),
+        "tiled_local_worker_lifecycle_status": "present" if lifecycles else "absent",
+        "tiled_local_worker_process_count": len(by_pid),
+        "tiled_local_worker_process_ids": sorted(by_pid),
+        "tiled_local_worker_tile_counts": {str(pid): int(row["tile_count"]) for pid, row in sorted(by_pid.items())},
+        "tiled_local_worker_overhead_totals_ms": {key: round(value, 3) for key, value in totals.items()},
+        "tiled_local_worker_overhead_percentages": percentages,
+        "tiled_local_slowest_workers": sorted(
+            slowest_workers,
+            key=lambda item: (-float(item["total_tile_wall_ms"]), int(item["worker_process_pid"])),
+        ),
+        "tiled_local_slowest_worker_tiles": sorted(
+            slowest_tiles,
+            key=lambda item: (-float(item["total_tile_wall_ms"]), int(item["tile_index"])),
+        )[:10],
+    }
+
+
 def _round_matlab_internal_total(round_entry: Mapping[str, Any]) -> float:
     total = 0.0
     for _candidate_round, internal, _tile in _iter_matlab_internal_timing_blocks([round_entry]):
@@ -1049,6 +1378,7 @@ def _build_summary(
     boundary_summary = summarize_matlab_boundary_traces(boundary_traces) if boundary_traces else None
     flow_summary = _flow_sidecar_summary(rounds)
     matlab_internal_summary = _matlab_internal_timing_summary(rounds)
+    worker_summary = _worker_lifecycle_summary(rounds)
     round_totals = [
         {
             "round_id": int(round_entry.get("round_id", -1)),
@@ -1086,6 +1416,7 @@ def _build_summary(
         },
         "matlab_boundary_summary": boundary_summary,
         **matlab_internal_summary,
+        **worker_summary,
         "flow_sidecar_count": flow_summary["flow_sidecar_count"],
         "flow_sidecar_total_bytes": flow_summary["flow_sidecar_total_bytes"],
         "flow_sidecars": flow_summary["flow_sidecars"],
@@ -1157,11 +1488,23 @@ def _validate_nested_timings(round_entry: Mapping[str, Any], *, field_name: str)
         stitch = tiled.get("stitch")
         if stitch is not None:
             _validate_timing_record(stitch, field_name=f"{field_name}.tiled_local.stitch")
+        execution = tiled.get("execution")
+        execution_effective_mode = execution.get("effective_mode") if isinstance(execution, Mapping) else None
         tiles = tiled.get("tiles")
         if isinstance(tiles, Sequence) and not isinstance(tiles, (str, bytes)):
+            tile_indices: list[int] = []
             for index, tile in enumerate(tiles):
                 if not isinstance(tile, Mapping):
                     raise ValueError(f"{field_name}.tiled_local.tiles[{index}] must be a mapping")
+                tile_index = _validate_tiled_local_tile_identity(
+                    tile,
+                    field_name=f"{field_name}.tiled_local.tiles[{index}]",
+                )
+                if tile_index in tile_indices:
+                    raise ValueError(
+                        f"{field_name}.tiled_local.tiles contains duplicate tile identity {tile_index}"
+                    )
+                tile_indices.append(tile_index)
                 boundary = tile.get("boundary_instrumentation")
                 if isinstance(boundary, Mapping):
                     _validate_boundary_instrumentation(
@@ -1174,11 +1517,28 @@ def _validate_nested_timings(round_entry: Mapping[str, Any], *, field_name: str)
                         internal,
                         field_name=f"{field_name}.tiled_local.tiles[{index}].matlab_internal_timing",
                     )
+                lifecycle = tile.get("worker_lifecycle")
+                if lifecycle is not None:
+                    _validate_worker_lifecycle(
+                        lifecycle,
+                        field_name=f"{field_name}.tiled_local.tiles[{index}].worker_lifecycle",
+                        tile_index=tile_index,
+                    )
+                elif execution_effective_mode == "process_parallel":
+                    raise ValueError(
+                        f"{field_name}.tiled_local.tiles[{index}].worker_lifecycle is required for process_parallel execution"
+                    )
                 timings = tile.get("timings")
                 if not isinstance(timings, Mapping):
                     raise ValueError(f"{field_name}.tiled_local.tiles[{index}].timings must be a mapping")
                 for timing_name, record in timings.items():
                     _validate_timing_record(record, field_name=f"{field_name}.tiled_local.tiles[{index}].timings.{timing_name}")
+            if isinstance(execution, Mapping):
+                _validate_tiled_local_execution_report(
+                    execution,
+                    field_name=f"{field_name}.tiled_local.execution",
+                    tile_indices=tile_indices,
+                )
 
 
 def validate_registration_performance_payload(
@@ -1274,6 +1634,14 @@ def validate_registration_performance_payload(
         "matlab_boundary_call_count",
         "matlab_boundary_seam_cost_totals_ms",
         "matlab_boundary_summary",
+        "tiled_local_execution_status",
+        "tiled_local_worker_lifecycle_status",
+        "tiled_local_worker_process_count",
+        "tiled_local_worker_tile_counts",
+        "tiled_local_worker_overhead_totals_ms",
+        "tiled_local_worker_overhead_percentages",
+        "tiled_local_slowest_workers",
+        "tiled_local_slowest_worker_tiles",
         "flow_sidecar_count",
         "flow_sidecar_total_bytes",
         "flow_sidecars",
@@ -1296,6 +1664,7 @@ def validate_registration_performance_payload(
         "matlab_global_boundary_call_count",
         "matlab_local_boundary_call_count",
         "matlab_boundary_call_count",
+        "tiled_local_worker_process_count",
         "flow_sidecar_count",
         "flow_sidecar_total_bytes",
     ):
@@ -1308,6 +1677,34 @@ def validate_registration_performance_payload(
         raise ValueError("Registration diagnostics summary.nested_phase_totals_ms must be a mapping")
     if not isinstance(summary.get("matlab_boundary_seam_cost_totals_ms"), Mapping):
         raise ValueError("Registration diagnostics summary.matlab_boundary_seam_cost_totals_ms must be a mapping")
+    if summary.get("tiled_local_execution_status") not in {"present", "absent"}:
+        raise ValueError("Registration diagnostics summary.tiled_local_execution_status must be 'present' or 'absent'")
+    if summary.get("tiled_local_worker_lifecycle_status") not in {"present", "absent"}:
+        raise ValueError("Registration diagnostics summary.tiled_local_worker_lifecycle_status must be 'present' or 'absent'")
+    if not isinstance(summary.get("tiled_local_worker_tile_counts"), Mapping):
+        raise ValueError("Registration diagnostics summary.tiled_local_worker_tile_counts must be a mapping")
+    for pid, count in cast(Mapping[str, Any], summary.get("tiled_local_worker_tile_counts")).items():
+        if not isinstance(pid, str) or not pid.strip():
+            raise ValueError("Registration diagnostics summary.tiled_local_worker_tile_counts keys must be non-empty strings")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"Registration diagnostics summary.tiled_local_worker_tile_counts.{pid} must be a non-negative integer")
+    for mapping_name in ("tiled_local_worker_overhead_totals_ms", "tiled_local_worker_overhead_percentages"):
+        mapping = summary.get(mapping_name)
+        if not isinstance(mapping, Mapping):
+            raise ValueError(f"Registration diagnostics summary.{mapping_name} must be a mapping")
+        for key in WORKER_LIFECYCLE_MS_FIELDS:
+            if key not in mapping:
+                raise ValueError(f"Registration diagnostics summary.{mapping_name} is missing {key}")
+            if mapping_name == "tiled_local_worker_overhead_totals_ms":
+                _ = _validate_elapsed_ms(mapping.get(key), field_name=f"summary.{mapping_name}.{key}")
+            else:
+                percentage = _validate_finite_number(mapping.get(key), field_name=f"summary.{mapping_name}.{key}")
+                if percentage < 0:
+                    raise ValueError(f"Registration diagnostics summary.{mapping_name}.{key} must be non-negative")
+    if not isinstance(summary.get("tiled_local_slowest_workers"), list):
+        raise ValueError("Registration diagnostics summary.tiled_local_slowest_workers must be a list")
+    if not isinstance(summary.get("tiled_local_slowest_worker_tiles"), list):
+        raise ValueError("Registration diagnostics summary.tiled_local_slowest_worker_tiles must be a list")
     stage17_summary_fields = (
         "matlab_internal_timing_status",
         "matlab_internal_call_count",
