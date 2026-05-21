@@ -20,7 +20,11 @@ from typing import Any, cast
 import numpy as np
 
 from ._io_paths import get_fov_output_structure
-from ._registration_worker_lifecycle import WORKER_LIFECYCLE_MS_FIELDS, WORKER_LIFECYCLE_REQUIRED_FIELDS
+from ._registration_worker_lifecycle import (
+    WORKER_LIFECYCLE_MS_FIELDS,
+    WORKER_LIFECYCLE_OPTIONAL_MS_FIELDS,
+    WORKER_LIFECYCLE_REQUIRED_FIELDS,
+)
 from ._stage_contracts import get_stage_spec
 from .matlab_engine_bootstrap import MATLAB_BOUNDARY_SEAM_COST_KEYS, summarize_matlab_boundary_traces
 from .serialization import write_backend_metadata
@@ -249,6 +253,24 @@ def _validate_worker_lifecycle(value: Any, *, field_name: str, tile_index: int |
         normalized["status"] = _validate_status(value.get("status"), field_name=f"{field_name}.status")
     for key in WORKER_LIFECYCLE_MS_FIELDS:
         normalized[key] = _validate_elapsed_ms(value.get(key), field_name=f"{field_name}.{key}")
+    if "worker_backend_reused" in value:
+        worker_backend_reused = value.get("worker_backend_reused")
+        if not isinstance(worker_backend_reused, bool):
+            raise ValueError(f"{field_name}.worker_backend_reused must be a boolean")
+        normalized["worker_backend_reused"] = bool(worker_backend_reused)
+    if "worker_backend_reuse_index" in value:
+        reuse_index = value.get("worker_backend_reuse_index")
+        if isinstance(reuse_index, bool) or not isinstance(reuse_index, int) or int(reuse_index) <= 0:
+            raise ValueError(f"{field_name}.worker_backend_reuse_index must be a positive integer")
+        normalized["worker_backend_reuse_index"] = int(reuse_index)
+    for key in WORKER_LIFECYCLE_OPTIONAL_MS_FIELDS:
+        if key in value:
+            normalized[key] = _validate_elapsed_ms(value.get(key), field_name=f"{field_name}.{key}")
+    if "worker_tiles_completed" in value:
+        tiles_completed = value.get("worker_tiles_completed")
+        if isinstance(tiles_completed, bool) or not isinstance(tiles_completed, int) or int(tiles_completed) < 0:
+            raise ValueError(f"{field_name}.worker_tiles_completed must be a non-negative integer")
+        normalized["worker_tiles_completed"] = int(tiles_completed)
     return normalized
 
 
@@ -1239,28 +1261,47 @@ def _worker_lifecycle_summary(rounds: Sequence[Mapping[str, Any]]) -> dict[str, 
     totals = {key: 0.0 for key in WORKER_LIFECYCLE_MS_FIELDS}
     by_pid: dict[int, dict[str, Any]] = {}
     slowest_tiles: list[dict[str, Any]] = []
+    first_use_tile_count = 0
+    reused_tile_count = 0
     for lifecycle in lifecycles:
         normalized = _validate_worker_lifecycle(lifecycle, field_name="worker_lifecycle_summary.worker_lifecycle")
         pid = int(normalized["worker_process_pid"])
         tile_index = int(normalized["tile_index"])
         worker = by_pid.setdefault(
             pid,
-            {"worker_process_pid": pid, "tile_count": 0, "total_tile_wall_ms": 0.0, "max_tile_wall_ms": 0.0},
+            {
+                "worker_process_pid": pid,
+                "tile_count": 0,
+                "first_use_tile_count": 0,
+                "reused_tile_count": 0,
+                "total_tile_wall_ms": 0.0,
+                "max_tile_wall_ms": 0.0,
+            },
         )
         worker["tile_count"] = int(worker["tile_count"]) + 1
         tile_wall = float(normalized["total_tile_wall_ms"])
         worker["total_tile_wall_ms"] = round(float(worker["total_tile_wall_ms"]) + tile_wall, 3)
         worker["max_tile_wall_ms"] = round(max(float(worker["max_tile_wall_ms"]), tile_wall), 3)
-        slowest_tiles.append(
-            {
-                "worker_process_pid": pid,
-                "tile_index": tile_index,
-                "total_tile_wall_ms": tile_wall,
-                "backend_construct_ms": normalized["backend_construct_ms"],
-                "matlab_call_ms": normalized["matlab_call_ms"],
-                "backend_close_ms": normalized["backend_close_ms"],
-            }
-        )
+        worker_backend_reused = normalized.get("worker_backend_reused")
+        if worker_backend_reused is True:
+            reused_tile_count += 1
+            worker["reused_tile_count"] = int(worker["reused_tile_count"]) + 1
+        elif worker_backend_reused is False:
+            first_use_tile_count += 1
+            worker["first_use_tile_count"] = int(worker["first_use_tile_count"]) + 1
+        slowest_tile = {
+            "worker_process_pid": pid,
+            "tile_index": tile_index,
+            "total_tile_wall_ms": tile_wall,
+            "backend_construct_ms": normalized["backend_construct_ms"],
+            "matlab_call_ms": normalized["matlab_call_ms"],
+            "backend_close_ms": normalized["backend_close_ms"],
+        }
+        if "worker_backend_reused" in normalized:
+            slowest_tile["worker_backend_reused"] = normalized["worker_backend_reused"]
+        if "worker_backend_reuse_index" in normalized:
+            slowest_tile["worker_backend_reuse_index"] = normalized["worker_backend_reuse_index"]
+        slowest_tiles.append(slowest_tile)
         for key in WORKER_LIFECYCLE_MS_FIELDS:
             totals[key] = round(totals[key] + float(normalized[key]), 3)
 
@@ -1277,6 +1318,8 @@ def _worker_lifecycle_summary(rounds: Sequence[Mapping[str, Any]]) -> dict[str, 
             {
                 "worker_process_pid": int(pid),
                 "tile_count": tile_count,
+                "first_use_tile_count": int(row.get("first_use_tile_count", 0)),
+                "reused_tile_count": int(row.get("reused_tile_count", 0)),
                 "total_tile_wall_ms": total_wall,
                 "mean_tile_wall_ms": round(total_wall / tile_count, 3) if tile_count else 0.0,
                 "max_tile_wall_ms": round(float(row["max_tile_wall_ms"]), 3),
@@ -1295,6 +1338,17 @@ def _worker_lifecycle_summary(rounds: Sequence[Mapping[str, Any]]) -> dict[str, 
         "tiled_local_worker_process_count": len(by_pid),
         "tiled_local_worker_process_ids": sorted(by_pid),
         "tiled_local_worker_tile_counts": {str(pid): int(row["tile_count"]) for pid, row in sorted(by_pid.items())},
+        "tiled_local_worker_backend_reuse": {
+            "first_use_tile_count": int(first_use_tile_count),
+            "reused_tile_count": int(reused_tile_count),
+            "observed_tile_count": int(first_use_tile_count + reused_tile_count),
+            "reused_tile_fraction": round(
+                reused_tile_count / (first_use_tile_count + reused_tile_count),
+                6,
+            )
+            if first_use_tile_count + reused_tile_count
+            else 0.0,
+        },
         "tiled_local_worker_overhead_totals_ms": {key: round(value, 3) for key, value in totals.items()},
         "tiled_local_worker_overhead_percentages": percentages,
         "tiled_local_slowest_workers": sorted(

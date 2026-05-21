@@ -6,6 +6,7 @@ from typing import Any, cast
 
 import numpy as np
 import pytest
+from numpy.typing import NDArray
 
 from pystar._registration_equivalence import compare_local_demons_requests, compare_tiled_flow_outputs
 from pystar._registration_tile_executor import (
@@ -13,6 +14,7 @@ from pystar._registration_tile_executor import (
     build_matlab_local_tile_execution_plan,
     compare_tile_result_sequence,
     normalize_matlab_local_tile_results,
+    run_matlab_local_tile_process_parallel,
 )
 from pystar.infrastructure import MatlabLocalParallelConfig, RegistrationConfig
 from pystar.matlab_registration import build_matlab_local_registration_plan
@@ -24,6 +26,19 @@ FOV_ID = 7
 ROUND_ID = 2
 REFERENCE_ROUND = 1
 FULL_SHAPE_ZYX = (2, 4, 4)
+FloatArray = NDArray[np.float32]
+
+
+def _tuple2(value: Any) -> tuple[int, int]:
+    items = tuple(int(item) for item in value)
+    assert len(items) == 2
+    return (items[0], items[1])
+
+
+def _tuple3(value: Any) -> tuple[int, int, int]:
+    items = tuple(int(item) for item in value)
+    assert len(items) == 3
+    return (items[0], items[1], items[2])
 
 
 def _layout() -> TileLayout:
@@ -44,7 +59,7 @@ def _scope_descriptor() -> dict[str, Any]:
     }
 
 
-def _flow_tile(tile: TileSpec) -> np.ndarray:
+def _flow_tile(tile: TileSpec) -> FloatArray:
     flow = np.zeros((3, *tile.region_shape_zyx), dtype=np.float32)
     flow[0].fill(float(tile.tile_index))
     flow[1].fill(float(tile.grid_position_yx[0]))
@@ -71,7 +86,7 @@ def _request(tile: TileSpec) -> dict[str, Any]:
     }
 
 
-def _backend_metadata(tile: TileSpec, flow: np.ndarray) -> dict[str, Any]:
+def _backend_metadata(tile: TileSpec, flow: FloatArray) -> dict[str, Any]:
     return {
         "request": _request(tile),
         "normalized_result": {
@@ -103,7 +118,7 @@ def _worker_lifecycle(tile: TileSpec, *, status: str = "completed") -> dict[str,
 def _result(
     tile: TileSpec,
     *,
-    flow: np.ndarray | None = None,
+    flow: FloatArray | None = None,
     status: str = "completed",
     worker_lifecycle: dict[str, Any] | None = None,
 ) -> MatlabLocalTileResult:
@@ -168,8 +183,8 @@ class _SerialBackend:
 
     def compute_local_flow(
         self,
-        ref_tile: np.ndarray,
-        mov_tile: np.ndarray,
+        ref_tile: FloatArray,
+        mov_tile: FloatArray,
         *,
         fov_id: int,
         round_id: int,
@@ -180,14 +195,14 @@ class _SerialBackend:
         del ref_tile, mov_tile, scope_descriptor
         tile = TileSpec(
             tile_index=int(compute_tile["tile_index"]),
-            grid_position_yx=tuple(int(value) for value in compute_tile["grid_position_yx"]),
-            grid_shape_yx=tuple(int(value) for value in compute_tile["grid_shape_yx"]),
-            region_origin_zyx=tuple(int(value) for value in compute_tile["region_origin_zyx"]),
-            region_shape_zyx=tuple(int(value) for value in compute_tile["region_shape_zyx"]),
-            write_origin_zyx=tuple(int(value) for value in compute_tile["write_origin_zyx"]),
-            write_shape_zyx=tuple(int(value) for value in compute_tile["write_shape_zyx"]),
-            write_offset_zyx=tuple(int(value) for value in compute_tile["write_offset_zyx"]),
-            full_volume_shape_zyx=tuple(int(value) for value in compute_tile["full_volume_shape_zyx"]),
+            grid_position_yx=_tuple2(compute_tile["grid_position_yx"]),
+            grid_shape_yx=_tuple2(compute_tile["grid_shape_yx"]),
+            region_origin_zyx=_tuple3(compute_tile["region_origin_zyx"]),
+            region_shape_zyx=_tuple3(compute_tile["region_shape_zyx"]),
+            write_origin_zyx=_tuple3(compute_tile["write_origin_zyx"]),
+            write_shape_zyx=_tuple3(compute_tile["write_shape_zyx"]),
+            write_offset_zyx=_tuple3(compute_tile["write_offset_zyx"]),
+            full_volume_shape_zyx=_tuple3(compute_tile["full_volume_shape_zyx"]),
         )
         self.calls.append(
             {
@@ -199,6 +214,67 @@ class _SerialBackend:
         )
         flow = _flow_tile(tile)
         return {"flow_3d": flow, "backend_metadata": _backend_metadata(tile, flow)}
+
+
+class _WorkerReusableBackend:
+    construct_count: int = 0
+    close_count: int = 0
+    call_count: int = 0
+
+    def __init__(self, config: Any) -> None:
+        del config
+        type(self).construct_count += 1
+        self.instance_id: int = int(type(self).construct_count)
+        self.closed: bool = False
+
+    def compute_local_flow(
+        self,
+        ref_tile: FloatArray,
+        mov_tile: FloatArray,
+        *,
+        fov_id: int,
+        round_id: int,
+        reference_round: int,
+        scope_descriptor: dict[str, Any],
+        compute_tile: dict[str, Any],
+    ) -> dict[str, Any]:
+        del ref_tile, mov_tile, fov_id, round_id, reference_round, scope_descriptor
+        type(self).call_count += 1
+        tile = TileSpec(
+            tile_index=int(compute_tile["tile_index"]),
+            grid_position_yx=_tuple2(compute_tile["grid_position_yx"]),
+            grid_shape_yx=_tuple2(compute_tile["grid_shape_yx"]),
+            region_origin_zyx=_tuple3(compute_tile["region_origin_zyx"]),
+            region_shape_zyx=_tuple3(compute_tile["region_shape_zyx"]),
+            write_origin_zyx=_tuple3(compute_tile["write_origin_zyx"]),
+            write_shape_zyx=_tuple3(compute_tile["write_shape_zyx"]),
+            write_offset_zyx=_tuple3(compute_tile["write_offset_zyx"]),
+            full_volume_shape_zyx=_tuple3(compute_tile["full_volume_shape_zyx"]),
+        )
+        flow = _flow_tile(tile)
+        metadata = _backend_metadata(tile, flow)
+        metadata["boundary_instrumentation"] = {
+            "seam_costs_ms": {
+                "runtime_file_validation_ms": 0.5 if type(self).call_count == 1 else 0.0,
+                "input_staging_ms": 1.0,
+                "matlab_call_ms": 2.0,
+                "result_validation_ms": 0.25,
+            },
+            "phase_timings_ms": {"mat_output_load": 0.75},
+            "phase_details": {
+                "engine_bootstrap": {
+                    "start_matlab_ms": 3.0 if self.instance_id == 1 and type(self).call_count == 1 else 0.0,
+                    "connect_matlab_ms": 0.0,
+                    "addpath_ms": 1.5 if self.instance_id == 1 and type(self).call_count == 1 else 0.0,
+                }
+            },
+        }
+        return {"flow_3d": flow, "backend_metadata": metadata}
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            type(self).close_count += 1
 
 
 def test_parallel_config_defaults_to_serial_off() -> None:
@@ -221,29 +297,30 @@ def test_parallel_config_requires_positive_workers_when_enabled() -> None:
 
 
 def test_registration_config_rejects_parallel_without_matlab_tiled_local() -> None:
-    source = {"method": "mip_all_channels", "mip_channels": [0, 1, 2]}
+    source = cast(Any, {"method": "mip_all_channels", "mip_channels": [0, 1, 2]})
+    enabled_parallel = cast(Any, {"enabled": True, "workers": 2})
 
     with pytest.raises(ValueError, match="requires registration.local.enabled=true"):
         _ = RegistrationConfig(
             reference_round=1,
             source=source,
-            matlab_local_parallel={"enabled": True, "workers": 2},
+            matlab_local_parallel=enabled_parallel,
         )
 
     with pytest.raises(ValueError, match="provider='matlab'.*method='demons_3d'"):
         _ = RegistrationConfig(
             reference_round=1,
             source=source,
-            local={"enabled": True, "method": "demons_3d", "provider": "native"},
-            matlab_local_parallel={"enabled": True, "workers": 2},
+            local=cast(Any, {"enabled": True, "method": "demons_3d", "provider": "native"}),
+            matlab_local_parallel=enabled_parallel,
         )
 
     with pytest.raises(ValueError, match="use_tiling=true"):
         _ = RegistrationConfig(
             reference_round=1,
             source=source,
-            local={"enabled": True, "method": "demons_3d", "provider": "matlab"},
-            matlab_local_parallel={"enabled": True, "workers": 2},
+            local=cast(Any, {"enabled": True, "method": "demons_3d", "provider": "matlab"}),
+            matlab_local_parallel=enabled_parallel,
         )
 
 
@@ -349,9 +426,131 @@ def test_parallel_results_are_restored_by_tile_index_before_stitching() -> None:
     assert report.to_dict()["worker_lifecycle"]["status"] == "present"
     assert report.to_dict()["worker_lifecycle"]["worker_process_count"] == 2
     assert report.to_dict()["worker_lifecycle"]["worker_tile_counts"] == {"4300": 2, "4301": 2}
-    stitched = stitch_tiles([(result.tile, cast(np.ndarray, result.flow_tile)) for result in ordered], full_shape_zyx=FULL_SHAPE_ZYX)
+    stitched = stitch_tiles([(result.tile, cast(FloatArray, result.flow_tile)) for result in ordered], full_shape_zyx=FULL_SHAPE_ZYX)
     expected = stitch_tiles([(tile, _flow_tile(tile)) for tile in layout.tiles], full_shape_zyx=FULL_SHAPE_ZYX)
     np.testing.assert_array_equal(stitched, expected)
+
+
+def test_worker_local_backend_is_reused_for_multiple_jobs_and_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    import pystar._registration_tile_executor as executor_module
+
+    layout = _layout()
+    ref = np.arange(np.prod(FULL_SHAPE_ZYX), dtype=np.float32).reshape(FULL_SHAPE_ZYX)
+    mov = ref + np.float32(1.0)
+    plan = build_matlab_local_tile_execution_plan(
+        config=_config(parallel=True),
+        ref_volume_zyx=ref,
+        mov_volume_zyx=mov,
+        fov_id=FOV_ID,
+        round_id=ROUND_ID,
+        reference_round=REFERENCE_ROUND,
+        scope_descriptor=_scope_descriptor(),
+        layout=layout,
+        worker_count=1,
+        execution_mode="process_parallel",
+        strict_equivalence_audit=True,
+    )
+    _WorkerReusableBackend.construct_count = 0
+    _WorkerReusableBackend.close_count = 0
+    _WorkerReusableBackend.call_count = 0
+    _ = executor_module._close_worker_backend()
+    monkeypatch.setattr(executor_module, "MATLABRegistrationBackend", _WorkerReusableBackend)
+
+    try:
+        raw_results = tuple(executor_module._run_matlab_local_tile_job(job) for job in plan.jobs)
+        backend_close_ms = executor_module._close_worker_backend()
+    finally:
+        _ = executor_module._close_worker_backend()
+
+    ordered, report = normalize_matlab_local_tile_results(
+        raw_results,
+        layout=layout,
+        requested_mode="process_parallel",
+        effective_mode="process_parallel",
+        worker_count=1,
+        strict_equivalence_audit=True,
+    )
+
+    assert _WorkerReusableBackend.construct_count == 1
+    assert _WorkerReusableBackend.close_count == 1
+    assert _WorkerReusableBackend.call_count == len(layout.tiles)
+    assert backend_close_ms >= 0.0
+    lifecycles = [cast(dict[str, Any], result.worker_lifecycle) for result in ordered]
+    assert [lifecycle["worker_backend_reused"] for lifecycle in lifecycles] == [False, True, True, True]
+    assert [lifecycle["worker_backend_reuse_index"] for lifecycle in lifecycles] == [1, 2, 3, 4]
+    assert [lifecycle["worker_tiles_completed"] for lifecycle in lifecycles] == [1, 2, 3, 4]
+    assert lifecycles[0]["backend_construct_ms"] >= 0.0
+    assert all(float(lifecycle["backend_close_ms"]) == 0.0 for lifecycle in lifecycles)
+    execution = report.to_dict()
+    assert execution["worker_lifecycle"]["worker_backend_reuse"]["first_use_tile_count"] == 1
+    assert execution["worker_lifecycle"]["worker_backend_reuse"]["reused_tile_count"] == 3
+
+
+def test_worker_backend_init_failure_fails_loudly_without_serial_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    import pystar._registration_tile_executor as executor_module
+
+    class FailingBackend:
+        def __init__(self, config: Any) -> None:
+            del config
+            raise RuntimeError("synthetic backend init failure")
+
+    layout = _layout()
+    ref = np.arange(np.prod(FULL_SHAPE_ZYX), dtype=np.float32).reshape(FULL_SHAPE_ZYX)
+    mov = ref + np.float32(1.0)
+    plan = build_matlab_local_tile_execution_plan(
+        config=_config(parallel=True),
+        ref_volume_zyx=ref,
+        mov_volume_zyx=mov,
+        fov_id=FOV_ID,
+        round_id=ROUND_ID,
+        reference_round=REFERENCE_ROUND,
+        scope_descriptor=_scope_descriptor(),
+        layout=layout,
+        worker_count=1,
+        execution_mode="process_parallel",
+        strict_equivalence_audit=True,
+    )
+    _ = executor_module._close_worker_backend()
+    monkeypatch.setattr(executor_module, "MATLABRegistrationBackend", FailingBackend)
+
+    failed_result = executor_module._run_matlab_local_tile_job(plan.jobs[0])
+
+    assert failed_result.status == "failed"
+    assert failed_result.flow_tile is None
+    assert failed_result.error is not None
+    assert "synthetic backend init failure" in failed_result.error
+    assert isinstance(failed_result.worker_lifecycle, dict)
+    assert failed_result.worker_lifecycle["status"] == "failed"
+    with pytest.raises(RuntimeError, match="synthetic backend init failure"):
+        _ = normalize_matlab_local_tile_results(
+            (failed_result,),
+            layout=layout,
+            requested_mode="process_parallel",
+            effective_mode="process_parallel",
+            worker_count=1,
+            strict_equivalence_audit=True,
+        )
+
+    assert executor_module._close_worker_backend() == 0.0
+
+
+def test_process_parallel_executor_accepts_empty_plan_without_starting_matlab() -> None:
+    layout = _layout()
+    empty_plan = build_matlab_local_tile_execution_plan(
+        config=_config(parallel=True),
+        ref_volume_zyx=np.zeros(FULL_SHAPE_ZYX, dtype=np.float32),
+        mov_volume_zyx=np.zeros(FULL_SHAPE_ZYX, dtype=np.float32),
+        fov_id=FOV_ID,
+        round_id=ROUND_ID,
+        reference_round=REFERENCE_ROUND,
+        scope_descriptor=_scope_descriptor(),
+        layout=replace(layout, tiles=()),
+        worker_count=1,
+        execution_mode="process_parallel",
+        strict_equivalence_audit=True,
+    )
+
+    assert run_matlab_local_tile_process_parallel(empty_plan) == ()
 
 
 def test_parallel_worker_failure_fails_loudly_without_serial_fallback() -> None:
