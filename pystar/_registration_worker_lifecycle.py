@@ -23,6 +23,21 @@ WORKER_LIFECYCLE_MS_FIELDS = (
 )
 
 
+WORKER_LIFECYCLE_OPTIONAL_MS_FIELDS = (
+    "worker_initializer_ms",
+    "worker_teardown_ms",
+    "worker_session_lifetime_ms",
+)
+
+
+WORKER_LIFECYCLE_OPTIONAL_FIELDS = (
+    "worker_backend_reused",
+    "worker_backend_reuse_index",
+    *WORKER_LIFECYCLE_OPTIONAL_MS_FIELDS,
+    "worker_tiles_completed",
+)
+
+
 WORKER_LIFECYCLE_REQUIRED_FIELDS = (
     "worker_process_pid",
     "tile_index",
