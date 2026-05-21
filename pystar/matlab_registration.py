@@ -535,7 +535,7 @@ class MATLABRegistrationBackend:
         round_id: int,
     ) -> NDArray[np.float32]:
         flow_variable = str(metadata["flow_variable"])
-        mat_payload = loadmat(flow_output_path)
+        mat_payload = loadmat(flow_output_path, variable_names=[flow_variable])
         if flow_variable not in mat_payload:
             raise ValueError(
                 f"MATLAB local-registration output is missing variable {flow_variable!r}: {flow_output_path}"
