@@ -340,6 +340,37 @@ def test_matlab_local_internal_steps_normalize_and_aggregate_without_matlab() ->
     assert summary["matlab_internal_dominant_step_counts"] == {"imregdemons": 1}
     assert summary["slowest_rounds"][0]["matlab_internal_total_duration_ms"] == 100.0
 
+    hot_path = summary["matlab_local_hot_path_profile"]
+    assert hot_path["status"] == "present"
+    assert hot_path["source"] == "matlab_metadata.steps + boundary_instrumentation.seam_costs_ms.matlab_call_ms"
+    assert hot_path["scope"] == "matlab_local_registration"
+    assert hot_path["call_count"] == 1
+    assert hot_path["boundary_closure_count"] == 1
+    assert hot_path["boundary_closure_complete"] is True
+    assert hot_path["boundary_matlab_call_total_ms"] == 106.0
+    assert hot_path["matlab_internal_total_duration_ms"] == 100.0
+    assert hot_path["boundary_minus_internal_total_ms"] == 6.0
+    assert hot_path["matlab_internal_unaccounted_total_ms"] == 5.0
+    assert hot_path["step_totals_ms"] == summary["matlab_internal_step_totals_ms"]
+    assert hot_path["step_call_counts"] == {
+        "imregdemons": 1,
+        "new_LoadMultipageTiff": 1,
+        "save_local_flow_mat": 1,
+    }
+    assert hot_path["step_percent_of_matlab_internal_total"]["imregdemons"] == 80.0
+    assert hot_path["step_percent_of_boundary_matlab_call"]["imregdemons"] == 75.472
+    assert hot_path["dominant_internal_step"] == {
+        "name": "imregdemons",
+        "total_duration_ms": 80.0,
+        "call_count": 1,
+        "percent_of_matlab_internal_total": 80.0,
+        "percent_of_boundary_matlab_call": 75.472,
+        "owner": "matlab_runtime/pystar_registration/pystar_register_local_demons_entry.m",
+    }
+    assert hot_path["hot_path_rankings"][0]["component_type"] == "matlab_step"
+    assert hot_path["hot_path_rankings"][0]["name"] == "imregdemons"
+    assert hot_path["hot_path_rankings"][0]["total_duration_ms"] == 80.0
+
 
 def test_tiled_matlab_internal_steps_preserve_dominant_step_and_aggregate() -> None:
     recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
@@ -518,6 +549,9 @@ def test_missing_matlab_internal_steps_remain_valid_and_absent() -> None:
     assert payload["summary"]["matlab_internal_timing_status"] == "absent"
     assert payload["summary"]["matlab_internal_call_count"] == 0
     assert payload["summary"]["matlab_internal_step_totals_ms"] == {}
+    assert payload["summary"]["matlab_local_hot_path_profile"]["status"] == "absent"
+    assert payload["summary"]["matlab_local_hot_path_profile"]["call_count"] == 0
+    assert payload["summary"]["matlab_local_hot_path_profile"]["hot_path_rankings"] == []
 
 
 def test_internal_timing_without_boundary_reports_null_closure_delta() -> None:
@@ -539,6 +573,107 @@ def test_internal_timing_without_boundary_reports_null_closure_delta() -> None:
     assert internal["boundary_matlab_call_ms"] is None
     assert internal["boundary_minus_matlab_total_ms"] is None
     assert payload["summary"]["matlab_boundary_minus_internal_total_ms"] is None
+    assert payload["summary"]["matlab_local_hot_path_profile"]["boundary_closure_complete"] is False
+    assert payload["summary"]["matlab_local_hot_path_profile"]["boundary_matlab_call_total_ms"] is None
+    assert payload["summary"]["matlab_local_hot_path_profile"]["boundary_minus_internal_total_ms"] is None
+
+
+def test_stage19_hot_path_profile_is_optional_for_older_diagnostics() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    recorder.start_round(2, is_reference_round=False)
+    recorder.record_local_registration(
+        2,
+        elapsed_wall_ms=120.0,
+        provider="matlab",
+        method="demons_3d",
+        status="accepted",
+        final_corr=0.92,
+        backend_metadata={"local_flow": {"matlab_metadata": _matlab_internal_metadata()}},
+    )
+    payload = recorder.build_payload()
+    legacy_payload = dict(payload)
+    legacy_summary = dict(legacy_payload["summary"])
+    legacy_summary.pop("matlab_local_hot_path_profile")
+    legacy_payload["summary"] = legacy_summary
+
+    validate_registration_performance_payload(legacy_payload, expected_fov_id=FOV_ID)
+
+
+def test_malformed_stage19_hot_path_profile_fails_payload_validation() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    payload = recorder.build_payload()
+    malformed = dict(payload)
+    malformed_summary = dict(malformed["summary"])
+    malformed_summary["matlab_local_hot_path_profile"] = {
+        "schema_version": "1.0",
+        "status": "present",
+        "source": "matlab_metadata.steps + boundary_instrumentation.seam_costs_ms.matlab_call_ms",
+        "scope": "matlab_local_registration",
+        "call_count": 1,
+        "boundary_closure_count": 1,
+        "boundary_closure_complete": True,
+        "boundary_matlab_call_total_ms": 10.0,
+        "matlab_internal_total_duration_ms": 9.0,
+        "boundary_minus_internal_total_ms": 1.0,
+        "matlab_internal_unaccounted_total_ms": 0.0,
+        "step_totals_ms": {"imregdemons": -1.0},
+        "step_call_counts": {"imregdemons": 1},
+        "step_percent_of_matlab_internal_total": {"imregdemons": 100.0},
+        "step_percent_of_boundary_matlab_call": {"imregdemons": 90.0},
+        "dominant_internal_step": None,
+        "hot_path_rankings": [],
+    }
+    malformed["summary"] = malformed_summary
+
+    with pytest.raises(ValueError, match="matlab_local_hot_path_profile.*step_totals_ms"):
+        validate_registration_performance_payload(malformed, expected_fov_id=FOV_ID)
+
+
+def test_partial_stage19_hot_path_boundary_closure_fails_payload_validation() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    payload = recorder.build_payload()
+    malformed = dict(payload)
+    malformed_summary = dict(malformed["summary"])
+    malformed_summary["matlab_local_hot_path_profile"] = {
+        "schema_version": "1.0",
+        "status": "present",
+        "source": "matlab_metadata.steps + boundary_instrumentation.seam_costs_ms.matlab_call_ms",
+        "scope": "matlab_local_registration",
+        "call_count": 2,
+        "boundary_closure_count": 1,
+        "boundary_closure_complete": False,
+        "boundary_matlab_call_total_ms": 10.0,
+        "matlab_internal_total_duration_ms": 9.0,
+        "boundary_minus_internal_total_ms": 1.0,
+        "matlab_internal_unaccounted_total_ms": 0.0,
+        "step_totals_ms": {"imregdemons": 9.0},
+        "step_call_counts": {"imregdemons": 1},
+        "step_percent_of_matlab_internal_total": {"imregdemons": 100.0},
+        "step_percent_of_boundary_matlab_call": {},
+        "dominant_internal_step": {
+            "name": "imregdemons",
+            "total_duration_ms": 9.0,
+            "call_count": 1,
+            "percent_of_matlab_internal_total": 100.0,
+            "percent_of_boundary_matlab_call": None,
+            "owner": "matlab_runtime/pystar_registration/pystar_register_local_demons_entry.m",
+        },
+        "hot_path_rankings": [
+            {
+                "component_type": "matlab_step",
+                "name": "imregdemons",
+                "owner": "matlab_runtime/pystar_registration/pystar_register_local_demons_entry.m",
+                "total_duration_ms": 9.0,
+                "percent_of_matlab_internal_total": 100.0,
+                "percent_of_boundary_matlab_call": None,
+                "call_count": 1,
+            }
+        ],
+    }
+    malformed["summary"] = malformed_summary
+
+    with pytest.raises(ValueError, match="boundary_matlab_call_total_ms.*closure is incomplete"):
+        validate_registration_performance_payload(malformed, expected_fov_id=FOV_ID)
 
 
 def test_step_durations_exceeding_total_fail_loudly() -> None:

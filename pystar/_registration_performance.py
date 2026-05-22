@@ -591,6 +591,155 @@ def _validate_matlab_internal_timing_block(value: Any, *, field_name: str) -> No
         )
 
 
+def _validate_optional_percentage(value: Any, *, field_name: str) -> None:
+    if value is None:
+        return
+    percentage = _validate_finite_number(value, field_name=field_name)
+    if percentage < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+
+
+def _validate_hot_path_percentage_mapping(value: Any, *, field_name: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping")
+    for key, percentage in value.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(f"{field_name} keys must be non-empty strings")
+        _validate_optional_percentage(percentage, field_name=f"{field_name}.{key}")
+
+
+def _validate_matlab_local_hot_path_profile(value: Any, *, field_name: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping")
+    if value.get("schema_version") != "1.0":
+        raise ValueError(f"{field_name}.schema_version must be '1.0'")
+    status = value.get("status")
+    if status not in {"present", "absent"}:
+        raise ValueError(f"{field_name}.status must be 'present' or 'absent'")
+    source = value.get("source")
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError(f"{field_name}.source must be a non-empty string")
+    scope = value.get("scope")
+    if not isinstance(scope, str) or not scope.strip():
+        raise ValueError(f"{field_name}.scope must be a non-empty string")
+    counts: dict[str, int] = {}
+    for count_field in ("call_count", "boundary_closure_count"):
+        count_value = value.get(count_field)
+        if isinstance(count_value, bool) or not isinstance(count_value, int) or count_value < 0:
+            raise ValueError(f"{field_name}.{count_field} must be a non-negative integer")
+        counts[count_field] = count_value
+    if not isinstance(value.get("boundary_closure_complete"), bool):
+        raise ValueError(f"{field_name}.boundary_closure_complete must be a boolean")
+    call_count = counts["call_count"]
+    boundary_closure_count = counts["boundary_closure_count"]
+    if status == "absent" and call_count != 0:
+        raise ValueError(f"{field_name}.call_count must be 0 when status is 'absent'")
+    if boundary_closure_count > call_count:
+        raise ValueError(f"{field_name}.boundary_closure_count must be <= call_count")
+    expected_closure_complete = call_count > 0 and boundary_closure_count == call_count
+    if bool(value.get("boundary_closure_complete")) is not expected_closure_complete:
+        raise ValueError(
+            f"{field_name}.boundary_closure_complete must reflect whether every counted call has boundary closure data"
+        )
+
+    boundary_total = value.get("boundary_matlab_call_total_ms")
+    if boundary_total is not None:
+        _ = _validate_elapsed_ms(boundary_total, field_name=f"{field_name}.boundary_matlab_call_total_ms")
+    _ = _validate_elapsed_ms(
+        value.get("matlab_internal_total_duration_ms"),
+        field_name=f"{field_name}.matlab_internal_total_duration_ms",
+    )
+    boundary_delta = value.get("boundary_minus_internal_total_ms")
+    if boundary_delta is not None:
+        _ = _validate_finite_number(boundary_delta, field_name=f"{field_name}.boundary_minus_internal_total_ms")
+    if not bool(value.get("boundary_closure_complete")):
+        if boundary_total is not None:
+            raise ValueError(f"{field_name}.boundary_matlab_call_total_ms must be null when boundary closure is incomplete")
+        if boundary_delta is not None:
+            raise ValueError(f"{field_name}.boundary_minus_internal_total_ms must be null when boundary closure is incomplete")
+    _ = _validate_elapsed_ms(
+        value.get("matlab_internal_unaccounted_total_ms"),
+        field_name=f"{field_name}.matlab_internal_unaccounted_total_ms",
+    )
+
+    step_totals = value.get("step_totals_ms")
+    if not isinstance(step_totals, Mapping):
+        raise ValueError(f"{field_name}.step_totals_ms must be a mapping")
+    for step_name, duration_ms in step_totals.items():
+        if not isinstance(step_name, str) or not step_name.strip():
+            raise ValueError(f"{field_name}.step_totals_ms keys must be non-empty strings")
+        _ = _validate_elapsed_ms(duration_ms, field_name=f"{field_name}.step_totals_ms.{step_name}")
+
+    step_counts = value.get("step_call_counts")
+    if not isinstance(step_counts, Mapping):
+        raise ValueError(f"{field_name}.step_call_counts must be a mapping")
+    for step_name, count in step_counts.items():
+        if not isinstance(step_name, str) or not step_name.strip():
+            raise ValueError(f"{field_name}.step_call_counts keys must be non-empty strings")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"{field_name}.step_call_counts.{step_name} must be a non-negative integer")
+
+    _validate_hot_path_percentage_mapping(
+        value.get("step_percent_of_matlab_internal_total"),
+        field_name=f"{field_name}.step_percent_of_matlab_internal_total",
+    )
+    _validate_hot_path_percentage_mapping(
+        value.get("step_percent_of_boundary_matlab_call"),
+        field_name=f"{field_name}.step_percent_of_boundary_matlab_call",
+    )
+
+    dominant = value.get("dominant_internal_step")
+    if dominant is not None:
+        if not isinstance(dominant, Mapping):
+            raise ValueError(f"{field_name}.dominant_internal_step must be null or a mapping")
+        dominant_name = dominant.get("name")
+        if not isinstance(dominant_name, str) or not dominant_name.strip():
+            raise ValueError(f"{field_name}.dominant_internal_step.name must be a non-empty string")
+        _ = _validate_elapsed_ms(
+            dominant.get("total_duration_ms"),
+            field_name=f"{field_name}.dominant_internal_step.total_duration_ms",
+        )
+        dominant_count = dominant.get("call_count")
+        if isinstance(dominant_count, bool) or not isinstance(dominant_count, int) or dominant_count < 0:
+            raise ValueError(f"{field_name}.dominant_internal_step.call_count must be a non-negative integer")
+        _validate_optional_percentage(
+            dominant.get("percent_of_matlab_internal_total"),
+            field_name=f"{field_name}.dominant_internal_step.percent_of_matlab_internal_total",
+        )
+        _validate_optional_percentage(
+            dominant.get("percent_of_boundary_matlab_call"),
+            field_name=f"{field_name}.dominant_internal_step.percent_of_boundary_matlab_call",
+        )
+        owner = dominant.get("owner")
+        if not isinstance(owner, str) or not owner.strip():
+            raise ValueError(f"{field_name}.dominant_internal_step.owner must be a non-empty string")
+
+    rankings = value.get("hot_path_rankings")
+    if not isinstance(rankings, list):
+        raise ValueError(f"{field_name}.hot_path_rankings must be a list")
+    for index, row in enumerate(rankings):
+        row_field = f"{field_name}.hot_path_rankings[{index}]"
+        if not isinstance(row, Mapping):
+            raise ValueError(f"{row_field} must be a mapping")
+        for text_field in ("component_type", "name", "owner"):
+            text_value = row.get(text_field)
+            if not isinstance(text_value, str) or not text_value.strip():
+                raise ValueError(f"{row_field}.{text_field} must be a non-empty string")
+        _ = _validate_elapsed_ms(row.get("total_duration_ms"), field_name=f"{row_field}.total_duration_ms")
+        _validate_optional_percentage(
+            row.get("percent_of_matlab_internal_total"),
+            field_name=f"{row_field}.percent_of_matlab_internal_total",
+        )
+        _validate_optional_percentage(
+            row.get("percent_of_boundary_matlab_call"),
+            field_name=f"{row_field}.percent_of_boundary_matlab_call",
+        )
+        if "call_count" in row:
+            row_count = row.get("call_count")
+            if isinstance(row_count, bool) or not isinstance(row_count, int) or row_count < 0:
+                raise ValueError(f"{row_field}.call_count must be a non-negative integer")
+
+
 def _sum_numeric_mapping(target: dict[str, float], source: Mapping[str, Any]) -> None:
     for key, value in source.items():
         if not isinstance(key, str):
@@ -1186,6 +1335,194 @@ def _matlab_internal_timing_summary(rounds: Sequence[Mapping[str, Any]]) -> dict
     }
 
 
+def _percentage(value: float, total: float) -> float:
+    if total <= 0:
+        return 0.0
+    return round(float(value) / float(total) * 100.0, 3)
+
+
+def _percentage_mapping(values: Mapping[str, float], total: float) -> dict[str, float]:
+    return {key: _percentage(value, total) for key, value in sorted(values.items())}
+
+
+def _profile_hot_path_row(
+    *,
+    component_type: str,
+    name: str,
+    owner: str,
+    total_duration_ms: float,
+    internal_total_ms: float,
+    boundary_call_total_ms: float | None,
+    call_count: int | None = None,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "component_type": component_type,
+        "name": name,
+        "owner": owner,
+        "total_duration_ms": round(float(total_duration_ms), 3),
+        "percent_of_matlab_internal_total": _percentage(float(total_duration_ms), internal_total_ms),
+        "percent_of_boundary_matlab_call": None
+        if boundary_call_total_ms is None
+        else _percentage(float(total_duration_ms), boundary_call_total_ms),
+    }
+    if call_count is not None:
+        row["call_count"] = int(call_count)
+    return row
+
+
+def _matlab_local_hot_path_profile(rounds: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Build an additive Stage19 local MATLAB hot-path profile.
+
+    The profile derives only from already-recorded Stage17 internal timing and
+    outer MATLAB boundary data.  It does not introduce a new timing owner or
+    change MATLAB runtime behavior; older diagnostics without this optional
+    block remain valid.
+    """
+
+    call_count = 0
+    boundary_closure_count = 0
+    boundary_call_total_ms = 0.0
+    boundary_minus_internal_total_ms = 0.0
+    internal_total_ms = 0.0
+    internal_unaccounted_total_ms = 0.0
+    step_totals_ms: dict[str, float] = {}
+    step_call_counts: dict[str, int] = {}
+
+    for _round_entry, internal, _tile in _iter_matlab_internal_timing_blocks(rounds):
+        _validate_matlab_internal_timing_block(internal, field_name="matlab_local_hot_path_profile.matlab_internal_timing")
+        call_count += 1
+        internal_total_ms = round(internal_total_ms + float(internal["total_duration_ms"]), 3)
+        internal_unaccounted_total_ms = round(
+            internal_unaccounted_total_ms + float(internal["unaccounted_duration_ms"]),
+            3,
+        )
+
+        boundary_call = internal.get("boundary_matlab_call_ms")
+        boundary_delta = internal.get("boundary_minus_matlab_total_ms")
+        if boundary_call is not None and boundary_delta is not None:
+            boundary_call_total_ms = round(boundary_call_total_ms + float(boundary_call), 3)
+            boundary_minus_internal_total_ms = round(boundary_minus_internal_total_ms + float(boundary_delta), 3)
+            boundary_closure_count += 1
+
+        steps = internal.get("steps")
+        if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)):
+            continue
+        for raw_step in steps:
+            if not isinstance(raw_step, Mapping):
+                continue
+            name = raw_step.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            duration_ms = _validate_elapsed_ms(
+                raw_step.get("duration_ms"),
+                field_name=f"matlab_local_hot_path_profile.steps.{name}.duration_ms",
+            )
+            step_name = name.strip()
+            step_totals_ms[step_name] = round(step_totals_ms.get(step_name, 0.0) + duration_ms, 3)
+            step_call_counts[step_name] = step_call_counts.get(step_name, 0) + 1
+
+    boundary_closure_complete = call_count > 0 and boundary_closure_count == call_count
+    closed_boundary_call_total_ms = round(boundary_call_total_ms, 3) if boundary_closure_complete else None
+    closed_boundary_delta_total_ms = (
+        round(boundary_minus_internal_total_ms, 3)
+        if boundary_closure_complete
+        else None
+    )
+    sorted_step_totals = {key: round(value, 3) for key, value in sorted(step_totals_ms.items())}
+    step_percent_internal = _percentage_mapping(sorted_step_totals, internal_total_ms)
+    step_percent_boundary = (
+        _percentage_mapping(sorted_step_totals, closed_boundary_call_total_ms)
+        if closed_boundary_call_total_ms is not None
+        else {}
+    )
+    dominant_step_name: str | None = None
+    dominant_step_total_ms = 0.0
+    if sorted_step_totals:
+        dominant_step_name, dominant_step_total_ms = max(
+            sorted_step_totals.items(),
+            key=lambda item: (float(item[1]), item[0]),
+        )
+
+    profile: dict[str, Any] = {
+        "schema_version": "1.0",
+        "status": "present" if call_count else "absent",
+        "source": "matlab_metadata.steps + boundary_instrumentation.seam_costs_ms.matlab_call_ms",
+        "scope": "matlab_local_registration",
+        "call_count": int(call_count),
+        "boundary_closure_count": int(boundary_closure_count),
+        "boundary_closure_complete": bool(boundary_closure_complete),
+        "boundary_matlab_call_total_ms": closed_boundary_call_total_ms,
+        "matlab_internal_total_duration_ms": round(internal_total_ms, 3),
+        "boundary_minus_internal_total_ms": closed_boundary_delta_total_ms,
+        "matlab_internal_unaccounted_total_ms": round(internal_unaccounted_total_ms, 3),
+        "step_totals_ms": sorted_step_totals,
+        "step_call_counts": dict(sorted(step_call_counts.items())),
+        "step_percent_of_matlab_internal_total": step_percent_internal,
+        "step_percent_of_boundary_matlab_call": step_percent_boundary,
+        "dominant_internal_step": None,
+        "hot_path_rankings": [],
+    }
+
+    rankings: list[dict[str, Any]] = []
+    for step_name, duration_ms in sorted(
+        sorted_step_totals.items(),
+        key=lambda item: (-float(item[1]), item[0]),
+    ):
+        rankings.append(
+            _profile_hot_path_row(
+                component_type="matlab_step",
+                name=step_name,
+                owner="matlab_runtime/pystar_registration/pystar_register_local_demons_entry.m",
+                total_duration_ms=duration_ms,
+                internal_total_ms=internal_total_ms,
+                boundary_call_total_ms=closed_boundary_call_total_ms,
+                call_count=step_call_counts.get(step_name, 0),
+            )
+        )
+
+    if closed_boundary_delta_total_ms is not None and closed_boundary_delta_total_ms >= 0:
+        rankings.append(
+            _profile_hot_path_row(
+                component_type="python_matlab_boundary_closure",
+                name="boundary_minus_internal",
+                owner="pystar/matlab_registration.py + MATLAB Engine call boundary",
+                total_duration_ms=closed_boundary_delta_total_ms,
+                internal_total_ms=internal_total_ms,
+                boundary_call_total_ms=closed_boundary_call_total_ms,
+                call_count=boundary_closure_count,
+            )
+        )
+
+    if internal_unaccounted_total_ms > 0:
+        rankings.append(
+            _profile_hot_path_row(
+                component_type="matlab_entrypoint_unaccounted",
+                name="metadata_unaccounted",
+                owner="matlab_runtime/pystar_registration/pystar_register_local_demons_entry.m",
+                total_duration_ms=internal_unaccounted_total_ms,
+                internal_total_ms=internal_total_ms,
+                boundary_call_total_ms=closed_boundary_call_total_ms,
+                call_count=call_count,
+            )
+        )
+
+    profile["hot_path_rankings"] = sorted(
+        rankings,
+        key=lambda item: (-float(item["total_duration_ms"]), str(item["component_type"]), str(item["name"])),
+    )
+    if dominant_step_name is not None:
+        profile["dominant_internal_step"] = {
+            "name": dominant_step_name,
+            "total_duration_ms": round(dominant_step_total_ms, 3),
+            "call_count": int(step_call_counts.get(dominant_step_name, 0)),
+            "percent_of_matlab_internal_total": step_percent_internal.get(dominant_step_name, 0.0),
+            "percent_of_boundary_matlab_call": step_percent_boundary.get(dominant_step_name),
+            "owner": "matlab_runtime/pystar_registration/pystar_register_local_demons_entry.m",
+        }
+
+    return profile
+
+
 def _iter_tiled_local_executions(rounds: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     executions: list[Mapping[str, Any]] = []
     for round_entry in rounds:
@@ -1432,6 +1769,7 @@ def _build_summary(
     boundary_summary = summarize_matlab_boundary_traces(boundary_traces) if boundary_traces else None
     flow_summary = _flow_sidecar_summary(rounds)
     matlab_internal_summary = _matlab_internal_timing_summary(rounds)
+    matlab_hot_path_profile = _matlab_local_hot_path_profile(rounds)
     worker_summary = _worker_lifecycle_summary(rounds)
     round_totals = [
         {
@@ -1470,6 +1808,7 @@ def _build_summary(
         },
         "matlab_boundary_summary": boundary_summary,
         **matlab_internal_summary,
+        "matlab_local_hot_path_profile": matlab_hot_path_profile,
         **worker_summary,
         "flow_sidecar_count": flow_summary["flow_sidecar_count"],
         "flow_sidecar_total_bytes": flow_summary["flow_sidecar_total_bytes"],
@@ -1822,6 +2161,12 @@ def validate_registration_performance_payload(
                 duration_ms,
                 field_name=f"summary.matlab_internal_dominant_step_totals_ms.{step_name}",
             )
+    hot_path_profile = summary.get("matlab_local_hot_path_profile")
+    if hot_path_profile is not None:
+        _validate_matlab_local_hot_path_profile(
+            hot_path_profile,
+            field_name="summary.matlab_local_hot_path_profile",
+        )
     if not isinstance(summary.get("flow_sidecars"), list):
         raise ValueError("Registration diagnostics summary.flow_sidecars must be a list")
     if not isinstance(summary.get("slowest_rounds"), list):
