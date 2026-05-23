@@ -431,27 +431,57 @@ def extract_box_sum_integer(img_vol: FloatArray, coords: FloatArray, box_size: t
 
     n_spots = len(coords)
     intensities = np.zeros(n_spots, dtype=np.float32)
+
     coords_int = np.rint(coords).astype(np.int32)
     ic_z = coords_int[:, 0]
     ic_y = coords_int[:, 1]
     ic_x = coords_int[:, 2]
+    if n_spots == 0:
+        return intensities
 
-    for dz in range(-rz, rz + 1):
-        for dy in range(-ry, ry + 1):
-            for dx in range(-rx, rx + 1):
-                cur_z = ic_z + dz
-                cur_y = ic_y + dy
-                cur_x = ic_x + dx
-                valid_mask = (
-                    (cur_z >= 0) & (cur_z < d) &
-                    (cur_y >= 0) & (cur_y < h) &
-                    (cur_x >= 0) & (cur_x < w)
-                )
-                if np.any(valid_mask):
-                    val = img_vol[cur_z[valid_mask], cur_y[valid_mask], cur_x[valid_mask]]
-                    intensities[valid_mask] += val
+    interior_mask = (
+        (ic_z - rz >= 0) & (ic_z + rz < d) &
+        (ic_y - ry >= 0) & (ic_y + ry < h) &
+        (ic_x - rx >= 0) & (ic_x + rx < w)
+    )
+    interior_idx = np.flatnonzero(interior_mask)
+    edge_idx = np.flatnonzero(~interior_mask)
 
-    return np.asarray(intensities, dtype=np.float32)
+    plane_stride = h * w
+    flat_img = np.ravel(img_vol, order='C')
+
+    if interior_idx.size:
+        base = ic_z[interior_idx] * plane_stride + ic_y[interior_idx] * w + ic_x[interior_idx]
+        interior_values = np.zeros(interior_idx.size, dtype=np.float32)
+        for dz in range(-rz, rz + 1):
+            dz_offset = dz * plane_stride
+            for dy in range(-ry, ry + 1):
+                row_offset = dz_offset + dy * w
+                for dx in range(-rx, rx + 1):
+                    interior_values += flat_img[base + row_offset + dx]
+        intensities[interior_idx] = interior_values
+
+    if edge_idx.size:
+        edge_values = np.zeros(edge_idx.size, dtype=np.float32)
+        edge_z = ic_z[edge_idx]
+        edge_y = ic_y[edge_idx]
+        edge_x = ic_x[edge_idx]
+        for dz in range(-rz, rz + 1):
+            cur_z = edge_z + dz
+            for dy in range(-ry, ry + 1):
+                cur_y = edge_y + dy
+                for dx in range(-rx, rx + 1):
+                    cur_x = edge_x + dx
+                    valid_mask = (
+                        (cur_z >= 0) & (cur_z < d) &
+                        (cur_y >= 0) & (cur_y < h) &
+                        (cur_x >= 0) & (cur_x < w)
+                    )
+                    if np.any(valid_mask):
+                        edge_values[valid_mask] += img_vol[cur_z[valid_mask], cur_y[valid_mask], cur_x[valid_mask]]
+        intensities[edge_idx] = edge_values
+
+    return intensities
 
 
 def warp_volume_to_reference(
