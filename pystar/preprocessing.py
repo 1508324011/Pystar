@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 import time
 import shutil
 from datetime import datetime, timezone
+from functools import lru_cache
 import cv2
 from skimage import exposure, morphology
 from skimage.transform import resize
@@ -171,6 +172,47 @@ def op_clahe(img: ImageArray, params: ProcessorParams, ctx: ProcessorContext) ->
     # equalize_adapthist 完美支持 float，且输出也是 float
     return exposure.equalize_adapthist(img, clip_limit=clip, nbins=nbins).astype(np.float32)
 
+
+@lru_cache(maxsize=32)
+def _morphology_disk(radius: int | float) -> ImageArray:
+    return cast(ImageArray, morphology.disk(radius))
+
+
+def _morpho_reconstruction_contrast_slice(
+    slice_2d: ImageArray,
+    *,
+    small_shape: tuple[int, int],
+    selem_full: ImageArray,
+    selem_small: ImageArray,
+) -> ImageArray:
+    h, w = slice_2d.shape
+
+    # --- Step A: 快速估算背景 (The Slow Part Optimization) ---
+    slice_small = resize(slice_2d, small_shape, order=1, preserve_range=True)
+
+    # 在小图上做侵蚀和重建
+    marker_s = morphology.erosion(slice_small, selem_small)
+    bg_rec_s = morphology.reconstruction(marker_s, slice_small, method='dilation')
+
+    # 放大背景
+    bg_full = resize(bg_rec_s, (h, w), order=1, preserve_range=True)
+
+    # --- Step B: 全分辨率去背景 ---
+    # 这一步是快加减法，没压力
+    diff = slice_2d - bg_full
+
+    # --- Step C: 全分辨率增强 (The Detail Part) ---
+    # White/Black Tophat 在 OpenCV/Skimage 里通常优化得不错，比 Reconstruction 快
+    # 为了保留 1-2px 的细节，这步还得在原图跑。
+    w_th = np.empty_like(diff)
+    morphology.white_tophat(diff, selem_full, out=w_th)
+    b_th = np.empty_like(diff)
+    morphology.black_tophat(diff, selem_full, out=b_th)
+
+    diff += w_th
+    diff -= b_th
+    return cast(ImageArray, diff)
+
 def op_morpho_reconstruction_contrast(img: ImageArray, params: ProcessorParams, ctx: ProcessorContext) -> ImageArray:
     """
     复杂的背景扣除逻辑：Morphological Reconstruction + TopHat。
@@ -181,48 +223,53 @@ def op_morpho_reconstruction_contrast(img: ImageArray, params: ProcessorParams, 
     3. W-TopHat-Rec = Img - Background
     4. Enhanced = W-TopHat-Rec + WhiteTopHat(W-TopHat-Rec) - BlackTopHat(W-TopHat-Rec)
     """
-    rad = params.get('radius', 10)
-    downsample = params.get('downsample_factor', 0.25)
-    
-    rad_small = max(1, int(rad * downsample))
-    selem_full = morphology.disk(rad)     # 大图用的核
-    selem_small = morphology.disk(rad_small) # 小图用的核
+    rad = float(params.get('radius', 10))
+    downsample = float(params.get('downsample_factor', 0.25))
 
-    def _process_slice_safe(slice_2d: ImageArray) -> ImageArray:
-        h, w = slice_2d.shape
-        
-        # --- Step A: 快速估算背景 (The Slow Part Optimization) ---
-        small_h, small_w = int(h * downsample), int(w * downsample)
-        slice_small = resize(slice_2d, (small_h, small_w), order=1, preserve_range=True)
-        
-        # 在小图上做侵蚀和重建
-        marker_s = morphology.erosion(slice_small, selem_small)
-        bg_rec_s = morphology.reconstruction(marker_s, slice_small, method='dilation')
-        
-        # 放大背景
-        bg_full = resize(bg_rec_s, (h, w), order=1, preserve_range=True)
-        
-        # --- Step B: 全分辨率去背景 ---
-        # 这一步是快加减法，没压力
-        diff = slice_2d - bg_full
-        
-        # --- Step C: 全分辨率增强 (The Detail Part) ---
-        # White/Black Tophat 在 OpenCV/Skimage 里通常优化得不错，比 Reconstruction 快
-        # 为了保留 1-2px 的细节，这步还得在原图跑。
-        
-        # 如果觉得这步还是慢，可以单独给这步开 0.5 的 downsample，而不是 0.25
-        w_th = morphology.white_tophat(diff, selem_full)
-        b_th = morphology.black_tophat(diff, selem_full)
-        
-        final = diff + w_th - b_th
-        return final
+    if downsample <= 0:
+        raise ValueError(
+            f"morpho_reconstruction_contrast expects downsample_factor > 0; got {downsample!r}"
+        )
+
+    if img.ndim not in (2, 3):
+        raise ValueError(
+            f"morpho_reconstruction_contrast expects a 2D image or 3D stack; got ndim={img.ndim}"
+        )
+
+    rad_small = max(1, int(rad * downsample))
+    selem_full = _morphology_disk(rad)     # 大图用的核
+    selem_small = _morphology_disk(rad_small) # 小图用的核
+
+    h, w = img.shape[-2:]
+    small_shape = (max(1, int(h * downsample)), max(1, int(w * downsample)))
 
     if img.ndim == 3:
-        res = np.stack([_process_slice_safe(s) for s in img])
+        if img.shape[0] == 0:
+            raise ValueError("morpho_reconstruction_contrast expects a non-empty 3D stack")
+        first_slice = _morpho_reconstruction_contrast_slice(
+            cast(ImageArray, img[0]),
+            small_shape=small_shape,
+            selem_full=selem_full,
+            selem_small=selem_small,
+        )
+        res = np.empty((img.shape[0], *first_slice.shape), dtype=first_slice.dtype)
+        res[0] = first_slice
+        for z_index in range(1, img.shape[0]):
+            res[z_index] = _morpho_reconstruction_contrast_slice(
+                cast(ImageArray, img[z_index]),
+                small_shape=small_shape,
+                selem_full=selem_full,
+                selem_small=selem_small,
+            )
     else:
-        res = _process_slice_safe(img)
-        
-    return np.clip(res, 0, 1).astype(np.float32)
+        res = _morpho_reconstruction_contrast_slice(
+            img,
+            small_shape=small_shape,
+            selem_full=selem_full,
+            selem_small=selem_small,
+        )
+
+    return np.clip(res, 0, 1, out=res).astype(np.float32, copy=False)
 
 
 def op_min_max_normalize(img: ImageArray, params: ProcessorParams, ctx: ProcessorContext) -> ImageArray:
