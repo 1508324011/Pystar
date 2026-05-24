@@ -6,7 +6,6 @@ from tempfile import TemporaryDirectory
 import time
 import shutil
 from datetime import datetime, timezone
-from tqdm import tqdm
 import cv2
 from skimage import exposure, morphology
 from skimage.transform import resize
@@ -27,6 +26,10 @@ ImageArray = NDArray[Any]
 ProcessorParams = dict[str, Any]
 ProcessorContext = dict[str, Any]
 ProcessorFunc = Callable[[ImageArray, ProcessorParams, ProcessorContext], ImageArray]
+NativeOutputWriter = Callable[[ImageArray, int, int], Path]
+
+NATIVE_PREPROCESSING_TIMING_SCHEMA_NAME = "pystar_native_preprocessing_timing"
+NATIVE_PREPROCESSING_TIMING_SCHEMA_VERSION = 1
 
 # ==============================================================================
 # 1. THE ATOMS
@@ -257,6 +260,104 @@ PROCESSOR_MAP: dict[str, ProcessorFunc] = {
     "none": op_noop, # Null Object Pattern
 }
 
+
+def _elapsed_ms_since(start_time: float) -> float:
+    return round((time.perf_counter() - start_time) * 1000.0, 3)
+
+
+def _duration_summary(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {
+            "count": 0,
+            "total_duration_ms": 0.0,
+            "mean_duration_ms": None,
+            "median_duration_ms": None,
+            "min_duration_ms": None,
+            "max_duration_ms": None,
+        }
+
+    sorted_values = sorted(float(value) for value in values)
+    count = len(sorted_values)
+    total = round(sum(sorted_values), 3)
+    midpoint = count // 2
+    if count % 2:
+        median = sorted_values[midpoint]
+    else:
+        median = (sorted_values[midpoint - 1] + sorted_values[midpoint]) / 2.0
+
+    return {
+        "count": count,
+        "total_duration_ms": total,
+        "mean_duration_ms": round(total / count, 3),
+        "median_duration_ms": round(float(median), 3),
+        "min_duration_ms": round(float(sorted_values[0]), 3),
+        "max_duration_ms": round(float(sorted_values[-1]), 3),
+    }
+
+
+def _build_native_preprocessing_timing_payload(
+    *,
+    fov_id: int,
+    round_order: list[int],
+    volumes: list[dict[str, Any]],
+    segment_index: int | None = None,
+) -> dict[str, Any]:
+    method_durations: dict[str, list[float]] = {}
+    phase_durations: dict[str, list[float]] = {
+        "load": [],
+        "calibration_steps": [],
+        "extraction_steps": [],
+        "clip_convert": [],
+        "write": [],
+        "volume_total": [],
+    }
+
+    for volume in volumes:
+        phase_durations["load"].append(float(volume["load_ms"]))
+        phase_durations["clip_convert"].append(float(volume["clip_convert_ms"]))
+        phase_durations["write"].append(float(volume["write_ms"]))
+        phase_durations["volume_total"].append(float(volume["total_ms"]))
+
+        calibration_total = 0.0
+        for step_record in volume["calibration_steps"]:
+            duration_ms = float(step_record["duration_ms"])
+            calibration_total += duration_ms
+            method_durations.setdefault(str(step_record["method"]), []).append(duration_ms)
+        phase_durations["calibration_steps"].append(round(calibration_total, 3))
+
+        extraction_total = 0.0
+        for step_record in volume["extraction_steps"]:
+            duration_ms = float(step_record["duration_ms"])
+            extraction_total += duration_ms
+            method_durations.setdefault(str(step_record["method"]), []).append(duration_ms)
+        phase_durations["extraction_steps"].append(round(extraction_total, 3))
+
+    by_method = {
+        method: _duration_summary(durations)
+        for method, durations in sorted(method_durations.items())
+    }
+    by_phase = {
+        phase: _duration_summary(durations)
+        for phase, durations in phase_durations.items()
+    }
+
+    payload = {
+        "schema_name": NATIVE_PREPROCESSING_TIMING_SCHEMA_NAME,
+        "schema_version": NATIVE_PREPROCESSING_TIMING_SCHEMA_VERSION,
+        "fov_id": int(fov_id),
+        "round_order": [int(round_id) for round_id in round_order],
+        "volume_count": len(volumes),
+        "total_volume_ms": by_phase["volume_total"]["total_duration_ms"],
+        "volumes": volumes,
+        "summary": {
+            "by_method": by_method,
+            "by_phase": by_phase,
+        },
+    }
+    if segment_index is not None:
+        payload["segment_index"] = int(segment_index)
+    return payload
+
 # ==============================================================================
 # 3. THE ENGINE
 # ==============================================================================
@@ -312,8 +413,9 @@ class DataSanitizer:
         extraction_steps: list[PreprocessingStep],
         output_files: list[str],
         target_rounds: Optional[list[int]],
+        preprocessing_timing: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        return {
+        provenance = {
             "version": PREPROCESSING_PROVENANCE_VERSION,
             "generated_at": finished_at,
             "fov_id": int(fov_id),
@@ -343,6 +445,9 @@ class DataSanitizer:
             ],
             "output_files": output_files,
         }
+        if preprocessing_timing is not None:
+            provenance["preprocessing_timing"] = preprocessing_timing
+        return provenance
 
     def _build_provider_dispatch_provenance(
         self,
@@ -473,6 +578,18 @@ class DataSanitizer:
         tifffile.imwrite(output_path, img, compression='zlib')
         return output_path
 
+    def _make_stage_output_writer(self, output_root: Path, fov_id: int) -> NativeOutputWriter:
+        def write(img: ImageArray, round_id: int, channel_id: int) -> Path:
+            return self._save_stage_clean(img, output_root, fov_id, round_id, channel_id)
+
+        return write
+
+    def _make_canonical_output_writer(self, fov_id: int) -> NativeOutputWriter:
+        def write(img: ImageArray, round_id: int, channel_id: int) -> Path:
+            return self._save_clean(img, fov_id, round_id, channel_id)
+
+        return write
+
     def _flat_clean_filename(self, fov_id: int, round_id: int, channel_id: int) -> str:
         return f"clean_fov_{fov_id}_round_{round_id}_ch_{channel_id}.tif"
 
@@ -528,6 +645,133 @@ class DataSanitizer:
         paths = get_fov_output_structure(base_dir, fov_id)
         return paths['cleaned'] / self._flat_clean_filename(fov_id, round_id, channel_id)
 
+    def _run_pipeline_with_timing(
+        self,
+        img_vol: ImageArray,
+        pipeline_seq: list[PreprocessingStep],
+        context: ProcessorContext,
+    ) -> tuple[ImageArray, list[dict[str, Any]]]:
+        if img_vol.dtype != np.float32:
+            max_val = 255.0 if img_vol.dtype == np.uint8 else 65535.0
+            if np.issubdtype(img_vol.dtype, np.floating) and img_vol.max() > 1.0:
+                current_data = img_vol
+            else:
+                current_data = img_vol.astype(np.float32) / max_val
+        else:
+            current_data = img_vol
+
+        step_timings: list[dict[str, Any]] = []
+        for step_index, step in enumerate(pipeline_seq):
+            func = PROCESSOR_MAP.get(step.method)
+            if func:
+                step_started = time.perf_counter()
+                current_data = func(current_data, step.params, context)
+                step_timings.append(
+                    {
+                        "index": step_index,
+                        "method": step.method,
+                        "provider": step.provider,
+                        "duration_ms": _elapsed_ms_since(step_started),
+                    }
+                )
+
+        return current_data, step_timings
+
+    def _run_native_preprocessing_kernel(
+        self,
+        *,
+        fov_id: int,
+        loader: ImageLoader,
+        sequence: list[PreprocessingStep],
+        target_rounds: Optional[list[int]],
+        output_writer: NativeOutputWriter,
+        segment_index: int | None = None,
+        print_progress: bool = False,
+    ) -> dict[str, Any]:
+        if not sequence:
+            raise ValueError("Native preprocessing kernel cannot run an empty sequence")
+
+        seq_calibration, seq_extraction = self._split_sequence(sequence)
+        rounds_to_process = self._resolve_rounds_to_process(target_rounds)
+        if print_progress and target_rounds is not None:
+            print(f" -> DEBUG: Only processing user-selected rounds: {rounds_to_process}")
+        final_queue = self._ordered_round_queue(rounds_to_process)
+        if print_progress:
+            print(f" -> Pipeline Split: {len(seq_calibration)} Calibration steps + {len(seq_extraction)} Extraction steps")
+
+        inter_round_ref_cache: dict[int, ImageArray] = {}
+        output_files: list[str] = []
+        volume_records: list[dict[str, Any]] = []
+
+        for r_id in final_queue:
+            if print_progress:
+                print(f" -> Processing Round {r_id}...")
+            intra_round_ref_img: ImageArray | None = None
+            roles = self.cfg.dataset.channel_roles
+            channels_in_round = self.cfg.dataset.round_structure[r_id]
+            seq_channels = sorted([c for c in channels_in_round if roles.get(c) == 'seq'])
+
+            for c_id in seq_channels:
+                volume_started = time.perf_counter()
+
+                load_started = time.perf_counter()
+                path = loader._get_path(fov_id, r_id, c_id)
+                raw_vol = loader._lazy_load_tiff(path).compute()
+                load_ms = _elapsed_ms_since(load_started)
+
+                ctx = {
+                    'ref_round_image': inter_round_ref_cache.get(c_id),
+                    'ref_channel_image': intra_round_ref_img,
+                }
+
+                img_calibrated, calibration_timings = self._run_pipeline_with_timing(raw_vol, seq_calibration, ctx)
+
+                if r_id == 1:
+                    inter_round_ref_cache[c_id] = img_calibrated.copy()
+
+                if intra_round_ref_img is None:
+                    intra_round_ref_img = img_calibrated.copy()
+
+                final_vol, extraction_timings = self._run_pipeline_with_timing(img_calibrated, seq_extraction, ctx)
+
+                clip_convert_started = time.perf_counter()
+                final_u8 = img_as_ubyte(np.clip(final_vol, 0, 1))
+                clip_convert_ms = _elapsed_ms_since(clip_convert_started)
+
+                write_started = time.perf_counter()
+                output_path = output_writer(final_u8, r_id, c_id)
+                write_ms = _elapsed_ms_since(write_started)
+                output_files.append(str(output_path))
+
+                volume_records.append(
+                    {
+                        "round_id": int(r_id),
+                        "channel_id": int(c_id),
+                        "input_path": str(path),
+                        "output_path": str(output_path),
+                        "load_ms": load_ms,
+                        "calibration_steps": calibration_timings,
+                        "extraction_steps": extraction_timings,
+                        "clip_convert_ms": clip_convert_ms,
+                        "write_ms": write_ms,
+                        "total_ms": _elapsed_ms_since(volume_started),
+                    }
+                )
+
+        return {
+            "rounds_to_process": rounds_to_process,
+            "round_order": final_queue,
+            "calibration_steps": seq_calibration,
+            "extraction_steps": seq_extraction,
+            "output_files": output_files,
+            "preprocessing_timing": _build_native_preprocessing_timing_payload(
+                fov_id=fov_id,
+                round_order=final_queue,
+                volumes=volume_records,
+                segment_index=segment_index,
+            ),
+        }
+
     def _run_native_sequence_segment(
         self,
         fov_id: int,
@@ -544,40 +788,16 @@ class DataSanitizer:
             raise ValueError("Native preprocessing segment cannot be empty")
 
         loader = self._make_loader(input_root, input_filename_pattern)
-        seq_calibration, seq_extraction = self._split_sequence(full_seq)
-        rounds_to_process = self._resolve_rounds_to_process(target_rounds)
-        final_queue = self._ordered_round_queue(rounds_to_process)
-        inter_round_ref_cache = {}
         started_at = self._utc_now()
         start_time = time.perf_counter()
-        output_files: list[str] = []
-
-        for r_id in final_queue:
-            intra_round_ref_img = None
-            roles = self.cfg.dataset.channel_roles
-            channels_in_round = self.cfg.dataset.round_structure[r_id]
-            seq_channels = sorted([c for c in channels_in_round if roles.get(c) == 'seq'])
-
-            for c_id in seq_channels:
-                path = loader._get_path(fov_id, r_id, c_id)
-                raw_vol = loader._lazy_load_tiff(path).compute()
-                ctx = {
-                    'ref_round_image': inter_round_ref_cache.get(c_id),
-                    'ref_channel_image': intra_round_ref_img,
-                }
-
-                img_calibrated = self._run_pipeline(raw_vol, seq_calibration, ctx)
-
-                if r_id == 1:
-                    inter_round_ref_cache[c_id] = img_calibrated.copy()
-
-                if intra_round_ref_img is None:
-                    intra_round_ref_img = img_calibrated.copy()
-
-                final_vol = self._run_pipeline(img_calibrated, seq_extraction, ctx)
-                final_u8 = img_as_ubyte(np.clip(final_vol, 0, 1))
-                output_path = self._save_stage_clean(final_u8, output_root, fov_id, r_id, c_id)
-                output_files.append(str(output_path))
+        native_result = self._run_native_preprocessing_kernel(
+            fov_id=fov_id,
+            loader=loader,
+            sequence=full_seq,
+            target_rounds=target_rounds,
+            output_writer=self._make_stage_output_writer(output_root, fov_id),
+            segment_index=segment_index,
+        )
 
         finished_at = self._utc_now()
         duration_ms = round((time.perf_counter() - start_time) * 1000.0, 3)
@@ -590,12 +810,12 @@ class DataSanitizer:
             "input_contract": {
                 "raw_data_path": str(input_root),
                 "filename_pattern": input_filename_pattern,
-                "rounds_processed": final_queue,
+                "rounds_processed": native_result["round_order"],
                 "target_rounds": list(target_rounds) if target_rounds is not None else None,
             },
             "pipeline_split": {
-                "calibration_steps": [step.method for step in seq_calibration],
-                "extraction_steps": [step.method for step in seq_extraction],
+                "calibration_steps": [step.method for step in native_result["calibration_steps"]],
+                "extraction_steps": [step.method for step in native_result["extraction_steps"]],
             },
             "raw_sequence": [
                 {
@@ -606,7 +826,8 @@ class DataSanitizer:
                 }
                 for index, step in enumerate(full_seq)
             ],
-            "output_files": output_files,
+            "output_files": native_result["output_files"],
+            "preprocessing_timing": native_result["preprocessing_timing"],
         }
 
     def _split_sequence(
@@ -645,25 +866,7 @@ class DataSanitizer:
         can either feed it into additional atoms or convert it to the canonical
         clean TIFF dtype at the persistence boundary.
         """
-        # 1. 确保 Float32
-        if img_vol.dtype != np.float32:
-            # 假设输入是 uint8/16，归一化到 0-1
-            max_val = 255.0 if img_vol.dtype == np.uint8 else 65535.0
-            # 简单的防御性检查，有些 TIFF 读进来已经是 float 但数值很大
-            if np.issubdtype(img_vol.dtype, np.floating) and img_vol.max() > 1.0:
-                current_data = img_vol
-            else:
-                current_data = img_vol.astype(np.float32) / max_val
-        else:
-            current_data = img_vol
-
-        # 2. 执行
-        for step in pipeline_seq:
-            func = PROCESSOR_MAP.get(step.method)
-            if func:
-                current_data = func(current_data, step.params, context)
-            # else: warning handled in upper logic or crash
-        
+        current_data, _step_timings = self._run_pipeline_with_timing(img_vol, pipeline_seq, context)
         return current_data
 
     def _native_sanitize_fov(
@@ -697,46 +900,16 @@ class DataSanitizer:
                 "output_files": [],
             }
 
-        seq_calibration, seq_extraction = self._split_sequence(full_seq)
-        rounds_to_process = self._resolve_rounds_to_process(target_rounds)
-        if target_rounds is not None:
-            print(f" -> DEBUG: Only processing user-selected rounds: {rounds_to_process}")
-        final_queue = self._ordered_round_queue(rounds_to_process)
-
-        print(f" -> Pipeline Split: {len(seq_calibration)} Calibration steps + {len(seq_extraction)} Extraction steps")
-
-        inter_round_ref_cache = {}
         started_at = self._utc_now()
         start_time = time.perf_counter()
-        output_files: list[str] = []
-
-        for r_id in final_queue:
-            print(f" -> Processing Round {r_id}...")
-            intra_round_ref_img = None
-            roles = self.cfg.dataset.channel_roles
-            channels_in_round = self.cfg.dataset.round_structure[r_id]
-            seq_channels = sorted([c for c in channels_in_round if roles.get(c) == 'seq'])
-
-            for c_id in seq_channels:
-                path = self.loader._get_path(fov_id, r_id, c_id)
-                raw_vol = self.loader._lazy_load_tiff(path).compute()
-                ctx = {
-                    'ref_round_image': inter_round_ref_cache.get(c_id),
-                    'ref_channel_image': intra_round_ref_img,
-                }
-
-                img_calibrated = self._run_pipeline(raw_vol, seq_calibration, ctx)
-
-                if r_id == 1:
-                    inter_round_ref_cache[c_id] = img_calibrated.copy()
-
-                if intra_round_ref_img is None:
-                    intra_round_ref_img = img_calibrated.copy()
-
-                final_vol = self._run_pipeline(img_calibrated, seq_extraction, ctx)
-                final_u8 = img_as_ubyte(np.clip(final_vol, 0, 1))
-                output_path = self._save_clean(final_u8, fov_id, r_id, c_id)
-                output_files.append(str(output_path))
+        native_result = self._run_native_preprocessing_kernel(
+            fov_id=fov_id,
+            loader=self.loader,
+            sequence=full_seq,
+            target_rounds=target_rounds,
+            output_writer=self._make_canonical_output_writer(fov_id),
+            print_progress=True,
+        )
 
         finished_at = self._utc_now()
         duration_ms = round((time.perf_counter() - start_time) * 1000.0, 3)
@@ -745,11 +918,12 @@ class DataSanitizer:
             started_at=started_at,
             finished_at=finished_at,
             duration_ms=duration_ms,
-            rounds_processed=final_queue,
-            calibration_steps=seq_calibration,
-            extraction_steps=seq_extraction,
-            output_files=output_files,
+            rounds_processed=native_result["round_order"],
+            calibration_steps=native_result["calibration_steps"],
+            extraction_steps=native_result["extraction_steps"],
+            output_files=native_result["output_files"],
             target_rounds=target_rounds,
+            preprocessing_timing=native_result["preprocessing_timing"],
         )
 
     def _provider_dispatch_sanitize_fov(
