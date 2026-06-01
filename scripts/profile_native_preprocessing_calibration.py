@@ -9,15 +9,20 @@ import statistics
 import subprocess
 import sys
 import time
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence, cast
+from typing import Any, cast
+
+import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from pystar import preprocessing as preprocessing_module
 from pystar.infrastructure import ExperimentConfig, PreprocessingStep, load_config
 from pystar.io import ImageLoader, get_fov_output_structure
 from pystar.preprocessing import (
@@ -30,6 +35,8 @@ from pystar.serialization import write_backend_metadata
 
 CALIBRATION_PROFILE_SCHEMA_NAME = "pystar_native_preprocessing_calibration_profile"
 CALIBRATION_PROFILE_SCHEMA_VERSION = 1
+HISTOGRAM_MATCH_PROFILE_SCHEMA_NAME = "pystar_native_histogram_match_profile"
+HISTOGRAM_MATCH_PROFILE_SCHEMA_VERSION = 1
 CALIBRATION_PROFILE_FILENAMES = {
     "json": "native_preprocessing_calibration_profile.json",
     "markdown": "native_preprocessing_calibration_profile.md",
@@ -69,6 +76,77 @@ class ProfileRunResult:
     repeat_output_root: Path
     elapsed_wall_ms: float
     kernel_result: Mapping[str, Any]
+    histogram_match_calls: tuple[Mapping[str, Any], ...] = ()
+
+
+def _array_dtype(value: object | None) -> str | None:
+    if value is None:
+        return None
+    return str(np.asarray(value).dtype)
+
+
+def _array_shape(value: object | None) -> list[int] | None:
+    if value is None:
+        return None
+    return [int(dimension) for dimension in np.asarray(value).shape]
+
+
+def _histogram_reference_for_scope(
+    params: Mapping[str, Any],
+    context: Mapping[str, Any],
+) -> tuple[str, object | None]:
+    scope = str(params.get("scope", "none"))
+    if scope == "inter_round":
+        return scope, context.get("ref_round_image")
+    if scope == "intra_round":
+        return scope, context.get("ref_channel_image")
+    return scope, None
+
+
+@contextmanager
+def _capture_histogram_match_calls() -> Iterator[list[dict[str, object]]]:
+    """Capture histogram-match call details for the profiling harness only.
+
+    The production native preprocessing provenance already records coarse
+    per-step timings. Stage25 needs extra scope/reference/dtype/shape evidence
+    without changing that production payload, so the profiling script wraps the
+    registry entry only for the duration of a repeat run and restores it
+    immediately afterwards.
+    """
+
+    original = preprocessing_module.PROCESSOR_MAP["histogram_match"]
+    calls: list[dict[str, object]] = []
+
+    def profiled_histogram_match(img: Any, params: Mapping[str, Any], ctx: Mapping[str, Any]) -> Any:
+        scope, reference = _histogram_reference_for_scope(params, ctx)
+        started = time.perf_counter()
+        output = original(img, dict(params), dict(ctx))
+        duration_ms = round((time.perf_counter() - started) * 1000.0, 3)
+
+        has_reference = reference is not None
+        calls.append(
+            {
+                "call_index": len(calls),
+                "scope": scope,
+                "has_reference": has_reference,
+                "operation": "match_histograms" if has_reference else "no_reference_noop",
+                "duration_ms": duration_ms,
+                "input_dtype": _array_dtype(img),
+                "input_shape": _array_shape(img),
+                "reference_dtype": _array_dtype(reference),
+                "reference_shape": _array_shape(reference),
+                "output_dtype": _array_dtype(output),
+                "output_shape": _array_shape(output),
+                "output_is_input": output is img,
+            }
+        )
+        return output
+
+    preprocessing_module.PROCESSOR_MAP["histogram_match"] = profiled_histogram_match
+    try:
+        yield calls
+    finally:
+        preprocessing_module.PROCESSOR_MAP["histogram_match"] = original
 
 
 def _duration_summary(values: Sequence[float]) -> dict[str, object]:
@@ -440,6 +518,97 @@ def _phase_durations(kernel_result: Mapping[str, Any]) -> dict[str, list[float]]
     return durations
 
 
+def _unique_string_values(values: Sequence[object | None]) -> list[str]:
+    return sorted({str(value) for value in values if value is not None})
+
+
+def _unique_shapes(values: Sequence[object | None]) -> list[list[int]]:
+    shapes: set[tuple[int, ...]] = set()
+    for value in values:
+        if value is None:
+            continue
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+            raise ValueError(f"Histogram profile shape field must be a sequence of integers or null; got {value!r}")
+        shape_tuple = tuple(_coerce_shape_dimension(dimension) for dimension in value)
+        shapes.add(shape_tuple)
+    return [[int(dimension) for dimension in shape] for shape in sorted(shapes)]
+
+
+def _coerce_shape_dimension(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"Histogram profile shape dimensions must be integers; got {value!r}")
+    dimension = value.item() if isinstance(value, np.integer) else value
+    if dimension < 0:
+        raise ValueError(f"Histogram profile shape dimensions must be non-negative; got {value!r}")
+    return dimension
+
+
+def _histogram_call_duration(call: Mapping[str, Any]) -> float:
+    value = call.get("duration_ms")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"Histogram profile duration_ms must be numeric; got {value!r}")
+    duration = float(value)
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError(f"Histogram profile duration_ms must be finite and non-negative; got {value!r}")
+    return duration
+
+
+def _summarize_histogram_calls(calls: Sequence[Mapping[str, Any]]) -> dict[str, object]:
+    scopes = sorted({str(call.get("scope", "none")) for call in calls})
+    by_scope: dict[str, object] = {}
+    for scope in scopes:
+        scoped_calls = [call for call in calls if str(call.get("scope", "none")) == scope]
+        matched_calls = [call for call in scoped_calls if bool(call.get("has_reference"))]
+        no_reference_calls = [call for call in scoped_calls if not bool(call.get("has_reference"))]
+        by_scope[scope] = {
+            "call_count": len(scoped_calls),
+            "match_call_count": len(matched_calls),
+            "no_reference_call_count": len(no_reference_calls),
+            "duration_ms": _duration_summary([_histogram_call_duration(call) for call in scoped_calls]),
+            "matched_duration_ms": _duration_summary([_histogram_call_duration(call) for call in matched_calls]),
+            "no_reference_duration_ms": _duration_summary(
+                [_histogram_call_duration(call) for call in no_reference_calls]
+            ),
+            "input_dtypes": _unique_string_values([call.get("input_dtype") for call in scoped_calls]),
+            "reference_dtypes": _unique_string_values([call.get("reference_dtype") for call in matched_calls]),
+            "output_dtypes": _unique_string_values([call.get("output_dtype") for call in scoped_calls]),
+            "input_shapes": _unique_shapes([call.get("input_shape") for call in scoped_calls]),
+            "reference_shapes": _unique_shapes([call.get("reference_shape") for call in matched_calls]),
+            "output_shapes": _unique_shapes([call.get("output_shape") for call in scoped_calls]),
+        }
+
+    matched_all = [call for call in calls if bool(call.get("has_reference"))]
+    no_reference_all = [call for call in calls if not bool(call.get("has_reference"))]
+    return {
+        "schema_name": HISTOGRAM_MATCH_PROFILE_SCHEMA_NAME,
+        "schema_version": HISTOGRAM_MATCH_PROFILE_SCHEMA_VERSION,
+        "call_count": len(calls),
+        "match_call_count": len(matched_all),
+        "no_reference_call_count": len(no_reference_all),
+        "duration_ms": _duration_summary([_histogram_call_duration(call) for call in calls]),
+        "matched_duration_ms": _duration_summary([_histogram_call_duration(call) for call in matched_all]),
+        "no_reference_duration_ms": _duration_summary(
+            [_histogram_call_duration(call) for call in no_reference_all]
+        ),
+        "by_scope": by_scope,
+    }
+
+
+def _histogram_profile_for_runs(run_results: Sequence[ProfileRunResult]) -> dict[str, object]:
+    all_calls: list[Mapping[str, Any]] = []
+    repeat_summaries: list[dict[str, object]] = []
+    for run in run_results:
+        run_calls = [dict(call) for call in run.histogram_match_calls]
+        all_calls.extend(run_calls)
+        repeat_summary = _summarize_histogram_calls(run_calls)
+        repeat_summary["repeat_index"] = int(run.repeat_index)
+        repeat_summaries.append(repeat_summary)
+
+    aggregate = _summarize_histogram_calls(all_calls)
+    aggregate["repeats"] = repeat_summaries
+    return aggregate
+
+
 def _aggregate_runs(run_results: Sequence[ProfileRunResult]) -> dict[str, object]:
     method_durations: dict[str, list[float]] = {}
     calibration_method_durations: dict[str, list[float]] = {}
@@ -494,6 +663,7 @@ def _aggregate_runs(run_results: Sequence[ProfileRunResult]) -> dict[str, object
         "by_calibration_method": by_calibration_method,
         "by_extraction_method": by_extraction_method,
         "focused_methods": focused,
+        "histogram_match_profile": _histogram_profile_for_runs(run_results),
     }
 
 
@@ -517,14 +687,15 @@ def _run_profile_repeats(
         sanitizer = DataSanitizer(config)
         loader = ImageLoader(config)
         started = time.perf_counter()
-        kernel_result = sanitizer._run_native_preprocessing_kernel(
-            fov_id=fov_id,
-            loader=loader,
-            sequence=config.pipeline.preprocessing.sequence,
-            target_rounds=None if target_rounds is None else list(target_rounds),
-            output_writer=_writer_for_repeat(sanitizer, repeat_root, fov_id),
-            print_progress=False,
-        )
+        with _capture_histogram_match_calls() as histogram_match_calls:
+            kernel_result = sanitizer._run_native_preprocessing_kernel(
+                fov_id=fov_id,
+                loader=loader,
+                sequence=config.pipeline.preprocessing.sequence,
+                target_rounds=None if target_rounds is None else list(target_rounds),
+                output_writer=_writer_for_repeat(sanitizer, repeat_root, fov_id),
+                print_progress=False,
+            )
         elapsed_wall_ms = round((time.perf_counter() - started) * 1000.0, 3)
         results.append(
             ProfileRunResult(
@@ -532,6 +703,7 @@ def _run_profile_repeats(
                 repeat_output_root=repeat_root,
                 elapsed_wall_ms=elapsed_wall_ms,
                 kernel_result=kernel_result,
+                histogram_match_calls=tuple(dict(call) for call in histogram_match_calls),
             )
         )
     return results
@@ -575,6 +747,7 @@ def build_profile_payload(
         repeats_payload = []
         for result in run_results:
             timing = cast(Mapping[str, Any], result.kernel_result["preprocessing_timing"])
+            histogram_match_calls = [dict(call) for call in result.histogram_match_calls]
             repeats_payload.append(
                 {
                     "repeat_index": result.repeat_index,
@@ -585,6 +758,8 @@ def build_profile_payload(
                     "total_volume_ms": float(timing["total_volume_ms"]),
                     "output_files": list(result.kernel_result["output_files"]),
                     "timing": timing,
+                    "histogram_match_calls": histogram_match_calls,
+                    "histogram_match_profile": _summarize_histogram_calls(histogram_match_calls),
                 }
             )
 
@@ -654,6 +829,10 @@ def render_profile_markdown(payload: Mapping[str, object]) -> str:
     lines = [
         "# Native Preprocessing Calibration Profile",
         "",
+        "## Profile Schema",
+        "",
+        f"- Calibration profile schema: `{payload['schema_name']}` v`{payload['schema_version']}`",
+        "",
         "## Source",
         "",
         f"- Repository root: `{source.get('repo_root')}`",
@@ -669,6 +848,7 @@ def render_profile_markdown(payload: Mapping[str, object]) -> str:
         f"- FOV IDs: `{profile_config.get('fov_ids')}`",
         f"- Target rounds: `{profile_config.get('target_rounds') or 'all configured rounds'}`",
         f"- Repeats: `{profile_config.get('repeats')}`",
+        f"- Histogram profile schema: `{HISTOGRAM_MATCH_PROFILE_SCHEMA_NAME}` v`{HISTOGRAM_MATCH_PROFILE_SCHEMA_VERSION}`",
         "",
         "## Contract Guardrails",
         "",
@@ -685,6 +865,8 @@ def render_profile_markdown(payload: Mapping[str, object]) -> str:
         summary = cast(Mapping[str, object], fov["summary"])
         by_phase = cast(Mapping[str, object], summary["by_phase"])
         focused = cast(Mapping[str, object], summary["focused_methods"])
+        histogram_profile = cast(Mapping[str, object], summary["histogram_match_profile"])
+        histogram_by_scope = cast(Mapping[str, object], histogram_profile["by_scope"])
         lines.extend(
             [
                 f"### FOV {fov['fov_id']}",
@@ -693,6 +875,7 @@ def render_profile_markdown(payload: Mapping[str, object]) -> str:
                 f"- Clean-output equivalence: `{equivalence['status']}` across `{equivalence['file_count']}` files",
                 f"- Calibration phase: `{cast(Mapping[str, object], by_phase['calibration_steps']).get('total_duration_ms')}` ms total",
                 f"- Extraction phase: `{cast(Mapping[str, object], by_phase['extraction_steps']).get('total_duration_ms')}` ms total",
+                f"- Histogram-match calls: `{histogram_profile['call_count']}` total; `{histogram_profile['match_call_count']}` real matches; `{histogram_profile['no_reference_call_count']}` no-reference no-ops",
                 "",
                 "| Method | Calibration count | Calibration total ms | Calibration mean ms | Extraction count | Extraction total ms | Extraction mean ms | % calibration |",
                 "|---|---:|---:|---:|---:|---:|---:|---:|",
@@ -715,6 +898,34 @@ def render_profile_markdown(payload: Mapping[str, object]) -> str:
                 )
             )
         lines.append("")
+        lines.extend(
+            [
+                "#### Histogram-match scope breakdown",
+                "",
+                "| Scope | Calls | Real matches | No-reference no-ops | Total ms | Match ms | No-ref ms | Input dtypes | Output dtypes | Input shapes |",
+                "|---|---:|---:|---:|---:|---:|---:|---|---|---|",
+            ]
+        )
+        for scope, raw_scope_summary in sorted(histogram_by_scope.items()):
+            scope_summary = cast(Mapping[str, object], raw_scope_summary)
+            duration = cast(Mapping[str, object], scope_summary["duration_ms"])
+            matched_duration = cast(Mapping[str, object], scope_summary["matched_duration_ms"])
+            no_ref_duration = cast(Mapping[str, object], scope_summary["no_reference_duration_ms"])
+            lines.append(
+                "| {scope} | {calls} | {matches} | {no_refs} | {total_ms} | {match_ms} | {no_ref_ms} | `{input_dtypes}` | `{output_dtypes}` | `{input_shapes}` |".format(
+                    scope=scope,
+                    calls=scope_summary["call_count"],
+                    matches=scope_summary["match_call_count"],
+                    no_refs=scope_summary["no_reference_call_count"],
+                    total_ms=duration.get("total_duration_ms"),
+                    match_ms=matched_duration.get("total_duration_ms"),
+                    no_ref_ms=no_ref_duration.get("total_duration_ms"),
+                    input_dtypes=scope_summary.get("input_dtypes"),
+                    output_dtypes=scope_summary.get("output_dtypes"),
+                    input_shapes=scope_summary.get("input_shapes"),
+                )
+            )
+        lines.append("")
 
     lines.extend(
         [
@@ -724,7 +935,7 @@ def render_profile_markdown(payload: Mapping[str, object]) -> str:
             "",
             "## Real-Data Validation Artifact Expectations",
             "",
-            "When running under `/media/zenglab/result/zhui/Leica_deconv_test_260106-worktrees/pystar-next`, keep the PyStar source fixed via `PYTHONPATH=/media/zenglab/result/zhui/PyStar` and write the JSON/Markdown artifacts to a validation-only directory. The validation report should record source commit, config path/hash, FOV/round/channel surface, clean TIFF paths, clean-output equivalence by shape/dtype/hash or array contents, calibration/histogram-match timings, total preprocessing timing, and any cache/warmup drift.",
+            "When running under `/media/zenglab/result/zhui/Leica_deconv_test_260106-worktrees/pystar-next`, keep the PyStar source fixed via `PYTHONPATH=/media/zenglab/result/zhui/PyStar` and write the JSON/Markdown artifacts to a validation-only directory. The validation report should record source commit, config path/hash, FOV/round/channel surface, JSON/Markdown profile artifact paths, clean TIFF paths, clean-output equivalence by shape/dtype/hash or array contents, histogram scope totals, reference/no-reference counts, calibration total, extraction total, volume total, wall time, and any cache/warmup drift.",
         ]
     )
     return "\n".join(lines) + "\n"

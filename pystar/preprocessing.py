@@ -106,7 +106,7 @@ def op_histogram_match(img: ImageArray, params: ProcessorParams, ctx: ProcessorC
     
     # skimage 的 match_histograms 支持 float 输入
     matched = exposure.match_histograms(img, ref_img)
-    return matched.astype(np.float32)
+    return matched.astype(np.float32, copy=False)
 
 def op_gamma_correction(img: ImageArray, params: ProcessorParams, ctx: ProcessorContext) -> ImageArray:
     """
