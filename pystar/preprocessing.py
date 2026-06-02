@@ -184,6 +184,7 @@ def _morpho_reconstruction_contrast_slice(
     small_shape: tuple[int, int],
     selem_full: ImageArray,
     selem_small: ImageArray,
+    full_resolution_scratch: tuple[ImageArray, ImageArray] | None = None,
 ) -> ImageArray:
     h, w = slice_2d.shape
 
@@ -204,14 +205,48 @@ def _morpho_reconstruction_contrast_slice(
     # --- Step C: 全分辨率增强 (The Detail Part) ---
     # White/Black Tophat 在 OpenCV/Skimage 里通常优化得不错，比 Reconstruction 快
     # 为了保留 1-2px 的细节，这步还得在原图跑。
-    w_th = np.empty_like(diff)
+    if full_resolution_scratch is None:
+        w_th = np.empty_like(diff)
+        b_th = np.empty_like(diff)
+    else:
+        w_th, b_th = full_resolution_scratch
+        expected = (diff.shape, diff.dtype)
+        if (w_th.shape, w_th.dtype) != expected or (b_th.shape, b_th.dtype) != expected:
+            raise ValueError(
+                "morpho_reconstruction_contrast scratch buffers must match the full-resolution "
+                + f"diff shape/dtype {diff.shape}/{diff.dtype}; got "
+                + f"{w_th.shape}/{w_th.dtype} and {b_th.shape}/{b_th.dtype}"
+            )
+        if np.may_share_memory(w_th, slice_2d) or np.may_share_memory(b_th, slice_2d):
+            raise ValueError("morpho_reconstruction_contrast scratch buffers must not alias input slices")
+        if np.may_share_memory(w_th, b_th):
+            raise ValueError("morpho_reconstruction_contrast scratch buffers must not alias each other")
+
     morphology.white_tophat(diff, selem_full, out=w_th)
-    b_th = np.empty_like(diff)
     morphology.black_tophat(diff, selem_full, out=b_th)
 
     diff += w_th
     diff -= b_th
     return cast(ImageArray, diff)
+
+
+def _morpho_reconstruction_contrast_scratch(
+    *,
+    shape: tuple[int, int],
+    dtype: np.dtype[Any],
+) -> tuple[ImageArray, ImageArray]:
+    """Allocate private full-resolution morphology scratch for one call.
+
+    The buffers are intentionally tiny in ownership scope: callers create them
+    for one 3-D volume and pass them slice-by-slice so the top-hat outputs stop
+    allocating new full-resolution arrays for every Z plane. They are not shared
+    across FOVs, volumes, threads, or calls.
+    """
+
+    return (
+        cast(ImageArray, np.empty(shape, dtype=dtype)),
+        cast(ImageArray, np.empty(shape, dtype=dtype)),
+    )
 
 def op_morpho_reconstruction_contrast(img: ImageArray, params: ProcessorParams, ctx: ProcessorContext) -> ImageArray:
     """
@@ -254,12 +289,17 @@ def op_morpho_reconstruction_contrast(img: ImageArray, params: ProcessorParams, 
         )
         res = np.empty((img.shape[0], *first_slice.shape), dtype=first_slice.dtype)
         res[0] = first_slice
+        full_resolution_scratch = _morpho_reconstruction_contrast_scratch(
+            shape=cast(tuple[int, int], first_slice.shape),
+            dtype=np.dtype(first_slice.dtype),
+        )
         for z_index in range(1, img.shape[0]):
             res[z_index] = _morpho_reconstruction_contrast_slice(
                 cast(ImageArray, img[z_index]),
                 small_shape=small_shape,
                 selem_full=selem_full,
                 selem_small=selem_small,
+                full_resolution_scratch=full_resolution_scratch,
             )
     else:
         res = _morpho_reconstruction_contrast_slice(
