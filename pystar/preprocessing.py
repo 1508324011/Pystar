@@ -1,10 +1,12 @@
 # pystar/preprocessing.py
 import numpy as np
 import tifffile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
 import shutil
+import os
 from datetime import datetime, timezone
 from functools import lru_cache
 import cv2
@@ -46,8 +48,10 @@ def op_median_filter(img: ImageArray, params: ProcessorParams, ctx: ProcessorCon
     """
     k = params.get('kernel_size', 3)
     # OpenCV 要求 kernel size 必须是大于1的奇数
-    if k % 2 == 0: k += 1
-    if k < 3: return img
+    if k % 2 == 0:
+        k += 1
+    if k < 3:
+        return img
 
     # Flight check: input is float32 0-1
     # 暂时转回 uint8 域做滤波 (OpenCV 针对 int 优化极好)
@@ -130,7 +134,8 @@ def op_gamma_correction(img: ImageArray, params: ProcessorParams, ctx: Processor
     Gamma > 1.0 压暗暗部。
     """
     gamma = params.get('gamma', 1.0)
-    if gamma == 1.0: return img
+    if gamma == 1.0:
+        return img
     
     # 假设输入已经是 float32 [0, 1]，直接幂运算
     # 为了防止负值导致 NaN (虽然理论上不该有负值)，加个绝对值或 clip
@@ -323,6 +328,47 @@ def _morpho_reconstruction_contrast_scratch(
         cast(ImageArray, np.empty(shape, dtype=dtype)),
     )
 
+
+def _morpho_reconstruction_contrast_workers(params: ProcessorParams) -> int:
+    raw_workers = params.get("workers", 1)
+    if isinstance(raw_workers, (bool, np.bool_)) or not isinstance(raw_workers, (int, np.integer)):
+        raise ValueError(
+            "morpho_reconstruction_contrast workers must be a positive integer; "
+            + f"got {raw_workers!r}"
+        )
+
+    workers = int(raw_workers)
+    if workers <= 0:
+        raise ValueError(
+            "morpho_reconstruction_contrast workers must be a positive integer; "
+            + f"got {raw_workers!r}"
+        )
+    return workers
+
+
+def _morpho_reconstruction_contrast_parallel_slice(
+    z_index: int,
+    slice_2d: ImageArray,
+    *,
+    small_shape: tuple[int, int],
+    selem_full: ImageArray,
+    selem_small: ImageArray,
+    scratch_shape: tuple[int, int],
+    scratch_dtype: np.dtype[Any],
+) -> tuple[int, ImageArray]:
+    scratch = _morpho_reconstruction_contrast_scratch(
+        shape=scratch_shape,
+        dtype=scratch_dtype,
+    )
+    result = _morpho_reconstruction_contrast_slice(
+        slice_2d,
+        small_shape=small_shape,
+        selem_full=selem_full,
+        selem_small=selem_small,
+        full_resolution_scratch=scratch,
+    )
+    return z_index, result
+
 def op_morpho_reconstruction_contrast(img: ImageArray, params: ProcessorParams, ctx: ProcessorContext) -> ImageArray:
     """
     复杂的背景扣除逻辑：Morphological Reconstruction + TopHat。
@@ -356,6 +402,7 @@ def op_morpho_reconstruction_contrast(img: ImageArray, params: ProcessorParams, 
     if img.ndim == 3:
         if img.shape[0] == 0:
             raise ValueError("morpho_reconstruction_contrast expects a non-empty 3D stack")
+        workers = _morpho_reconstruction_contrast_workers(params)
         first_slice = _morpho_reconstruction_contrast_slice(
             cast(ImageArray, img[0]),
             small_shape=small_shape,
@@ -364,18 +411,41 @@ def op_morpho_reconstruction_contrast(img: ImageArray, params: ProcessorParams, 
         )
         res = np.empty((img.shape[0], *first_slice.shape), dtype=first_slice.dtype)
         res[0] = first_slice
-        full_resolution_scratch = _morpho_reconstruction_contrast_scratch(
-            shape=cast(tuple[int, int], first_slice.shape),
-            dtype=np.dtype(first_slice.dtype),
-        )
-        for z_index in range(1, img.shape[0]):
-            res[z_index] = _morpho_reconstruction_contrast_slice(
-                cast(ImageArray, img[z_index]),
-                small_shape=small_shape,
-                selem_full=selem_full,
-                selem_small=selem_small,
-                full_resolution_scratch=full_resolution_scratch,
+        scratch_shape = cast(tuple[int, int], first_slice.shape)
+        scratch_dtype = np.dtype(first_slice.dtype)
+
+        if workers == 1 or img.shape[0] == 1:
+            full_resolution_scratch = _morpho_reconstruction_contrast_scratch(
+                shape=scratch_shape,
+                dtype=scratch_dtype,
             )
+            for z_index in range(1, img.shape[0]):
+                res[z_index] = _morpho_reconstruction_contrast_slice(
+                    cast(ImageArray, img[z_index]),
+                    small_shape=small_shape,
+                    selem_full=selem_full,
+                    selem_small=selem_small,
+                    full_resolution_scratch=full_resolution_scratch,
+                )
+        else:
+            max_workers = min(workers, img.shape[0] - 1, os.cpu_count() or 1)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        _morpho_reconstruction_contrast_parallel_slice,
+                        z_index,
+                        cast(ImageArray, img[z_index]),
+                        small_shape=small_shape,
+                        selem_full=selem_full,
+                        selem_small=selem_small,
+                        scratch_shape=scratch_shape,
+                        scratch_dtype=scratch_dtype,
+                    )
+                    for z_index in range(1, img.shape[0])
+                ]
+                for future in futures:
+                    z_index, slice_result = future.result()
+                    res[z_index] = slice_result
     else:
         res = _morpho_reconstruction_contrast_slice(
             img,
@@ -383,6 +453,8 @@ def op_morpho_reconstruction_contrast(img: ImageArray, params: ProcessorParams, 
             selem_full=selem_full,
             selem_small=selem_small,
         )
+        if "workers" in params:
+            _ = _morpho_reconstruction_contrast_workers(params)
 
     return np.clip(res, 0, 1, out=res).astype(np.float32, copy=False)
 
