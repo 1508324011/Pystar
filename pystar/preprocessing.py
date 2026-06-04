@@ -53,15 +53,19 @@ def op_median_filter(img: ImageArray, params: ProcessorParams, ctx: ProcessorCon
     # 暂时转回 uint8 域做滤波 (OpenCV 针对 int 优化极好)
     img_u8 = cast(ImageArray, (img * 255).astype(np.uint8))
 
-    def _median_blur_slice(slice_u8: ImageArray) -> ImageArray:
-        blurred = cv2.medianBlur(cast(Any, np.ascontiguousarray(slice_u8)), k)
-        return cast(ImageArray, blurred)
-
     if img_u8.ndim == 3:
-        # 3D stack: 逐层处理
-        res_u8 = cast(ImageArray, np.stack([_median_blur_slice(cast(ImageArray, s)) for s in img_u8]))
+        # 3D stack: 逐层处理。避免 list + np.stack 产生第二个全体积临时对象。
+        if img_u8.shape[0] == 0:
+            _raise_empty_stack_like_np_stack()
+        res_u8 = cast(ImageArray, np.empty_like(img_u8))
+        for z_index in range(img_u8.shape[0]):
+            _ = _median_blur_slice_into(
+                cast(ImageArray, img_u8[z_index]),
+                k,
+                cast(ImageArray, res_u8[z_index]),
+            )
     else:
-        res_u8 = _median_blur_slice(img_u8)
+        res_u8 = _median_blur_slice(img_u8, k)
 
     # 转回 float32
     return res_u8.astype(np.float32) / 255.0
@@ -80,10 +84,21 @@ def op_gaussian_blur(img: ImageArray, params: ProcessorParams, ctx: ProcessorCon
     
     if img.ndim == 3:
         # 3D Stack 必须切片处理，OpenCV 不支持 3D 卷积
-        return np.stack([cv2.GaussianBlur(s, (0, 0), sigmaX=sigma, sigmaY=sigma) for s in img])
+        if img.shape[0] == 0:
+            _raise_empty_stack_like_np_stack()
+        first_slice = _gaussian_blur_slice(cast(ImageArray, img[0]), sigma)
+        res = np.empty((img.shape[0], *first_slice.shape), dtype=first_slice.dtype)
+        res[0] = first_slice
+        for z_index in range(1, img.shape[0]):
+            _ = _gaussian_blur_slice_into(
+                cast(ImageArray, img[z_index]),
+                sigma,
+                cast(ImageArray, res[z_index]),
+            )
+        return cast(ImageArray, res)
     else:
         # 2D 图像
-        return cv2.GaussianBlur(img, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        return _gaussian_blur_slice(img, sigma)
 
 def op_histogram_match(img: ImageArray, params: ProcessorParams, ctx: ProcessorContext) -> ImageArray:
     """
@@ -132,22 +147,82 @@ def op_difference_of_gaussians(img: ImageArray, params: ProcessorParams, ctx: Pr
     # 模拟背景的大小 (通常是点的 3-5 倍)
     bg_sigma = params.get('bg_sigma', 5.0)
     
-    # 复用 op_gaussian_blur 的逻辑 (OpenCV 实现)
-    
-    def _blur_slice(s: ImageArray, sig: float) -> ImageArray:
-        return cv2.GaussianBlur(s, (0, 0), sigmaX=sig, sigmaY=sig)
-        
     if img.ndim == 3:
-        g_small = np.stack([_blur_slice(s, spot_sigma) for s in img])
-        g_large = np.stack([_blur_slice(s, bg_sigma) for s in img])
+        if img.shape[0] == 0:
+            _raise_empty_stack_like_np_stack()
+        first_small = _gaussian_blur_slice(cast(ImageArray, img[0]), spot_sigma)
+        res = np.empty((img.shape[0], *first_small.shape), dtype=first_small.dtype)
+        res[0] = first_small
+        scratch = np.empty_like(first_small)
+        _ = _gaussian_blur_slice_into(
+            cast(ImageArray, img[0]),
+            bg_sigma,
+            cast(ImageArray, scratch),
+        )
+        _subtract_and_clip_nonnegative(cast(ImageArray, res[0]), cast(ImageArray, scratch))
+        for z_index in range(1, img.shape[0]):
+            _ = _gaussian_blur_slice_into(
+                cast(ImageArray, img[z_index]),
+                spot_sigma,
+                cast(ImageArray, res[z_index]),
+            )
+            _ = _gaussian_blur_slice_into(
+                cast(ImageArray, img[z_index]),
+                bg_sigma,
+                cast(ImageArray, scratch),
+            )
+            _subtract_and_clip_nonnegative(cast(ImageArray, res[z_index]), cast(ImageArray, scratch))
+        return cast(ImageArray, res)
     else:
-        g_small = _blur_slice(img, spot_sigma)
-        g_large = _blur_slice(img, bg_sigma)
+        g_small = _gaussian_blur_slice(img, spot_sigma)
+        g_large = _gaussian_blur_slice(img, bg_sigma)
         
     # DoG 结果可能为负 (原来的背景区域)，这里我们将负值截断为 0
     # 因为在荧光图像中，负信号没有物理意义
     diff = g_small - g_large
     return np.maximum(diff, 0)
+
+
+def _raise_empty_stack_like_np_stack() -> None:
+    raise ValueError("need at least one array to stack")
+
+
+def _validate_cv2_dst_result(result: Any, dst: ImageArray, *, operation: str) -> ImageArray:
+    result_array = np.asarray(result)
+    if result_array.shape != dst.shape or result_array.dtype != dst.dtype:
+        raise ValueError(
+            f"{operation} OpenCV destination drifted; expected {dst.shape}/{dst.dtype}, got "
+            f"{result_array.shape}/{result_array.dtype}"
+        )
+    if result_array is not dst and not np.may_share_memory(result_array, dst):
+        dst[...] = result_array
+    return dst
+
+
+def _median_blur_slice(slice_u8: ImageArray, kernel_size: int) -> ImageArray:
+    blurred = cv2.medianBlur(cast(Any, np.ascontiguousarray(slice_u8)), kernel_size)
+    return cast(ImageArray, blurred)
+
+
+def _median_blur_slice_into(slice_u8: ImageArray, kernel_size: int, dst: ImageArray) -> ImageArray:
+    contiguous_slice = np.ascontiguousarray(slice_u8)
+    result = cv2.medianBlur(cast(Any, contiguous_slice), kernel_size, dst=dst)
+    return _validate_cv2_dst_result(result, dst, operation="medianBlur")
+
+
+def _gaussian_blur_slice(slice_2d: ImageArray, sigma: float) -> ImageArray:
+    blurred = cv2.GaussianBlur(slice_2d, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    return cast(ImageArray, blurred)
+
+
+def _gaussian_blur_slice_into(slice_2d: ImageArray, sigma: float, dst: ImageArray) -> ImageArray:
+    result = cv2.GaussianBlur(slice_2d, (0, 0), sigmaX=sigma, sigmaY=sigma, dst=dst)
+    return _validate_cv2_dst_result(result, dst, operation="GaussianBlur")
+
+
+def _subtract_and_clip_nonnegative(value: ImageArray, baseline: ImageArray) -> None:
+    _ = np.subtract(value, baseline, out=value)
+    _ = np.maximum(value, 0, out=value)
 
 def op_clip_percentile(img: ImageArray, params: ProcessorParams, ctx: ProcessorContext) -> ImageArray:
     """
