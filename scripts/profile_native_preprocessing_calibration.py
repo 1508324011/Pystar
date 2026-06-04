@@ -37,6 +37,8 @@ CALIBRATION_PROFILE_SCHEMA_NAME = "pystar_native_preprocessing_calibration_profi
 CALIBRATION_PROFILE_SCHEMA_VERSION = 1
 HISTOGRAM_MATCH_PROFILE_SCHEMA_NAME = "pystar_native_histogram_match_profile"
 HISTOGRAM_MATCH_PROFILE_SCHEMA_VERSION = 1
+HISTOGRAM_REAL_MATCH_ATTRIBUTION_SCHEMA_NAME = "pystar_native_histogram_real_match_attribution"
+HISTOGRAM_REAL_MATCH_ATTRIBUTION_SCHEMA_VERSION = 1
 CALIBRATION_PROFILE_FILENAMES = {
     "json": "native_preprocessing_calibration_profile.json",
     "markdown": "native_preprocessing_calibration_profile.md",
@@ -553,6 +555,74 @@ def _histogram_call_duration(call: Mapping[str, Any]) -> float:
     return duration
 
 
+def _histogram_real_match_attribution(calls: Sequence[Mapping[str, Any]]) -> dict[str, object]:
+    """Build the Stage29 real-match/no-op attribution block.
+
+    Stage25 already recorded individual histogram-match calls in the dedicated
+    calibration profile artifact. Stage29 keeps the same persisted profile
+    schema compatible and adds a clearer attribution view so real reference-
+    backed work is not averaged together with intentional no-reference no-ops.
+    """
+
+    real_match_calls = [call for call in calls if bool(call.get("has_reference"))]
+    no_reference_noop_calls = [call for call in calls if not bool(call.get("has_reference"))]
+    real_match_duration = _duration_summary([_histogram_call_duration(call) for call in real_match_calls])
+    no_reference_noop_duration = _duration_summary(
+        [_histogram_call_duration(call) for call in no_reference_noop_calls]
+    )
+
+    by_scope: dict[str, object] = {}
+    for scope in sorted({str(call.get("scope", "none")) for call in calls}):
+        scoped_calls = [call for call in calls if str(call.get("scope", "none")) == scope]
+        scoped_real_matches = [call for call in scoped_calls if bool(call.get("has_reference"))]
+        scoped_noops = [call for call in scoped_calls if not bool(call.get("has_reference"))]
+        scoped_real_duration = _duration_summary(
+            [_histogram_call_duration(call) for call in scoped_real_matches]
+        )
+        scoped_noop_duration = _duration_summary([_histogram_call_duration(call) for call in scoped_noops])
+        by_scope[scope] = {
+            "call_count": len(scoped_calls),
+            "real_match_call_count": len(scoped_real_matches),
+            "no_reference_noop_call_count": len(scoped_noops),
+            "real_match_duration_ms": scoped_real_duration,
+            "no_reference_noop_duration_ms": scoped_noop_duration,
+            "real_match_total_duration_ms": scoped_real_duration["total_duration_ms"],
+            "real_match_median_duration_ms": scoped_real_duration["median_duration_ms"],
+            "no_reference_noop_total_duration_ms": scoped_noop_duration["total_duration_ms"],
+            "no_reference_noop_median_duration_ms": scoped_noop_duration["median_duration_ms"],
+            "input_dtypes": _unique_string_values([call.get("input_dtype") for call in scoped_calls]),
+            "reference_dtypes": _unique_string_values(
+                [call.get("reference_dtype") for call in scoped_real_matches]
+            ),
+            "output_dtypes": _unique_string_values([call.get("output_dtype") for call in scoped_calls]),
+            "input_shapes": _unique_shapes([call.get("input_shape") for call in scoped_calls]),
+            "reference_shapes": _unique_shapes(
+                [call.get("reference_shape") for call in scoped_real_matches]
+            ),
+            "output_shapes": _unique_shapes([call.get("output_shape") for call in scoped_calls]),
+        }
+
+    return {
+        "schema_name": HISTOGRAM_REAL_MATCH_ATTRIBUTION_SCHEMA_NAME,
+        "schema_version": HISTOGRAM_REAL_MATCH_ATTRIBUTION_SCHEMA_VERSION,
+        "source": "histogram_match_calls.has_reference",
+        "call_count": len(calls),
+        "real_match_call_count": len(real_match_calls),
+        "no_reference_noop_call_count": len(no_reference_noop_calls),
+        "real_match_duration_ms": real_match_duration,
+        "no_reference_noop_duration_ms": no_reference_noop_duration,
+        "real_match_total_duration_ms": real_match_duration["total_duration_ms"],
+        "real_match_median_duration_ms": real_match_duration["median_duration_ms"],
+        "no_reference_noop_total_duration_ms": no_reference_noop_duration["total_duration_ms"],
+        "no_reference_noop_median_duration_ms": no_reference_noop_duration["median_duration_ms"],
+        "classification": {
+            "real_match": "has_reference is true; operation is reference-backed skimage.exposure.match_histograms",
+            "no_reference_noop": "has_reference is false; op_histogram_match returned the input object unchanged",
+        },
+        "by_scope": by_scope,
+    }
+
+
 def _summarize_histogram_calls(calls: Sequence[Mapping[str, Any]]) -> dict[str, object]:
     scopes = sorted({str(call.get("scope", "none")) for call in calls})
     by_scope: dict[str, object] = {}
@@ -560,15 +630,19 @@ def _summarize_histogram_calls(calls: Sequence[Mapping[str, Any]]) -> dict[str, 
         scoped_calls = [call for call in calls if str(call.get("scope", "none")) == scope]
         matched_calls = [call for call in scoped_calls if bool(call.get("has_reference"))]
         no_reference_calls = [call for call in scoped_calls if not bool(call.get("has_reference"))]
+        matched_duration = _duration_summary([_histogram_call_duration(call) for call in matched_calls])
+        no_reference_duration = _duration_summary([_histogram_call_duration(call) for call in no_reference_calls])
         by_scope[scope] = {
             "call_count": len(scoped_calls),
             "match_call_count": len(matched_calls),
             "no_reference_call_count": len(no_reference_calls),
+            "real_match_call_count": len(matched_calls),
+            "no_reference_noop_call_count": len(no_reference_calls),
             "duration_ms": _duration_summary([_histogram_call_duration(call) for call in scoped_calls]),
-            "matched_duration_ms": _duration_summary([_histogram_call_duration(call) for call in matched_calls]),
-            "no_reference_duration_ms": _duration_summary(
-                [_histogram_call_duration(call) for call in no_reference_calls]
-            ),
+            "matched_duration_ms": matched_duration,
+            "no_reference_duration_ms": no_reference_duration,
+            "real_match_duration_ms": matched_duration,
+            "no_reference_noop_duration_ms": no_reference_duration,
             "input_dtypes": _unique_string_values([call.get("input_dtype") for call in scoped_calls]),
             "reference_dtypes": _unique_string_values([call.get("reference_dtype") for call in matched_calls]),
             "output_dtypes": _unique_string_values([call.get("output_dtype") for call in scoped_calls]),
@@ -579,17 +653,22 @@ def _summarize_histogram_calls(calls: Sequence[Mapping[str, Any]]) -> dict[str, 
 
     matched_all = [call for call in calls if bool(call.get("has_reference"))]
     no_reference_all = [call for call in calls if not bool(call.get("has_reference"))]
+    matched_duration = _duration_summary([_histogram_call_duration(call) for call in matched_all])
+    no_reference_duration = _duration_summary([_histogram_call_duration(call) for call in no_reference_all])
     return {
         "schema_name": HISTOGRAM_MATCH_PROFILE_SCHEMA_NAME,
         "schema_version": HISTOGRAM_MATCH_PROFILE_SCHEMA_VERSION,
         "call_count": len(calls),
         "match_call_count": len(matched_all),
         "no_reference_call_count": len(no_reference_all),
+        "real_match_call_count": len(matched_all),
+        "no_reference_noop_call_count": len(no_reference_all),
         "duration_ms": _duration_summary([_histogram_call_duration(call) for call in calls]),
-        "matched_duration_ms": _duration_summary([_histogram_call_duration(call) for call in matched_all]),
-        "no_reference_duration_ms": _duration_summary(
-            [_histogram_call_duration(call) for call in no_reference_all]
-        ),
+        "matched_duration_ms": matched_duration,
+        "no_reference_duration_ms": no_reference_duration,
+        "real_match_duration_ms": matched_duration,
+        "no_reference_noop_duration_ms": no_reference_duration,
+        "real_match_attribution": _histogram_real_match_attribution(calls),
         "by_scope": by_scope,
     }
 
@@ -876,6 +955,8 @@ def render_profile_markdown(payload: Mapping[str, object]) -> str:
                 f"- Calibration phase: `{cast(Mapping[str, object], by_phase['calibration_steps']).get('total_duration_ms')}` ms total",
                 f"- Extraction phase: `{cast(Mapping[str, object], by_phase['extraction_steps']).get('total_duration_ms')}` ms total",
                 f"- Histogram-match calls: `{histogram_profile['call_count']}` total; `{histogram_profile['match_call_count']}` real matches; `{histogram_profile['no_reference_call_count']}` no-reference no-ops",
+                f"- Histogram real-match total / median: `{cast(Mapping[str, object], histogram_profile['real_match_duration_ms']).get('total_duration_ms')}` / `{cast(Mapping[str, object], histogram_profile['real_match_duration_ms']).get('median_duration_ms')}` ms",
+                f"- Histogram no-reference no-op total / median: `{cast(Mapping[str, object], histogram_profile['no_reference_noop_duration_ms']).get('total_duration_ms')}` / `{cast(Mapping[str, object], histogram_profile['no_reference_noop_duration_ms']).get('median_duration_ms')}` ms",
                 "",
                 "| Method | Calibration count | Calibration total ms | Calibration mean ms | Extraction count | Extraction total ms | Extraction mean ms | % calibration |",
                 "|---|---:|---:|---:|---:|---:|---:|---:|",
@@ -902,24 +983,26 @@ def render_profile_markdown(payload: Mapping[str, object]) -> str:
             [
                 "#### Histogram-match scope breakdown",
                 "",
-                "| Scope | Calls | Real matches | No-reference no-ops | Total ms | Match ms | No-ref ms | Input dtypes | Output dtypes | Input shapes |",
-                "|---|---:|---:|---:|---:|---:|---:|---|---|---|",
+                "| Scope | Calls | Real matches | No-reference no-ops | Total ms | Real total ms | Real median ms | No-op total ms | No-op median ms | Input dtypes | Output dtypes | Input shapes |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|",
             ]
         )
         for scope, raw_scope_summary in sorted(histogram_by_scope.items()):
             scope_summary = cast(Mapping[str, object], raw_scope_summary)
             duration = cast(Mapping[str, object], scope_summary["duration_ms"])
             matched_duration = cast(Mapping[str, object], scope_summary["matched_duration_ms"])
-            no_ref_duration = cast(Mapping[str, object], scope_summary["no_reference_duration_ms"])
+            no_ref_duration = cast(Mapping[str, object], scope_summary["no_reference_noop_duration_ms"])
             lines.append(
-                "| {scope} | {calls} | {matches} | {no_refs} | {total_ms} | {match_ms} | {no_ref_ms} | `{input_dtypes}` | `{output_dtypes}` | `{input_shapes}` |".format(
+                "| {scope} | {calls} | {matches} | {no_refs} | {total_ms} | {match_total_ms} | {match_median_ms} | {no_ref_total_ms} | {no_ref_median_ms} | `{input_dtypes}` | `{output_dtypes}` | `{input_shapes}` |".format(
                     scope=scope,
                     calls=scope_summary["call_count"],
                     matches=scope_summary["match_call_count"],
                     no_refs=scope_summary["no_reference_call_count"],
                     total_ms=duration.get("total_duration_ms"),
-                    match_ms=matched_duration.get("total_duration_ms"),
-                    no_ref_ms=no_ref_duration.get("total_duration_ms"),
+                    match_total_ms=matched_duration.get("total_duration_ms"),
+                    match_median_ms=matched_duration.get("median_duration_ms"),
+                    no_ref_total_ms=no_ref_duration.get("total_duration_ms"),
+                    no_ref_median_ms=no_ref_duration.get("median_duration_ms"),
                     input_dtypes=scope_summary.get("input_dtypes"),
                     output_dtypes=scope_summary.get("output_dtypes"),
                     input_shapes=scope_summary.get("input_shapes"),
