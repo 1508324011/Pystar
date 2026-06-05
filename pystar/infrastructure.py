@@ -1,6 +1,7 @@
 import hashlib
 import re
 import yaml
+from numbers import Integral
 from pathlib import Path
 from typing import List, Dict, Union, Any, Optional, Literal, Tuple
 from pydantic import BaseModel, model_validator, Field, ValidationError, ConfigDict
@@ -222,6 +223,29 @@ class PreprocessingConfig(BaseModel):
     # 这里是关键：我们强制要求 sequence 是一个 PreprocessingStep 的列表
     # Pydantic 会自动遍历列表，验证每一项都符合结构
     sequence: List[PreprocessingStep] = Field(default_factory=list)
+
+    # Native provider FOV-volume scheduler.  The default keeps the historical
+    # serial round/channel loop.  Values greater than one opt into bounded
+    # reference-aware parallel execution for volumes whose calibration
+    # references have already been materialized.
+    native_volume_workers: int = 1
+
+    @model_validator(mode='before')
+    @classmethod
+    def reject_invalid_native_volume_workers(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            raw_workers = data.get("native_volume_workers", 1)
+            if isinstance(raw_workers, bool) or not isinstance(raw_workers, Integral):
+                raise ValueError(
+                    "pipeline.preprocessing.native_volume_workers must be a positive integer"
+                )
+        return data
+
+    @model_validator(mode='after')
+    def validate_native_volume_workers(self) -> 'PreprocessingConfig':
+        if isinstance(self.native_volume_workers, bool) or int(self.native_volume_workers) <= 0:
+            raise ValueError("pipeline.preprocessing.native_volume_workers must be a positive integer")
+        return self
     
     model_config = ConfigDict(frozen=True)
 

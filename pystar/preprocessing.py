@@ -1,19 +1,20 @@
 # pystar/preprocessing.py
 import numpy as np
 import tifffile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
 import shutil
 import os
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from functools import lru_cache
 import cv2
 from skimage import exposure, morphology
 from skimage.transform import resize
 from skimage.util import img_as_ubyte
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, Mapping, Optional, Sequence, cast
 from numpy.typing import NDArray
 from .infrastructure import ExperimentConfig, PreprocessingStep
 from .io import ImageLoader
@@ -33,6 +34,70 @@ NativeOutputWriter = Callable[[ImageArray, int, int], Path]
 
 NATIVE_PREPROCESSING_TIMING_SCHEMA_NAME = "pystar_native_preprocessing_timing"
 NATIVE_PREPROCESSING_TIMING_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class NativeVolumeKey:
+    round_id: int
+    channel_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class NativeReferenceKey:
+    role: str
+    volume_key: NativeVolumeKey
+
+
+@dataclass(frozen=True, slots=True)
+class NativeVolumeWorkItem:
+    order_index: int
+    key: NativeVolumeKey
+    input_path: Path
+    planned_output_path: Path | None
+    calibration_steps: tuple[PreprocessingStep, ...]
+    extraction_steps: tuple[PreprocessingStep, ...]
+    inter_round_reference_key: NativeReferenceKey | None
+    intra_round_reference_key: NativeReferenceKey | None
+    produces_inter_round_reference: bool
+    produces_intra_round_reference: bool
+
+    @property
+    def required_reference_keys(self) -> tuple[NativeReferenceKey, ...]:
+        keys: list[NativeReferenceKey] = []
+        if self.inter_round_reference_key is not None:
+            keys.append(self.inter_round_reference_key)
+        if self.intra_round_reference_key is not None:
+            keys.append(self.intra_round_reference_key)
+        return tuple(keys)
+
+
+@dataclass(frozen=True, slots=True)
+class NativePreprocessingPlan:
+    fov_id: int
+    round_order: tuple[int, ...]
+    items: tuple[NativeVolumeWorkItem, ...]
+    worker_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class NativeVolumeRunResult:
+    work_item: NativeVolumeWorkItem
+    output_path: Path
+    volume_record: dict[str, Any]
+    inter_round_reference_image: ImageArray | None = None
+    intra_round_reference_image: ImageArray | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NativeOutputWriterWithPlanner:
+    write: NativeOutputWriter
+    output_path_for: Callable[[int, int], Path]
+
+    def __call__(self, img: ImageArray, round_id: int, channel_id: int) -> Path:
+        return self.write(img, round_id, channel_id)
+
+    def planned_output_path(self, round_id: int, channel_id: int) -> Path:
+        return self.output_path_for(round_id, channel_id)
 
 # ==============================================================================
 # 1. THE ATOMS
@@ -816,13 +881,25 @@ class DataSanitizer:
         def write(img: ImageArray, round_id: int, channel_id: int) -> Path:
             return self._save_stage_clean(img, output_root, fov_id, round_id, channel_id)
 
-        return write
+        def planned_output_path(round_id: int, channel_id: int) -> Path:
+            return output_root / self._stage_relative_path(fov_id, int(round_id), int(channel_id))
+
+        return NativeOutputWriterWithPlanner(
+            write=write,
+            output_path_for=planned_output_path,
+        )
 
     def _make_canonical_output_writer(self, fov_id: int) -> NativeOutputWriter:
         def write(img: ImageArray, round_id: int, channel_id: int) -> Path:
             return self._save_clean(img, fov_id, round_id, channel_id)
 
-        return write
+        def planned_output_path(round_id: int, channel_id: int) -> Path:
+            return self.get_clean_path(fov_id, int(round_id), int(channel_id))
+
+        return NativeOutputWriterWithPlanner(
+            write=write,
+            output_path_for=planned_output_path,
+        )
 
     def _flat_clean_filename(self, fov_id: int, round_id: int, channel_id: int) -> str:
         return f"clean_fov_{fov_id}_round_{round_id}_ch_{channel_id}.tif"
@@ -911,6 +988,424 @@ class DataSanitizer:
 
         return current_data, step_timings
 
+    def _native_volume_worker_count(self, sequence: Sequence[PreprocessingStep]) -> int:
+        if not sequence:
+            return 1
+
+        raw_workers = getattr(self.cfg.pipeline.preprocessing, "native_volume_workers", 1)
+        if isinstance(raw_workers, (bool, np.bool_)) or not isinstance(raw_workers, (int, np.integer)):
+            raise ValueError(
+                "pipeline.preprocessing.native_volume_workers must be a positive integer; "
+                + f"got {raw_workers!r}"
+            )
+
+        worker_count = int(raw_workers)
+        if worker_count <= 0:
+            raise ValueError(
+                "pipeline.preprocessing.native_volume_workers must be a positive integer; "
+                + f"got {raw_workers!r}"
+            )
+        return worker_count
+
+    def _planned_native_output_path(
+        self,
+        output_writer: NativeOutputWriter,
+        *,
+        round_id: int,
+        channel_id: int,
+    ) -> Path | None:
+        planner = getattr(output_writer, "planned_output_path", None)
+        if planner is None:
+            return None
+        planned = planner(round_id, channel_id)
+        return Path(planned)
+
+    def _native_sequence_uses_histogram_scope(
+        self,
+        steps: Sequence[PreprocessingStep],
+        scope: str,
+    ) -> bool:
+        return any(
+            step.method == "histogram_match" and step.params.get("scope", "none") == scope
+            for step in steps
+        )
+
+    def _build_native_preprocessing_plan(
+        self,
+        *,
+        fov_id: int,
+        loader: ImageLoader,
+        calibration_steps: Sequence[PreprocessingStep],
+        extraction_steps: Sequence[PreprocessingStep],
+        final_queue: Sequence[int],
+        output_writer: NativeOutputWriter,
+        worker_count: int,
+    ) -> NativePreprocessingPlan:
+        if worker_count <= 0:
+            raise ValueError(
+                "pipeline.preprocessing.native_volume_workers must be a positive integer; "
+                + f"got {worker_count!r}"
+            )
+
+        roles = self.cfg.dataset.channel_roles
+        items: list[NativeVolumeWorkItem] = []
+        seen_volume_keys: set[NativeVolumeKey] = set()
+        duplicate_volume_keys: list[NativeVolumeKey] = []
+        seen_output_paths: dict[Path, NativeVolumeKey] = {}
+        duplicate_output_paths: list[tuple[Path, NativeVolumeKey, NativeVolumeKey]] = []
+        missing_planned_output_keys: list[NativeVolumeKey] = []
+        reference_round_id = 1
+        order_index = 0
+        all_steps = tuple(calibration_steps) + tuple(extraction_steps)
+        needs_inter_round_reference = self._native_sequence_uses_histogram_scope(all_steps, "inter_round")
+        needs_intra_round_reference = self._native_sequence_uses_histogram_scope(all_steps, "intra_round")
+        available_volume_keys: set[NativeVolumeKey] = set()
+        round_seq_channels: dict[int, list[int]] = {}
+        for round_id in final_queue:
+            channels_in_round = self.cfg.dataset.round_structure[round_id]
+            seq_channels = sorted(channel_id for channel_id in channels_in_round if roles.get(channel_id) == 'seq')
+            round_seq_channels[int(round_id)] = [int(channel_id) for channel_id in seq_channels]
+            for channel_id in seq_channels:
+                available_volume_keys.add(NativeVolumeKey(round_id=int(round_id), channel_id=int(channel_id)))
+
+        for round_id in final_queue:
+            seq_channels = round_seq_channels[int(round_id)]
+            if not seq_channels:
+                continue
+            first_channel_id = int(seq_channels[0])
+            for channel_id in seq_channels:
+                key = NativeVolumeKey(round_id=int(round_id), channel_id=int(channel_id))
+                if key in seen_volume_keys:
+                    duplicate_volume_keys.append(key)
+                else:
+                    seen_volume_keys.add(key)
+                inter_key = None
+                if needs_inter_round_reference and round_id != reference_round_id:
+                    reference_volume_key = NativeVolumeKey(
+                        round_id=reference_round_id,
+                        channel_id=int(channel_id),
+                    )
+                    if worker_count > 1 or reference_volume_key in available_volume_keys:
+                        inter_key = NativeReferenceKey(
+                            role="inter_round",
+                            volume_key=reference_volume_key,
+                        )
+                intra_key = None if (not needs_intra_round_reference or channel_id == first_channel_id) else NativeReferenceKey(
+                    role="intra_round",
+                    volume_key=NativeVolumeKey(
+                        round_id=int(round_id),
+                        channel_id=first_channel_id,
+                    ),
+                )
+                planned_output_path = self._planned_native_output_path(
+                    output_writer,
+                    round_id=int(round_id),
+                    channel_id=int(channel_id),
+                )
+                if planned_output_path is None:
+                    missing_planned_output_keys.append(key)
+                else:
+                    previous_key = seen_output_paths.get(planned_output_path)
+                    if previous_key is not None:
+                        duplicate_output_paths.append((planned_output_path, previous_key, key))
+                    else:
+                        seen_output_paths[planned_output_path] = key
+                items.append(
+                    NativeVolumeWorkItem(
+                        order_index=order_index,
+                        key=key,
+                        input_path=loader._get_path(fov_id, int(round_id), int(channel_id)),
+                        planned_output_path=planned_output_path,
+                        calibration_steps=tuple(calibration_steps),
+                        extraction_steps=tuple(extraction_steps),
+                        inter_round_reference_key=inter_key,
+                        intra_round_reference_key=intra_key,
+                        produces_inter_round_reference=needs_inter_round_reference and round_id == reference_round_id,
+                        produces_intra_round_reference=needs_intra_round_reference and channel_id == first_channel_id,
+                    )
+                )
+                order_index += 1
+
+        if duplicate_volume_keys:
+            raise ValueError(
+                "Native preprocessing reference dependency plan is impossible: duplicate volume identities "
+                + ", ".join(
+                    f"round {key.round_id} channel {key.channel_id}"
+                    for key in duplicate_volume_keys
+                )
+            )
+
+        if worker_count > 1 and missing_planned_output_keys:
+            raise ValueError(
+                "Native preprocessing parallel execution requires planned output paths for every volume; missing "
+                + ", ".join(
+                    f"round {key.round_id} channel {key.channel_id}"
+                    for key in missing_planned_output_keys
+                )
+            )
+
+        if duplicate_output_paths:
+            raise ValueError(
+                "Native preprocessing reference dependency plan has duplicate output paths: "
+                + "; ".join(
+                    f"{path} for round {first_key.round_id} channel {first_key.channel_id} "
+                    f"and round {duplicate_key.round_id} channel {duplicate_key.channel_id}"
+                    for path, first_key, duplicate_key in duplicate_output_paths
+                )
+            )
+
+        item_keys = {item.key for item in items}
+        missing_dependencies: list[str] = []
+        for item in items:
+            for reference_key in item.required_reference_keys:
+                if reference_key.volume_key not in item_keys:
+                    missing_dependencies.append(
+                        f"round {item.key.round_id} channel {item.key.channel_id} requires "
+                        f"{reference_key.role} reference from round {reference_key.volume_key.round_id} "
+                        f"channel {reference_key.volume_key.channel_id}"
+                    )
+        if missing_dependencies:
+            raise ValueError(
+                "Native preprocessing reference dependency plan is impossible: "
+                + "; ".join(missing_dependencies)
+            )
+
+        return NativePreprocessingPlan(
+            fov_id=int(fov_id),
+            round_order=tuple(int(round_id) for round_id in final_queue),
+            items=tuple(items),
+            worker_count=int(worker_count),
+        )
+
+    def _run_native_volume_work_item(
+        self,
+        *,
+        item: NativeVolumeWorkItem,
+        raw_vol: ImageArray,
+        output_writer: NativeOutputWriter,
+        reference_images: Mapping[NativeReferenceKey, ImageArray],
+        load_ms: float,
+        volume_started: float,
+    ) -> NativeVolumeRunResult:
+        missing = [reference_key for reference_key in item.required_reference_keys if reference_key not in reference_images]
+        if missing:
+            raise ValueError(
+                "Native preprocessing volume scheduled before required references were materialized: "
+                + ", ".join(
+                    f"{key.role} reference from round {key.volume_key.round_id} "
+                    f"channel {key.volume_key.channel_id}"
+                    for key in missing
+                )
+            )
+
+        ctx = {
+            'ref_round_image': None
+            if item.inter_round_reference_key is None
+            else reference_images[item.inter_round_reference_key],
+            'ref_channel_image': None
+            if item.intra_round_reference_key is None
+            else reference_images[item.intra_round_reference_key],
+        }
+
+        img_calibrated, calibration_timings = self._run_pipeline_with_timing(
+            raw_vol,
+            list(item.calibration_steps),
+            ctx,
+        )
+        inter_round_reference_image = img_calibrated.copy() if item.produces_inter_round_reference else None
+        intra_round_reference_image = img_calibrated.copy() if item.produces_intra_round_reference else None
+
+        final_vol, extraction_timings = self._run_pipeline_with_timing(
+            img_calibrated,
+            list(item.extraction_steps),
+            ctx,
+        )
+
+        clip_convert_started = time.perf_counter()
+        final_u8 = img_as_ubyte(np.clip(final_vol, 0, 1))
+        clip_convert_ms = _elapsed_ms_since(clip_convert_started)
+
+        write_started = time.perf_counter()
+        output_path = output_writer(final_u8, item.key.round_id, item.key.channel_id)
+        write_ms = _elapsed_ms_since(write_started)
+
+        return NativeVolumeRunResult(
+            work_item=item,
+            output_path=output_path,
+            inter_round_reference_image=inter_round_reference_image,
+            intra_round_reference_image=intra_round_reference_image,
+            volume_record={
+                "round_id": int(item.key.round_id),
+                "channel_id": int(item.key.channel_id),
+                "input_path": str(item.input_path),
+                "output_path": str(output_path),
+                "load_ms": round(float(load_ms), 3),
+                "calibration_steps": calibration_timings,
+                "extraction_steps": extraction_timings,
+                "clip_convert_ms": clip_convert_ms,
+                "write_ms": write_ms,
+                "total_ms": _elapsed_ms_since(volume_started),
+            },
+        )
+
+    def _load_and_run_native_volume_work_item(
+        self,
+        *,
+        item: NativeVolumeWorkItem,
+        loader: ImageLoader,
+        output_writer: NativeOutputWriter,
+        reference_images: Mapping[NativeReferenceKey, ImageArray],
+    ) -> NativeVolumeRunResult:
+        volume_started = time.perf_counter()
+        load_started = time.perf_counter()
+        raw_vol = cast(ImageArray, loader._lazy_load_tiff(item.input_path).compute())
+        load_ms = _elapsed_ms_since(load_started)
+        return self._run_native_volume_work_item(
+            item=item,
+            raw_vol=raw_vol,
+            output_writer=output_writer,
+            reference_images=reference_images,
+            load_ms=load_ms,
+            volume_started=volume_started,
+        )
+
+    def _strip_native_volume_reference_payloads(
+        self,
+        result: NativeVolumeRunResult,
+    ) -> NativeVolumeRunResult:
+        return NativeVolumeRunResult(
+            work_item=result.work_item,
+            output_path=result.output_path,
+            volume_record=result.volume_record,
+        )
+
+    def _prune_native_reference_images(
+        self,
+        reference_images: dict[NativeReferenceKey, ImageArray],
+        remaining_items: Sequence[NativeVolumeWorkItem],
+    ) -> None:
+        still_required = {
+            reference_key
+            for item in remaining_items
+            for reference_key in item.required_reference_keys
+        }
+        stale_keys = [reference_key for reference_key in reference_images if reference_key not in still_required]
+        for reference_key in stale_keys:
+            del reference_images[reference_key]
+
+    def _run_native_volume_serial(
+        self,
+        *,
+        plan: NativePreprocessingPlan,
+        loader: ImageLoader,
+        output_writer: NativeOutputWriter,
+        print_progress: bool,
+    ) -> list[NativeVolumeRunResult]:
+        reference_images: dict[NativeReferenceKey, ImageArray] = {}
+        results: list[NativeVolumeRunResult] = []
+
+        for index, item in enumerate(plan.items):
+            if print_progress and (not results or results[-1].work_item.key.round_id != item.key.round_id):
+                print(f" -> Processing Round {item.key.round_id}...")
+
+            result = self._load_and_run_native_volume_work_item(
+                item=item,
+                loader=loader,
+                output_writer=output_writer,
+                reference_images=dict(reference_images),
+            )
+            self._publish_native_volume_references(result, reference_images)
+            self._prune_native_reference_images(reference_images, plan.items[index + 1:])
+            results.append(self._strip_native_volume_reference_payloads(result))
+
+        return results
+
+    def _publish_native_volume_references(
+        self,
+        result: NativeVolumeRunResult,
+        reference_images: dict[NativeReferenceKey, ImageArray],
+    ) -> None:
+        key = result.work_item.key
+        if result.inter_round_reference_image is not None:
+            reference_images[NativeReferenceKey(role="inter_round", volume_key=key)] = result.inter_round_reference_image
+        if result.intra_round_reference_image is not None:
+            reference_images[NativeReferenceKey(role="intra_round", volume_key=key)] = result.intra_round_reference_image
+
+    def _run_native_volume_parallel(
+        self,
+        *,
+        plan: NativePreprocessingPlan,
+        loader: ImageLoader,
+        output_writer: NativeOutputWriter,
+        print_progress: bool,
+    ) -> list[NativeVolumeRunResult]:
+        reference_images: dict[NativeReferenceKey, ImageArray] = {}
+        pending_items = list(plan.items)
+        completed_results: dict[NativeVolumeKey, NativeVolumeRunResult] = {}
+
+        while pending_items:
+            ready_items: list[NativeVolumeWorkItem] = [
+                item
+                for item in pending_items
+                if all(reference_key in reference_images for reference_key in item.required_reference_keys)
+            ]
+            if not ready_items:
+                unresolved = [
+                    f"round {item.key.round_id} channel {item.key.channel_id} waits for "
+                    + ", ".join(
+                        f"{key.role} reference from round {key.volume_key.round_id} "
+                        f"channel {key.volume_key.channel_id}"
+                        for key in item.required_reference_keys
+                        if key not in reference_images
+                    )
+                    for item in pending_items
+                ]
+                raise ValueError(
+                    "Native preprocessing reference dependency plan is impossible: "
+                    + "; ".join(unresolved)
+                )
+
+            ready_items.sort(key=lambda item: item.order_index)
+            max_workers = min(plan.worker_count, len(ready_items), os.cpu_count() or 1)
+            if max_workers <= 0:
+                raise ValueError(
+                    "pipeline.preprocessing.native_volume_workers must be a positive integer; "
+                    + f"got {plan.worker_count!r}"
+                )
+
+            if print_progress:
+                rounds = sorted({item.key.round_id for item in ready_items})
+                print(
+                    " -> Processing native volume batch "
+                    f"rounds={rounds} workers={max_workers} volumes={len(ready_items)}"
+                )
+
+            completed_batch: list[NativeVolumeRunResult] = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_item: dict[Future[NativeVolumeRunResult], NativeVolumeWorkItem] = {}
+                for item in ready_items:
+                    future = executor.submit(
+                        self._load_and_run_native_volume_work_item,
+                        item=item,
+                        loader=loader,
+                        output_writer=output_writer,
+                        reference_images=dict(reference_images),
+                    )
+                    future_to_item[future] = item
+                for future in as_completed(future_to_item):
+                    completed_batch.append(future.result())
+
+            completed_batch.sort(key=lambda result: result.work_item.order_index)
+            for result in completed_batch:
+                self._publish_native_volume_references(result, reference_images)
+                completed_results[result.work_item.key] = self._strip_native_volume_reference_payloads(result)
+
+            ready_keys: set[NativeVolumeKey] = {item.key for item in ready_items}
+            pending_items = [item for item in pending_items if item.key not in ready_keys]
+            self._prune_native_reference_images(reference_images, pending_items)
+
+        return [completed_results[item.key] for item in sorted(plan.items, key=lambda item: item.order_index)]
+
     def _run_native_preprocessing_kernel(
         self,
         *,
@@ -933,64 +1428,34 @@ class DataSanitizer:
         if print_progress:
             print(f" -> Pipeline Split: {len(seq_calibration)} Calibration steps + {len(seq_extraction)} Extraction steps")
 
-        inter_round_ref_cache: dict[int, ImageArray] = {}
-        output_files: list[str] = []
-        volume_records: list[dict[str, Any]] = []
+        worker_count = self._native_volume_worker_count(sequence)
+        plan = self._build_native_preprocessing_plan(
+            fov_id=fov_id,
+            loader=loader,
+            calibration_steps=seq_calibration,
+            extraction_steps=seq_extraction,
+            final_queue=final_queue,
+            output_writer=output_writer,
+            worker_count=worker_count,
+        )
+        if worker_count == 1:
+            run_results = self._run_native_volume_serial(
+                plan=plan,
+                loader=loader,
+                output_writer=output_writer,
+                print_progress=print_progress,
+            )
+        else:
+            run_results = self._run_native_volume_parallel(
+                plan=plan,
+                loader=loader,
+                output_writer=output_writer,
+                print_progress=print_progress,
+            )
 
-        for r_id in final_queue:
-            if print_progress:
-                print(f" -> Processing Round {r_id}...")
-            intra_round_ref_img: ImageArray | None = None
-            roles = self.cfg.dataset.channel_roles
-            channels_in_round = self.cfg.dataset.round_structure[r_id]
-            seq_channels = sorted([c for c in channels_in_round if roles.get(c) == 'seq'])
-
-            for c_id in seq_channels:
-                volume_started = time.perf_counter()
-
-                load_started = time.perf_counter()
-                path = loader._get_path(fov_id, r_id, c_id)
-                raw_vol = loader._lazy_load_tiff(path).compute()
-                load_ms = _elapsed_ms_since(load_started)
-
-                ctx = {
-                    'ref_round_image': inter_round_ref_cache.get(c_id),
-                    'ref_channel_image': intra_round_ref_img,
-                }
-
-                img_calibrated, calibration_timings = self._run_pipeline_with_timing(raw_vol, seq_calibration, ctx)
-
-                if r_id == 1:
-                    inter_round_ref_cache[c_id] = img_calibrated.copy()
-
-                if intra_round_ref_img is None:
-                    intra_round_ref_img = img_calibrated.copy()
-
-                final_vol, extraction_timings = self._run_pipeline_with_timing(img_calibrated, seq_extraction, ctx)
-
-                clip_convert_started = time.perf_counter()
-                final_u8 = img_as_ubyte(np.clip(final_vol, 0, 1))
-                clip_convert_ms = _elapsed_ms_since(clip_convert_started)
-
-                write_started = time.perf_counter()
-                output_path = output_writer(final_u8, r_id, c_id)
-                write_ms = _elapsed_ms_since(write_started)
-                output_files.append(str(output_path))
-
-                volume_records.append(
-                    {
-                        "round_id": int(r_id),
-                        "channel_id": int(c_id),
-                        "input_path": str(path),
-                        "output_path": str(output_path),
-                        "load_ms": load_ms,
-                        "calibration_steps": calibration_timings,
-                        "extraction_steps": extraction_timings,
-                        "clip_convert_ms": clip_convert_ms,
-                        "write_ms": write_ms,
-                        "total_ms": _elapsed_ms_since(volume_started),
-                    }
-                )
+        ordered_results = sorted(run_results, key=lambda result: result.work_item.order_index)
+        output_files = [str(result.output_path) for result in ordered_results]
+        volume_records = [result.volume_record for result in ordered_results]
 
         return {
             "rounds_to_process": rounds_to_process,
