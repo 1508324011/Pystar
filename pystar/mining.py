@@ -1,6 +1,9 @@
 # pystar/mining.py
+import os
 import time
+from contextlib import contextmanager
 from json import loads
+from collections.abc import Iterator, Mapping
 from typing import Any, Optional
 
 import numpy as np
@@ -26,11 +29,14 @@ from ._artifact_schemas import (
 )
 from .infrastructure import ExperimentConfig
 from .extraction_utils import (
+    RoundExtractionTransformPlan,
+    build_round_extraction_transform_plan,
     coords_within_transform_scope,
     extract_box_sum_integer,
     extract_signal_volume,
     get_transform_scope,
     map_spot_coordinates,
+    require_coords_within_transform_scope,
     warp_volume_to_reference,
 )
 from .io import (
@@ -49,6 +55,81 @@ from .matlab_engine_bootstrap import (
 from .matlab_extraction import MATLABExtractionBackend
 from .serialization import write_backend_metadata
 # visualization 模块保留引用，按需导入即可
+
+
+EXTRACTION_HOT_PATH_PROFILE_SCHEMA_NAME = "pystar_extraction_hot_path_profile"
+EXTRACTION_HOT_PATH_PROFILE_SCHEMA_VERSION = 1
+_EXTRACTION_PROFILE_BUCKETS = (
+    "spot_table_processing",
+    "transform_manifest_load",
+    "round_transform_materialization",
+    "round_transform_plan_build",
+    "image_read",
+    "coordinate_or_warp_preparation",
+    "interpolation_or_sampling",
+    "write_outputs",
+)
+
+
+class _ExtractionHotPathProfiler:
+    """Default-off extraction profiling guardrail for future optimization work."""
+
+    def __init__(self, *, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self._events: list[dict[str, Any]] = []
+
+    @contextmanager
+    def record(self, bucket: str, **details: Any) -> Iterator[None]:
+        if bucket not in _EXTRACTION_PROFILE_BUCKETS:
+            raise ValueError(f"Unknown extraction profiling bucket: {bucket!r}")
+        if not self.enabled:
+            yield
+            return
+
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._events.append(
+                {
+                    "bucket": bucket,
+                    "elapsed_wall_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                    "details": {key: value for key, value in details.items() if value is not None},
+                }
+            )
+
+    def build_payload(self, *, fov_id: int) -> dict[str, Any]:
+        buckets: dict[str, dict[str, Any]] = {
+            bucket: {"count": 0, "total_elapsed_wall_ms": 0.0}
+            for bucket in _EXTRACTION_PROFILE_BUCKETS
+        }
+        for event in self._events:
+            bucket = str(event["bucket"])
+            elapsed = float(event["elapsed_wall_ms"])
+            buckets[bucket]["count"] = int(buckets[bucket]["count"]) + 1
+            buckets[bucket]["total_elapsed_wall_ms"] = round(
+                float(buckets[bucket]["total_elapsed_wall_ms"]) + elapsed,
+                3,
+            )
+
+        return {
+            "schema_name": EXTRACTION_HOT_PATH_PROFILE_SCHEMA_NAME,
+            "schema_version": EXTRACTION_HOT_PATH_PROFILE_SCHEMA_VERSION,
+            "fov_id": int(fov_id),
+            "enabled": self.enabled,
+            "buckets": buckets,
+            "events": list(self._events),
+        }
+
+
+def _extraction_profile_enabled(config: ExperimentConfig) -> bool:
+    extraction_cfg = getattr(getattr(config, "pipeline", None), "extraction", None)
+    config_flag = any(
+        bool(getattr(extraction_cfg, attr, False))
+        for attr in ("profile_hot_path", "profiling_enabled", "enable_hot_path_profiling")
+    )
+    env_flag = os.environ.get("PYSTAR_EXTRACTION_PROFILE", "").strip().lower() in {"1", "true", "yes", "on"}
+    return bool(config_flag or env_flag)
 
 class SignalMiner:
     """Extract per-round sequencing-channel intensities at detected spots.
@@ -72,6 +153,7 @@ class SignalMiner:
         self.loader = ImageLoader(config)
         self._matlab_session_owner = matlab_session_owner
         self._matlab_backend: Optional[MATLABExtractionBackend] = None
+        self._last_extraction_profile: dict[str, Any] | None = None
 
     def close(self) -> None:
         """Release the optional MATLAB extraction backend session."""
@@ -108,9 +190,55 @@ class SignalMiner:
             hydrate_flow_3d=False,
         )
 
-    def _materialize_round_transform(self, fov_id: int, round_id: int, transform_data: dict[str, Any]) -> dict[str, Any]:
+    def _materialize_round_transform(
+        self,
+        fov_id: int,
+        round_id: int,
+        transform_data: Mapping[str, Any],
+        *,
+        hydrate_flow_3d: bool = True,
+    ) -> dict[str, Any]:
         base_dir = Path(self.cfg.pipeline.output.directory)
-        return materialize_round_transform_entry(base_dir, fov_id, round_id, transform_data)
+        return materialize_round_transform_entry(
+            base_dir,
+            fov_id,
+            round_id,
+            transform_data,
+            hydrate_flow_3d=hydrate_flow_3d,
+        )
+
+    def _build_round_transform_plan(
+        self,
+        fov_id: int,
+        round_id: int,
+        transform_data: Mapping[str, Any],
+        *,
+        hydrate_flow_3d: bool = True,
+        profiler: _ExtractionHotPathProfiler | None = None,
+    ) -> RoundExtractionTransformPlan:
+        profiler = profiler or _ExtractionHotPathProfiler(enabled=False)
+        with profiler.record(
+            "round_transform_materialization",
+            round_id=int(round_id),
+            hydrate_flow_3d=bool(hydrate_flow_3d),
+        ):
+            materialized = self._materialize_round_transform(
+                fov_id,
+                round_id,
+                transform_data,
+                hydrate_flow_3d=hydrate_flow_3d,
+            )
+        with profiler.record(
+            "round_transform_plan_build",
+            round_id=int(round_id),
+            hydrate_flow_3d=bool(hydrate_flow_3d),
+        ):
+            return build_round_extraction_transform_plan(
+                fov_id=fov_id,
+                round_id=round_id,
+                transform_data=materialized,
+                source_transform_data=transform_data,
+            )
 
     def _validate_scope_contract(self, fov_id: int, transforms: dict[Any, Any]) -> dict[str, Any]:
         provenance = transforms.get('_provenance')
@@ -148,7 +276,7 @@ class SignalMiner:
     def _resolve_scope_metadata(
         self,
         fov_id: int,
-        transforms: dict[Any, Any],
+        transforms: Mapping[Any, Any],
         contract: dict[str, Any],
     ) -> dict[str, Any] | None:
         delivered_coverage = contract['delivered_coverage']
@@ -158,10 +286,12 @@ class SignalMiner:
         for round_id, transform_data in transforms.items():
             if not isinstance(round_id, int):
                 continue
-            if not isinstance(transform_data, dict) or 'global_shift_3d' not in transform_data:
+            if isinstance(transform_data, RoundExtractionTransformPlan):
+                scope_metadata = transform_data.scope_public_payload()
+            elif isinstance(transform_data, dict) and 'global_shift_3d' in transform_data:
+                scope_metadata = get_transform_scope(transform_data)
+            else:
                 continue
-
-            scope_metadata = get_transform_scope(transform_data)
             if scope_metadata is None:
                 missing_rounds.append(int(round_id))
                 continue
@@ -222,19 +352,24 @@ class SignalMiner:
     def _validate_round_transform_for_mode(
         self,
         round_id: int,
-        transform_data: dict[str, Any],
+        transform_data: dict[str, Any] | RoundExtractionTransformPlan,
         transform_application_mode: str,
     ) -> None:
         if transform_application_mode != 'image_warp':
             return
 
-        if isinstance(transform_data.get('flow_2d'), np.ndarray):
+        if isinstance(transform_data, RoundExtractionTransformPlan):
+            data = transform_data.legacy_transform_data()
+        else:
+            data = transform_data
+
+        if isinstance(data.get('flow_2d'), np.ndarray):
             raise ValueError(
                 f"Round {round_id} delivered flow_2d, but image_warp mainline only supports flow_3d"
             )
 
-        is_reference_round = bool(transform_data.get('is_reference_round', False))
-        if transform_data.get('flow_3d') is None and not is_reference_round:
+        is_reference_round = bool(data.get('is_reference_round', False))
+        if data.get('flow_3d') is None and not is_reference_round:
             raise ValueError(
                 f"Round {round_id} is missing flow_3d. image_warp is the Phase 1 RC mainline and does not silently downgrade."
             )
@@ -244,12 +379,13 @@ class SignalMiner:
         *,
         img_vol: Any,
         ref_coords: Any,
-        transform_data: dict[str, Any],
+        transform_data: dict[str, Any] | RoundExtractionTransformPlan,
         box_size: tuple[int, int, int],
         transform_application_mode: str,
         fov_id: int,
         round_id: int,
         channel_id: int,
+        profiler: _ExtractionHotPathProfiler | None = None,
     ) -> tuple[Any, Optional[dict[str, Any]]]:
         """Extract one `(N_spots,)` intensity vector for one round/channel.
 
@@ -260,15 +396,36 @@ class SignalMiner:
         """
         expected_semantics = self._expected_field_semantics()
         provider = self.cfg.pipeline.extraction.provider
+        profiler = profiler or _ExtractionHotPathProfiler(enabled=False)
+        if transform_application_mode not in {'coordinate_mapping', 'image_warp'}:
+            raise ValueError(f'Unsupported transform application mode: {transform_application_mode}')
+
+        _ = require_coords_within_transform_scope(
+            ref_coords,
+            transform_data,
+            operation='image_warp extraction' if transform_application_mode == 'image_warp' else 'coordinate_mapping extraction',
+        )
 
         if provider == 'native':
             if transform_application_mode == 'coordinate_mapping':
-                target_coords = map_spot_coordinates(
-                    ref_coords,
-                    transform_data,
-                    expected_field_semantics=expected_semantics,
-                )
-                return extract_box_sum_integer(img_vol, target_coords, box_size), None
+                with profiler.record("coordinate_or_warp_preparation", round_id=round_id, channel_id=channel_id):
+                    target_coords = map_spot_coordinates(
+                        ref_coords,
+                        transform_data,
+                        expected_field_semantics=expected_semantics,
+                    )
+                with profiler.record("interpolation_or_sampling", round_id=round_id, channel_id=channel_id):
+                    return extract_box_sum_integer(img_vol, target_coords, box_size), None
+
+            if transform_application_mode == 'image_warp':
+                with profiler.record("coordinate_or_warp_preparation", round_id=round_id, channel_id=channel_id):
+                    warped_volume = warp_volume_to_reference(
+                        img_vol,
+                        transform_data,
+                        expected_field_semantics=expected_semantics,
+                    )
+                with profiler.record("interpolation_or_sampling", round_id=round_id, channel_id=channel_id):
+                    return extract_box_sum_integer(warped_volume, ref_coords, box_size), None
 
             return (
                 extract_signal_volume(
@@ -284,36 +441,40 @@ class SignalMiner:
 
         backend = self._get_matlab_backend()
         if transform_application_mode == 'coordinate_mapping':
-            target_coords = map_spot_coordinates(
-                ref_coords,
+            with profiler.record("coordinate_or_warp_preparation", round_id=round_id, channel_id=channel_id):
+                target_coords = map_spot_coordinates(
+                    ref_coords,
+                    transform_data,
+                    expected_field_semantics=expected_semantics,
+                )
+            with profiler.record("interpolation_or_sampling", round_id=round_id, channel_id=channel_id):
+                result = backend.extract_intensities(
+                    img_vol,
+                    target_coords,
+                    fov_id=fov_id,
+                    round_id=round_id,
+                    channel_id=channel_id,
+                    box_size=box_size,
+                    transform_application_mode=transform_application_mode,
+                )
+            return result['intensities'], result.get('backend_metadata')
+
+        with profiler.record("coordinate_or_warp_preparation", round_id=round_id, channel_id=channel_id):
+            warped_volume = warp_volume_to_reference(
+                img_vol,
                 transform_data,
                 expected_field_semantics=expected_semantics,
             )
+        with profiler.record("interpolation_or_sampling", round_id=round_id, channel_id=channel_id):
             result = backend.extract_intensities(
-                img_vol,
-                target_coords,
+                warped_volume,
+                ref_coords,
                 fov_id=fov_id,
                 round_id=round_id,
                 channel_id=channel_id,
                 box_size=box_size,
                 transform_application_mode=transform_application_mode,
             )
-            return result['intensities'], result.get('backend_metadata')
-
-        warped_volume = warp_volume_to_reference(
-            img_vol,
-            transform_data,
-            expected_field_semantics=expected_semantics,
-        )
-        result = backend.extract_intensities(
-            warped_volume,
-            ref_coords,
-            fov_id=fov_id,
-            round_id=round_id,
-            channel_id=channel_id,
-            box_size=box_size,
-            transform_application_mode=transform_application_mode,
-        )
         return result['intensities'], result.get('backend_metadata')
 
     def _require_persisted_spot_row_lineage(
@@ -347,35 +508,38 @@ class SignalMiner:
         deformation fields.
         """
         print(f"[{'='*20} Mining FOV {fov_id} {'='*20}]")
+        profiler = _ExtractionHotPathProfiler(enabled=_extraction_profile_enabled(self.cfg))
         base_dir = Path(self.cfg.pipeline.output.directory)
         paths = get_fov_output_structure(base_dir, fov_id)
         # 1. Load Metadata & Transforms
         spots_path = paths["spots"] / f"spots_fov_{fov_id}.csv"
         spot_expected = SpotTableSchema().expected_description()
-        try:
-            raw_spots_df = pd.read_csv(spots_path)
-        except Exception as exc:
-            raise wrap_table_read_error(
-                exc,
-                "spot table",
+        with profiler.record("spot_table_processing"):
+            try:
+                raw_spots_df = pd.read_csv(spots_path)
+            except Exception as exc:
+                raise wrap_table_read_error(
+                    exc,
+                    "spot table",
+                    fov_id=fov_id,
+                    path=spots_path,
+                    context="mining load",
+                    expected=spot_expected,
+                ) from exc
+            spots_df = validate_spot_table(
+                raw_spots_df,
                 fov_id=fov_id,
                 path=spots_path,
                 context="mining load",
-                expected=spot_expected,
-            ) from exc
-        spots_df = validate_spot_table(
-            raw_spots_df,
-            fov_id=fov_id,
-            path=spots_path,
-            context="mining load",
-        )
-        spot_row_lineage = build_spot_row_lineage(
-            spots_df,
-            fov_id=fov_id,
-            path=spots_path,
-            context="mining row-lineage build",
-        )
-        transforms = self._load_transforms(fov_id)
+            )
+            spot_row_lineage = build_spot_row_lineage(
+                spots_df,
+                fov_id=fov_id,
+                path=spots_path,
+                context="mining row-lineage build",
+            )
+        with profiler.record("transform_manifest_load"):
+            transforms = self._load_transforms(fov_id)
         
         ref_coords = spots_df[['z', 'y', 'x']].values.astype(np.float32)
         n_spots = len(ref_coords)
@@ -388,6 +552,20 @@ class SignalMiner:
         print(f" [Miner] Channels to extract: {channels}")
         
         rounds = sorted(list(self.cfg.dataset.round_structure.keys()))
+        round_transform_plans: dict[int, RoundExtractionTransformPlan] = {}
+        for r_id in rounds:
+            if r_id not in transforms:
+                raise KeyError(f"Missing transform entry for round {r_id} in FOV {fov_id} transform manifest")
+            transform_data = transforms[r_id]
+            if not isinstance(transform_data, Mapping):
+                raise ValueError(f"FOV {fov_id} transform manifest round {r_id} must be a mapping")
+            round_transform_plans[r_id] = self._build_round_transform_plan(
+                fov_id,
+                r_id,
+                transform_data,
+                hydrate_flow_3d=False,
+                profiler=profiler,
+            )
         matrix_spec = build_intensity_matrix_spec(
             fov_id=fov_id,
             n_spots=n_spots,
@@ -405,7 +583,7 @@ class SignalMiner:
         extraction_provider = self.cfg.pipeline.extraction.provider
         backend_records: list[dict[str, Any]] = []
         scope_contract = self._validate_scope_contract(fov_id, transforms)
-        scope_metadata = self._resolve_scope_metadata(fov_id, transforms, scope_contract)
+        scope_metadata = self._resolve_scope_metadata(fov_id, round_transform_plans, scope_contract)
         scope_transform = None if scope_metadata is None else {'_scope': scope_metadata}
         in_scope_mask = coords_within_transform_scope(ref_coords, scope_transform)
         in_scope_coords = ref_coords[in_scope_mask]
@@ -430,11 +608,17 @@ class SignalMiner:
         with tqdm(total=total_steps, desc="Extracting Signals") as pbar:
             for r_idx, r_id in enumerate(rounds):
                 # Pre-calculate coordinates for this round ONCE
-                if r_id not in transforms:
-                    raise KeyError(f"Missing transform entry for round {r_id} in FOV {fov_id} transform manifest")
-
-                trans_data = self._materialize_round_transform(fov_id, r_id, transforms[r_id])
-                self._validate_round_transform_for_mode(r_id, trans_data, transform_application_mode)
+                transform_data = transforms[r_id]
+                if not isinstance(transform_data, Mapping):
+                    raise ValueError(f"FOV {fov_id} transform manifest round {r_id} must be a mapping")
+                round_plan = self._build_round_transform_plan(
+                    fov_id,
+                    r_id,
+                    transform_data,
+                    hydrate_flow_3d=True,
+                    profiler=profiler,
+                )
+                self._validate_round_transform_for_mode(r_id, round_plan, transform_application_mode)
 
                 current_round_channels = self.cfg.dataset.round_structure[r_id]
                 
@@ -445,17 +629,19 @@ class SignalMiner:
 
                     # Load Image - 这是主要的 IO 开销
                     # 确保是 clean data
-                    img_vol = self.loader.load_clean_image(fov_id, r_id, c_id) 
+                    with profiler.record("image_read", round_id=r_id, channel_id=c_id):
+                        img_vol = self.loader.load_clean_image(fov_id, r_id, c_id)
 
                     vals, backend_metadata = self._extract_intensities_for_channel(
                         img_vol=img_vol,
                         ref_coords=in_scope_coords,
-                        transform_data=trans_data,
+                        transform_data=round_plan,
                         box_size=box_size,
                         transform_application_mode=transform_application_mode,
                         fov_id=fov_id,
                         round_id=r_id,
                         channel_id=c_id,
+                        profiler=profiler,
                     )
                     if isinstance(backend_metadata, dict):
                         backend_records.append(backend_metadata)
@@ -466,7 +652,7 @@ class SignalMiner:
                     del img_vol
                     pbar.update(1)
 
-                del trans_data
+                del round_plan
 
         # 4. Save
         out_name = paths["extraction"] / f"intensity_matrix_fov_{fov_id}.npy"
@@ -506,8 +692,9 @@ class SignalMiner:
             context="mining metadata save",
             spot_path=spots_path,
         )
-        np.save(out_name, intensity_matrix)
-        write_backend_metadata(metadata_path, metadata_payload)
+        with profiler.record("write_outputs", artifact="intensity_matrix"):
+            np.save(out_name, intensity_matrix)
+            write_backend_metadata(metadata_path, metadata_payload)
         metadata_expected = intensity_matrix_metadata_expected_description()
         try:
             persisted_metadata = loads(metadata_path.read_text(encoding="utf-8"))
@@ -583,6 +770,12 @@ class SignalMiner:
                     "boundary_instrumentation_summary": boundary_summary,
                     "session_lifecycle_summary": merge_matlab_session_lifecycle_summaries(session_summaries) if session_summaries else None,
                 },
+            )
+        self._last_extraction_profile = profiler.build_payload(fov_id=fov_id)
+        if profiler.enabled:
+            write_backend_metadata(
+                paths["qc"] / f"extraction_hot_path_profile_fov_{fov_id}.json",
+                self._last_extraction_profile,
             )
         print(f" [Miner] Saved extraction matrix to {out_name.name} | Shape: {intensity_matrix.shape}")
         

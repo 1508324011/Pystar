@@ -9,17 +9,138 @@ not optional decoration.
 """
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import cast
 
 import numpy as np
 import numpy.typing as npt
 from scipy.ndimage import map_coordinates
 
-from .runtime_artifacts import FieldSemantics, ScopeMetadata
+from .runtime_artifacts import FieldSemantics, Flow3DSidecarDescriptor, ScopeMetadata, TransformEntry
 
 
 FloatArray = npt.NDArray[np.float32]
-TransformData = Mapping[str, object] | None
+
+
+def _scope_public_payload(scope: ScopeMetadata) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "coverage_mode": scope.coverage_mode,
+        "region_origin_zyx": scope.region_origin_zyx,
+        "region_shape_zyx": scope.region_shape_zyx,
+        "full_volume_shape_zyx": scope.full_volume_shape_zyx,
+    }
+    if scope.coverage_mode == "tile_local":
+        payload["tile_grid_shape_yx"] = scope.tile_grid_shape_yx
+        payload["tile_index"] = scope.tile_index
+    return payload
+
+
+def _flow_descriptor_from_payload(
+    payload: object,
+    *,
+    field_name: str,
+) -> Flow3DSidecarDescriptor | None:
+    if not isinstance(payload, Mapping):
+        return None
+    flow_3d = payload.get("flow_3d")
+    if isinstance(flow_3d, Flow3DSidecarDescriptor):
+        return flow_3d
+    if isinstance(flow_3d, Mapping):
+        return Flow3DSidecarDescriptor.from_legacy(flow_3d, field_name=field_name)
+    return None
+
+
+@dataclass(frozen=True)
+class RoundExtractionTransformPlan:
+    """Runtime-only extraction view of one materialized round transform.
+
+    The plan is intentionally not a persisted artifact.  It wraps the legacy
+    round dictionary that extraction helpers already understand, while exposing
+    the normalized runtime-artifact models used for scope/semantics/sidecar
+    decisions.  Construction should happen after the I/O boundary has called
+    ``materialize_round_transform_entry(...)`` so declared sidecars stay under
+    the existing fail-loud authority.
+    """
+
+    fov_id: int
+    round_id: int
+    transform_entry: TransformEntry
+    transform_data: Mapping[str, object]
+    scope: ScopeMetadata | None
+    field_semantics: FieldSemantics
+    flow_descriptor: Flow3DSidecarDescriptor | None = None
+
+    def legacy_transform_data(self) -> dict[str, object]:
+        """Return a shallow legacy-compatible payload for existing helpers."""
+
+        return dict(self.transform_data)
+
+    def scope_public_payload(self) -> dict[str, object] | None:
+        if self.scope is None:
+            return None
+        return _scope_public_payload(self.scope)
+
+    def coords_within_scope(self, ref_coords: FloatArray) -> npt.NDArray[np.bool_]:
+        if self.scope is None or self.scope.coverage_mode == "full_fov":
+            return np.ones(len(ref_coords), dtype=bool)
+        return self.scope.contains(ref_coords)
+
+    def require_coords_within_scope(self, ref_coords: FloatArray, *, operation: str) -> dict[str, object] | None:
+        scope_payload = self.scope_public_payload()
+        if self.scope is None or self.scope.coverage_mode == "full_fov":
+            return scope_payload
+
+        in_scope = self.scope.contains(ref_coords)
+        if np.all(in_scope):
+            return scope_payload
+
+        outside_count = int((~in_scope).sum())
+        raise ValueError(
+            f"{operation} received {outside_count} reference coordinates outside tile_local coverage. "
+            "Filter coordinates by persisted scope metadata before replaying extraction."
+        )
+
+
+def build_round_extraction_transform_plan(
+    *,
+    fov_id: int,
+    round_id: int,
+    transform_data: Mapping[str, object],
+    source_transform_data: Mapping[str, object] | None = None,
+) -> RoundExtractionTransformPlan:
+    """Build a runtime-only extraction plan from a materialized round payload.
+
+    ``transform_data`` is the authoritative legacy payload used by extraction;
+    callers should pass the output of ``materialize_round_transform_entry(...)``.
+    ``source_transform_data`` may be the lazy manifest entry before hydration so
+    the plan can retain the original ``flow_3d`` sidecar descriptor even when the
+    materialized payload now contains a dense ndarray.
+    """
+
+    entry = TransformEntry.from_legacy(
+        round_id,
+        transform_data,
+        field_name=f"extraction transform plan round {round_id}",
+    )
+    descriptor = _flow_descriptor_from_payload(
+        source_transform_data,
+        field_name=f"extraction transform plan round {round_id}.flow_3d",
+    )
+    if descriptor is None and isinstance(entry.flow_3d, Flow3DSidecarDescriptor):
+        descriptor = entry.flow_3d
+
+    return RoundExtractionTransformPlan(
+        fov_id=int(fov_id),
+        round_id=int(round_id),
+        transform_entry=entry,
+        transform_data=cast(Mapping[str, object], entry.to_legacy()),
+        scope=entry.scope,
+        field_semantics=entry.field_semantics,
+        flow_descriptor=descriptor,
+    )
+
+
+TransformData = Mapping[str, object] | RoundExtractionTransformPlan | None
 
 
 def _unknown_field_semantics() -> dict[str, str]:
@@ -67,11 +188,14 @@ def validate_field_semantics(
         `representation` and `composition` are enforced because `status` is
         provenance, not geometry.
     """
-    actual_payload = None if transform_data is None else transform_data.get("_semantics")
-    actual = _normalize_field_semantics_payload(
-        actual_payload,
-        field_name="transform _semantics",
-    )
+    if isinstance(transform_data, RoundExtractionTransformPlan):
+        actual = _field_semantics_public_payload(transform_data.field_semantics)
+    else:
+        actual_payload = None if transform_data is None else transform_data.get("_semantics")
+        actual = _normalize_field_semantics_payload(
+            actual_payload,
+            field_name="transform _semantics",
+        )
 
     if expected_field_semantics is None:
         return {
@@ -221,20 +345,14 @@ def get_transform_scope(transform_data: TransformData) -> dict[str, object] | No
     if transform_data is None:
         return None
 
+    if isinstance(transform_data, RoundExtractionTransformPlan):
+        return transform_data.scope_public_payload()
+
     payload = transform_data.get("_scope")
     if payload is None:
         return None
     scope = ScopeMetadata.from_legacy(payload, field_name="transform _scope")
-    normalized: dict[str, object] = {
-        "coverage_mode": scope.coverage_mode,
-        "region_origin_zyx": scope.region_origin_zyx,
-        "region_shape_zyx": scope.region_shape_zyx,
-        "full_volume_shape_zyx": scope.full_volume_shape_zyx,
-    }
-    if scope.coverage_mode == "tile_local":
-        normalized["tile_grid_shape_yx"] = scope.tile_grid_shape_yx
-        normalized["tile_index"] = scope.tile_index
-    return normalized
+    return _scope_public_payload(scope)
 
 
 def coords_within_transform_scope(
@@ -247,6 +365,9 @@ def coords_within_transform_scope(
     `[origin, origin + shape)`. Full-FOV transforms accept every coordinate.
     Tile-local transforms only accept spots inside the persisted tile region.
     """
+    if isinstance(transform_data, RoundExtractionTransformPlan):
+        return transform_data.coords_within_scope(ref_coords)
+
     scope = get_transform_scope(transform_data)
     if scope is None or scope["coverage_mode"] == "full_fov":
         return np.ones(len(ref_coords), dtype=bool)
@@ -274,6 +395,9 @@ def _require_coords_within_scope(
     *,
     operation: str,
 ) -> dict[str, object] | None:
+    if isinstance(transform_data, RoundExtractionTransformPlan):
+        return transform_data.require_coords_within_scope(ref_coords, operation=operation)
+
     scope = get_transform_scope(transform_data)
     if scope is None or scope["coverage_mode"] == "full_fov":
         return scope
@@ -287,6 +411,23 @@ def _require_coords_within_scope(
         f"{operation} received {outside_count} reference coordinates outside tile_local coverage. "
         "Filter coordinates by persisted scope metadata before replaying extraction."
     )
+
+
+def require_coords_within_transform_scope(
+    ref_coords: FloatArray,
+    transform_data: TransformData,
+    *,
+    operation: str,
+) -> dict[str, object] | None:
+    """Fail loudly when reference coordinates exceed a transform's declared scope.
+
+    This is the central extraction-side guard used by callers that split warp
+    preparation from box sampling for profiling.  It preserves the same behavior
+    as ``extract_signal_volume(...)`` without forcing those callers to duplicate
+    tile-local scope parsing or error wording.
+    """
+
+    return _require_coords_within_scope(ref_coords, transform_data, operation=operation)
 
 
 def _is_reference_round_transform(transform_data: Mapping[str, object], global_shift: FloatArray) -> bool:
@@ -317,6 +458,11 @@ def map_spot_coordinates(
     if transform_data is None:
         return ref_coords.astype(np.float32)
 
+    if isinstance(transform_data, RoundExtractionTransformPlan):
+        data = transform_data.legacy_transform_data()
+    else:
+        data = transform_data
+
     _raise_if_field_semantics_mismatch(
         transform_data,
         expected_field_semantics,
@@ -329,11 +475,11 @@ def map_spot_coordinates(
     )
 
     mapped = ref_coords.copy().astype(np.float32)
-    global_shift = np.asarray(transform_data.get('global_shift_3d', np.zeros(3, dtype=np.float32)), dtype=np.float32)
+    global_shift = np.asarray(data.get('global_shift_3d', np.zeros(3, dtype=np.float32)), dtype=np.float32)
     mapped -= global_shift
 
-    flow_2d = transform_data.get('flow_2d')
-    flow_3d = transform_data.get('flow_3d')
+    flow_2d = data.get('flow_2d')
+    flow_3d = data.get('flow_3d')
     _require_materialized_flow(flow_2d, 'flow_2d')
     _require_materialized_flow(flow_3d, 'flow_3d')
     flow = flow_2d if flow_2d is not None else flow_3d
@@ -503,9 +649,15 @@ def warp_volume_to_reference(
     the covered subvolume. In that mode only the scoped region is locally
     deformed and stitched back into the full warped volume.
     """
-    data: dict[str, object] = {} if transform_data is None else dict(transform_data)
+    data: dict[str, object]
+    if isinstance(transform_data, RoundExtractionTransformPlan):
+        data = transform_data.legacy_transform_data()
+        semantics_source: TransformData = transform_data
+    else:
+        data = {} if transform_data is None else dict(transform_data)
+        semantics_source = data
     _raise_if_field_semantics_mismatch(
-        data,
+        semantics_source,
         expected_field_semantics,
         operation='image_warp extraction',
     )
@@ -543,7 +695,7 @@ def warp_volume_to_reference(
         return warped
 
     flow_arr = np.asarray(flow_3d, dtype=np.float32)
-    scope = get_transform_scope(data)
+    scope = get_transform_scope(transform_data if isinstance(transform_data, RoundExtractionTransformPlan) else data)
     if scope is not None and scope.get('coverage_mode') == 'tile_local':
         origin = scope['region_origin_zyx']
         region_shape = scope['region_shape_zyx']
@@ -616,8 +768,12 @@ def extract_signal_volume(
     Both paths share the same box-sum implementation so differences between
     them isolate transform-application semantics rather than integration logic.
     """
-    data: dict[str, object] = {} if transform_data is None else dict(transform_data)
-    scope = _require_coords_within_scope(
+    data: TransformData
+    if isinstance(transform_data, RoundExtractionTransformPlan):
+        data = transform_data
+    else:
+        data = {} if transform_data is None else dict(transform_data)
+    _ = require_coords_within_transform_scope(
         ref_coords,
         data,
         operation='image_warp extraction' if transform_application_mode == 'image_warp' else 'coordinate_mapping extraction',
