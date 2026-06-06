@@ -21,6 +21,8 @@ from scripts.profile_native_preprocessing_calibration import (
 )
 from scripts.validate_native_volume_worker_sweep import (
     STAGE32_POLICY_SCHEMA_NAME,
+    STAGE33_FOV1_OUTPUT_MARKER,
+    STAGE33_FOV1_POLICY_SCHEMA_NAME,
     build_sweep_payload,
     write_sweep_artifacts,
 )
@@ -181,7 +183,7 @@ def _profile_payload(
 ) -> dict[str, Any]:
     _ = label
     rounds = [1, 2] if target_rounds is None else list(target_rounds)
-    repeat_root = profile_output_dir / "fov_1" / "repeat_0"
+    repeat_root = profile_output_dir / f"fov_{fov_id}" / "repeat_0"
     output_files = _write_clean_tiffs(
         repeat_root=repeat_root,
         fov_id=fov_id,
@@ -278,6 +280,7 @@ def _write_existing_profiles(
     workers4_value_offset: int = 0,
     omitted_outputs: set[tuple[int, int]] | None = None,
     clean_channels: Sequence[int] = (0, 1),
+    fov_id: int = 1,
 ) -> tuple[Path, Path, dict[str, Path]]:
     config_path = tmp_path / "base.yaml"
     _write_yaml(config_path, base_config)
@@ -294,7 +297,7 @@ def _write_existing_profiles(
             worker_count=worker_count,
             source_config_path=source_config,
             profile_output_dir=tmp_path / "existing_profiles" / label,
-            fov_id=1,
+            fov_id=fov_id,
             target_rounds=target_rounds,
             wall_total_ms=wall_total_ms,
             validation_worktree=validation_worktree,
@@ -577,4 +580,194 @@ def test_stage32_rejects_generated_output_overlap_with_production_root(tmp_path:
             tmp_path=tmp_path,
             target_rounds=None,
             production_root_base=production_output_dir,
+        )
+
+
+def _stage33_payload(
+    *,
+    config_path: Path,
+    output_dir: Path,
+    profile_paths: Mapping[str, Path],
+    tmp_path: Path,
+    target_rounds: Sequence[int] | None,
+    validation_worktree: Path | None = None,
+    worker_counts: Sequence[int] = (1, 4),
+    fov_ids: Sequence[int] | None = None,
+    policy_candidate_workers: Sequence[int] = (4,),
+) -> dict[str, object]:
+    args = ["validate_native_volume_worker_sweep.py", "--stage33-fov1-policy"]
+    if target_rounds is not None:
+        args.extend(["--rounds", ",".join(str(round_id) for round_id in target_rounds)])
+    if fov_ids is not None:
+        args.extend(["--fovs", ",".join(str(fov_id) for fov_id in fov_ids)])
+    return build_sweep_payload(
+        config_path=config_path,
+        output_dir=output_dir,
+        worker_counts=worker_counts,
+        expected_worker_counts=(1, 4),
+        fov_ids=fov_ids,
+        target_rounds=target_rounds,
+        repeats=1,
+        compare_repeat_index=0,
+        baseline_commit="baseline",
+        validation_worktree=validation_worktree,
+        production_root_base=tmp_path / "generated_stage33_production_roots",
+        source_root=Path(__file__).resolve().parents[2],
+        existing_profiles=profile_paths,
+        baseline_profile_json=None,
+        skip_reason="not skipped",
+        argv=args,
+        stage33_fov1_policy=True,
+        policy_candidate_workers=policy_candidate_workers,
+    )
+
+
+def test_stage33_fov1_policy_passes_on_fov1_surface_without_multi_fov_claim(tmp_path: Path) -> None:
+    validation_worktree = tmp_path / "pystar-next"
+    base_config = _base_config_payload(tmp_path)
+    dataset = cast(dict[str, Any], base_config["dataset"])
+    dataset["fov_list"] = [1, 2, 3]
+    config_path, output_dir, profile_paths = _write_existing_profiles(
+        tmp_path=tmp_path,
+        base_config=base_config,
+        target_rounds=None,
+        validation_worktree=validation_worktree,
+    )
+
+    payload = _stage33_payload(
+        config_path=config_path,
+        output_dir=output_dir,
+        profile_paths=profile_paths,
+        tmp_path=tmp_path,
+        target_rounds=None,
+        validation_worktree=validation_worktree,
+    )
+
+    assert payload["schema_name"] == STAGE33_FOV1_POLICY_SCHEMA_NAME
+    surface = _mapping(_mapping(payload["worker_policy"])["surface"])
+    assert surface["declared_surface_scope"] == "fov1_only"
+    assert surface["effective_surface_scope"] == "full"
+    assert surface["fov1_policy_surface_ready"] is True
+    assert surface["selected_fov_ids"] == [1]
+    assert surface["configured_non_policy_fov_ids"] == [2, 3]
+    assert surface["multi_fov_policy_ready"] is False
+    assert surface["multi_fov_readiness_claimed"] is False
+    assert "must not be used as multi-FOV" in str(surface["multi_fov_readiness_disclaimer"])
+
+    worker_policy = _mapping(payload["worker_policy"])
+    assert _mapping(worker_policy["clean_equivalence_gate"])["status"] == "pass"
+    assert _mapping(worker_policy["surface_completeness_gate"])["status"] == "pass"
+    assert _mapping(worker_policy["source_consistency_gate"])["status"] == "pass"
+
+    verdict = _mapping(payload["verdict"])
+    assert verdict["status"] == "pass"
+    assert verdict["recommended_worker_count"] == 4
+    assert "no multi-FOV readiness is claimed" in str(verdict["opt_in_recommendation"])
+    assert "Stage33 FOV1 correctness gates passed" in str(verdict["reason"])
+
+    validation_surface = _mapping(payload["validation_surface"])
+    assert validation_surface["stage33_fov1_policy_enabled"] is True
+    assert validation_surface["stage33_policy_fov_ids"] == [1]
+    assert validation_surface["stage33_policy_surface_kind"] == "fov1_only"
+    contracts = _mapping(payload["contracts"])
+    assert contracts["stage33_multi_fov_readiness_claimed"] is False
+    downstream = _mapping(payload["downstream_metrics"])
+    assert "multi-FOV readiness claim" in str(downstream["reason"])
+
+    json_path, markdown_path = write_sweep_artifacts(payload, output_dir)
+    assert json_path.name == "stage33_fov1_native_volume_worker_policy_validation.json"
+    assert markdown_path.name == "stage33_fov1_native_volume_worker_policy_validation.md"
+    assert (output_dir / STAGE33_FOV1_OUTPUT_MARKER).exists()
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "Stage33 FOV1 Worker Policy Gate" in markdown
+    assert "fov1_only" in markdown
+
+
+def test_stage33_fov1_policy_is_inconclusive_when_configured_rounds_are_omitted(tmp_path: Path) -> None:
+    config_path, output_dir, profile_paths = _write_existing_profiles(
+        tmp_path=tmp_path,
+        base_config=_base_config_payload(tmp_path),
+        target_rounds=(1,),
+    )
+
+    payload = _stage33_payload(
+        config_path=config_path,
+        output_dir=output_dir,
+        profile_paths=profile_paths,
+        tmp_path=tmp_path,
+        target_rounds=(1,),
+    )
+
+    worker_policy = _mapping(payload["worker_policy"])
+    assert _mapping(worker_policy["clean_equivalence_gate"])["status"] == "pass"
+    assert _mapping(worker_policy["surface_completeness_gate"])["status"] == "pass"
+    surface = _mapping(worker_policy["surface"])
+    assert surface["effective_surface_scope"] == "limited"
+    assert surface["fov1_policy_surface_ready"] is False
+    assert surface["missing_configured_round_ids"] == [2]
+    verdict = _mapping(payload["verdict"])
+    assert verdict["status"] == "inconclusive"
+    assert "did not validate the complete FOV1 policy surface" in str(verdict["reason"])
+    assert "No FOV1 opt-in worker policy recommendation" in str(verdict["opt_in_recommendation"])
+
+
+def test_stage33_fov1_policy_rejects_non_fov1_selection(tmp_path: Path) -> None:
+    base_config = _base_config_payload(tmp_path)
+    dataset = cast(dict[str, Any], base_config["dataset"])
+    dataset["fov_list"] = [1, 2]
+    config_path, output_dir, profile_paths = _write_existing_profiles(
+        tmp_path=tmp_path,
+        base_config=base_config,
+        target_rounds=None,
+        fov_id=2,
+    )
+
+    payload = _stage33_payload(
+        config_path=config_path,
+        output_dir=output_dir,
+        profile_paths=profile_paths,
+        tmp_path=tmp_path,
+        target_rounds=None,
+        fov_ids=(2,),
+    )
+
+    surface = _mapping(_mapping(payload["worker_policy"])["surface"])
+    assert surface["policy_surface_status"] == "fail"
+    assert surface["effective_surface_scope"] == "limited"
+    assert surface["missing_policy_fov_ids"] == [1]
+    assert surface["selected_non_policy_fov_ids"] == [2]
+    verdict = _mapping(payload["verdict"])
+    assert verdict["status"] == "fail"
+    assert "FOV1 is the only policy surface" in str(verdict["reason"])
+    assert not _sequence(payload["fail_loud_errors"])
+
+
+def test_stage33_and_stage32_policy_modes_are_mutually_exclusive(tmp_path: Path) -> None:
+    config_path, output_dir, profile_paths = _write_existing_profiles(
+        tmp_path=tmp_path,
+        base_config=_base_config_payload(tmp_path),
+        target_rounds=None,
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _ = build_sweep_payload(
+            config_path=config_path,
+            output_dir=output_dir,
+            worker_counts=(1, 4),
+            expected_worker_counts=(1, 4),
+            fov_ids=None,
+            target_rounds=None,
+            repeats=1,
+            compare_repeat_index=0,
+            baseline_commit="baseline",
+            validation_worktree=None,
+            production_root_base=tmp_path / "generated_conflicting_policy_roots",
+            source_root=Path(__file__).resolve().parents[2],
+            existing_profiles=profile_paths,
+            baseline_profile_json=None,
+            skip_reason="not skipped",
+            argv=["validate_native_volume_worker_sweep.py"],
+            stage32_policy=True,
+            stage33_fov1_policy=True,
+            policy_candidate_workers=(4,),
         )

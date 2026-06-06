@@ -81,6 +81,14 @@ STAGE32_REPORT_FILENAMES = {
     "markdown": "stage32_native_volume_worker_policy_validation.md",
 }
 STAGE32_OUTPUT_MARKER = ".pystar_stage32_native_volume_worker_policy_validation"
+STAGE33_FOV1_POLICY_SCHEMA_NAME = "pystar_stage33_fov1_native_volume_worker_policy_validation"
+STAGE33_FOV1_POLICY_SCHEMA_VERSION = 1
+STAGE33_FOV1_REPORT_FILENAMES = {
+    "json": "stage33_fov1_native_volume_worker_policy_validation.json",
+    "markdown": "stage33_fov1_native_volume_worker_policy_validation.md",
+}
+STAGE33_FOV1_OUTPUT_MARKER = ".pystar_stage33_fov1_native_volume_worker_policy_validation"
+STAGE33_FOV1_POLICY_FOV_IDS = (1,)
 STAGE32_POLICY_BASELINE_WORKER = 1
 DEFAULT_STAGE32_POLICY_CANDIDATE_WORKERS = (4,)
 STAGE32_SURFACE_SCOPES = ("full", "limited")
@@ -117,7 +125,22 @@ CANONICAL_OUTPUT_DIRS = (
 )
 
 
-def _sweep_contract(stage32_policy: bool) -> dict[str, object]:
+def _sweep_contract(
+    stage32_policy: bool,
+    *,
+    stage33_fov1_policy: bool = False,
+) -> dict[str, object]:
+    if stage32_policy and stage33_fov1_policy:
+        raise ValueError("Stage32 and Stage33 FOV1 policy modes are mutually exclusive")
+    if stage33_fov1_policy:
+        return {
+            "schema_name": STAGE33_FOV1_POLICY_SCHEMA_NAME,
+            "schema_version": STAGE33_FOV1_POLICY_SCHEMA_VERSION,
+            "report_filenames": STAGE33_FOV1_REPORT_FILENAMES,
+            "output_marker": STAGE33_FOV1_OUTPUT_MARKER,
+            "label": "Stage33 FOV1",
+            "description": "FOV1-only native volume worker policy validation",
+        }
     if stage32_policy:
         return {
             "schema_name": STAGE32_POLICY_SCHEMA_NAME,
@@ -138,7 +161,11 @@ def _sweep_contract(stage32_policy: bool) -> dict[str, object]:
 
 
 def _sweep_contract_for_payload(payload: Mapping[str, object]) -> dict[str, object]:
-    return _sweep_contract(payload.get("schema_name") == STAGE32_POLICY_SCHEMA_NAME)
+    schema_name = payload.get("schema_name")
+    return _sweep_contract(
+        schema_name == STAGE32_POLICY_SCHEMA_NAME,
+        stage33_fov1_policy=schema_name == STAGE33_FOV1_POLICY_SCHEMA_NAME,
+    )
 
 
 def _utc_now_iso() -> str:
@@ -315,12 +342,12 @@ def _reject_sweep_production_overlap(
     base_production_resolved = base_production_output_dir.expanduser().resolve(strict=False)
     if _paths_overlap(output_dir, production_root_base):
         raise ValueError(
-            "--production-root-base must be isolated from the Stage30a/Stage32 evidence "
+            "--production-root-base must be isolated from the Stage30a/Stage32/Stage33 evidence "
             f"--output-dir: {production_root_base} vs {output_dir}"
         )
     if _paths_overlap(output_dir, base_production_resolved):
         raise ValueError(
-            "--output-dir must be a dedicated Stage30a/Stage32 evidence directory that does not "
+            "--output-dir must be a dedicated Stage30a/Stage32/Stage33 evidence directory that does not "
             "overlap the base config pipeline.output.directory: "
             f"{output_dir} vs {base_production_resolved}"
         )
@@ -336,8 +363,9 @@ def _prepare_sweep_output_dir(
     output_dir: Path,
     *,
     stage32_policy: bool = False,
+    stage33_fov1_policy: bool = False,
 ) -> Path:
-    contract = _sweep_contract(stage32_policy)
+    contract = _sweep_contract(stage32_policy, stage33_fov1_policy=stage33_fov1_policy)
     marker_name = str(contract["output_marker"])
     label = str(contract["label"])
     output_path = output_dir.expanduser()
@@ -1467,6 +1495,131 @@ def _stage32_surface_policy(
     }
 
 
+def _stage33_fov1_surface_policy(
+    *,
+    config_fovs: Sequence[int],
+    selected_fovs: Sequence[int],
+    config_rounds: Sequence[int],
+    selected_rounds: Sequence[int],
+    policy_candidate_workers: Sequence[int],
+) -> dict[str, object]:
+    policy_fov_ids = [int(value) for value in STAGE33_FOV1_POLICY_FOV_IDS]
+    config_fov_set = {int(value) for value in config_fovs}
+    selected_fov_list = [int(value) for value in selected_fovs]
+    selected_fov_set = set(selected_fov_list)
+    policy_fov_set = set(policy_fov_ids)
+    duplicate_selected_fovs = sorted(
+        {
+            fov_id
+            for fov_id in selected_fov_list
+            if selected_fov_list.count(fov_id) > 1
+        }
+    )
+    missing_policy_fovs = sorted(policy_fov_set - selected_fov_set)
+    selected_non_policy_fovs = sorted(selected_fov_set - policy_fov_set)
+    configured_non_policy_fovs = sorted(config_fov_set - policy_fov_set)
+    missing_policy_fovs_in_config = sorted(policy_fov_set - config_fov_set)
+    fov1_surface_complete = (
+        selected_fov_list == policy_fov_ids
+        and not duplicate_selected_fovs
+        and not missing_policy_fovs
+        and not selected_non_policy_fovs
+    )
+
+    config_round_set = {int(value) for value in config_rounds}
+    selected_round_list = [int(value) for value in selected_rounds]
+    selected_round_set = set(selected_round_list)
+    duplicate_selected_rounds = sorted(
+        {
+            round_id
+            for round_id in selected_round_list
+            if selected_round_list.count(round_id) > 1
+        }
+    )
+    missing_rounds = sorted(config_round_set - selected_round_set)
+    extra_rounds = sorted(selected_round_set - config_round_set)
+    round_surface_complete = not missing_rounds and not extra_rounds and not duplicate_selected_rounds
+    fov1_policy_ready = fov1_surface_complete and round_surface_complete and not missing_policy_fovs_in_config
+    fov_selection_invalid = bool(
+        missing_policy_fovs_in_config
+        or duplicate_selected_fovs
+        or missing_policy_fovs
+        or selected_non_policy_fovs
+        or selected_fov_list != policy_fov_ids
+    )
+    round_selection_invalid = bool(extra_rounds or duplicate_selected_rounds)
+    policy_surface_status = (
+        "pass"
+        if fov1_policy_ready
+        else "fail"
+        if fov_selection_invalid or round_selection_invalid
+        else "inconclusive"
+    )
+
+    reasons: list[str] = []
+    if missing_policy_fovs_in_config:
+        reasons.append(f"Configured FOV surface does not include required Stage33 FOV1 policy FOVs: {missing_policy_fovs_in_config}.")
+    if duplicate_selected_fovs:
+        reasons.append(f"Selected FOVs repeat Stage33 FOV1 policy FOVs: {duplicate_selected_fovs}.")
+    if missing_policy_fovs:
+        reasons.append(f"Selected FOVs omit required Stage33 FOV1 policy FOVs: {missing_policy_fovs}.")
+    if selected_non_policy_fovs:
+        reasons.append(
+            f"Selected FOVs include non-policy FOVs {selected_non_policy_fovs}; Stage33 can only recommend FOV1 readiness."
+        )
+    if missing_rounds:
+        reasons.append(f"Selected rounds omit configured FOV1 policy rounds: {missing_rounds}.")
+    if extra_rounds:
+        reasons.append(f"Selected rounds include rounds outside the FOV1 policy config surface: {extra_rounds}.")
+    if duplicate_selected_rounds:
+        reasons.append(f"Selected rounds repeat FOV1 policy rounds: {duplicate_selected_rounds}.")
+    if fov1_policy_ready:
+        if configured_non_policy_fovs:
+            reasons.append(
+                "FOV1 policy surface included exactly FOV 1 and all configured rounds; "
+                f"configured non-policy FOVs {configured_non_policy_fovs} were not validated and no multi-FOV readiness is claimed."
+            )
+        else:
+            reasons.append(
+                "FOV1 policy surface included exactly FOV 1 and all configured rounds; no multi-FOV readiness is claimed."
+            )
+
+    return {
+        "policy_stage": "Stage33 FOV1",
+        "policy_surface_status": policy_surface_status,
+        "policy_surface_kind": "fov1_only",
+        "declared_surface_scope": "fov1_only",
+        "effective_surface_scope": "full" if fov1_policy_ready else "limited",
+        "limited_surface_reason": None if fov1_policy_ready else "; ".join(reasons),
+        "policy_candidate_workers": [int(worker) for worker in policy_candidate_workers],
+        "baseline_worker_count": STAGE32_POLICY_BASELINE_WORKER,
+        "required_worker_counts": sorted({STAGE32_POLICY_BASELINE_WORKER, *[int(worker) for worker in policy_candidate_workers]}),
+        "policy_fov_ids": policy_fov_ids,
+        "config_fov_ids": [int(value) for value in config_fovs],
+        "configured_non_policy_fov_ids": configured_non_policy_fovs,
+        "missing_policy_fov_ids_in_config": missing_policy_fovs_in_config,
+        "selected_fov_ids": selected_fov_list,
+        "fov_surface_complete": fov1_surface_complete,
+        "fov1_policy_surface_complete": fov1_surface_complete,
+        "duplicate_selected_fov_ids": duplicate_selected_fovs,
+        "missing_policy_fov_ids": missing_policy_fovs,
+        "extra_selected_fov_ids": selected_non_policy_fovs,
+        "selected_non_policy_fov_ids": selected_non_policy_fovs,
+        "config_round_ids": [int(value) for value in config_rounds],
+        "selected_round_ids": selected_round_list,
+        "round_surface_complete": round_surface_complete,
+        "missing_configured_round_ids": missing_rounds,
+        "extra_selected_round_ids": extra_rounds,
+        "duplicate_selected_round_ids": duplicate_selected_rounds,
+        "reasons": reasons,
+        "full_surface_policy_ready": fov1_policy_ready,
+        "fov1_policy_surface_ready": fov1_policy_ready,
+        "multi_fov_policy_ready": False,
+        "multi_fov_readiness_claimed": False,
+        "multi_fov_readiness_disclaimer": "Stage33 validates only FOV1 native preprocessing; it must not be used as multi-FOV readiness evidence.",
+    }
+
+
 def _determine_stage32_policy_verdict(
     *,
     profile_records: Sequence[Mapping[str, object]],
@@ -1479,6 +1632,15 @@ def _determine_stage32_policy_verdict(
     clean_gate: Mapping[str, object],
     clean_surface_gate: Mapping[str, object],
     source_consistency_gate: Mapping[str, object],
+    policy_label: str = "Stage32",
+    pass_opt_in_recommendation: str | None = None,
+    pass_reason: str | None = None,
+    limited_opt_in_recommendation: str | None = None,
+    limited_reason: str | None = None,
+    limited_next_debugging_task: str | None = None,
+    invalid_surface_opt_in_recommendation: str | None = None,
+    invalid_surface_reason: str | None = None,
+    invalid_surface_next_debugging_task: str | None = None,
 ) -> dict[str, object]:
     failed_profiles = [record for record in profile_records if record.get("status") != "completed"]
     failed_directories = [record for record in directory_contracts if record.get("status") != "pass"]
@@ -1531,8 +1693,8 @@ def _determine_stage32_policy_verdict(
             "status": "fail",
             "regression": clean_gate.get("status") == "fail" or clean_surface_gate.get("status") == "fail",
             "recommended_worker_count": None,
-            "opt_in_recommendation": "Do not recommend native_volume_workers=4; at least one Stage32 correctness gate failed.",
-            "reason": "One or more Stage32 worker-policy correctness gates failed before any speed recommendation.",
+            "opt_in_recommendation": f"Do not recommend native_volume_workers=4; at least one {policy_label} correctness gate failed.",
+            "reason": f"One or more {policy_label} worker-policy correctness gates failed before any speed recommendation.",
             "next_debugging_task": "Inspect fail_loud_errors, directory_contracts, internal_repeat_equivalence, histogram_attribution_summary, clean_tiff_equivalence, worker_policy.surface_completeness_gate, and worker_policy.source_consistency_gate for the first failing gate.",
             "failed_profile_count": len(failed_profiles),
             "failed_directory_contract_count": len(failed_directories),
@@ -1546,13 +1708,31 @@ def _determine_stage32_policy_verdict(
             "skipped_workers": list(skipped_workers),
         }
 
+    if policy_surface.get("policy_surface_status") == "fail":
+        return {
+            "status": "fail",
+            "regression": False,
+            "recommended_worker_count": None,
+            "opt_in_recommendation": invalid_surface_opt_in_recommendation
+            or "No opt-in worker policy recommendation; the requested policy surface is invalid.",
+            "reason": invalid_surface_reason or f"{policy_label} policy surface selection is invalid.",
+            "next_debugging_task": invalid_surface_next_debugging_task
+            or f"Rerun {policy_label} with a valid policy surface selection.",
+            "clean_equivalence_gate": dict(clean_gate),
+            "surface_completeness_gate": dict(clean_surface_gate),
+            "source_consistency_gate": dict(source_consistency_gate),
+            "surface_reasons": list(cast(Sequence[object], policy_surface.get("reasons", []))),
+            "missing_required_workers": missing_required_workers,
+            "skipped_workers": list(skipped_workers),
+        }
+
     if clean_gate.get("status") != "pass":
         return {
             "status": "inconclusive",
             "regression": False,
             "recommended_worker_count": None,
             "opt_in_recommendation": "No opt-in worker policy recommendation; serial/default vs workers4 clean TIFFs were not compared.",
-            "reason": "No Stage32 cross-run clean TIFF comparison was available.",
+            "reason": f"No {policy_label} cross-run clean TIFF comparison was available.",
             "next_debugging_task": "Provide completed serial/default and explicit workers4 profiles on the same surface.",
             "clean_equivalence_gate": dict(clean_gate),
             "surface_completeness_gate": dict(clean_surface_gate),
@@ -1567,7 +1747,7 @@ def _determine_stage32_policy_verdict(
             "regression": False,
             "recommended_worker_count": None,
             "opt_in_recommendation": "No opt-in worker policy recommendation; expected clean TIFF surface completeness was not proven.",
-            "reason": "Stage32 did not validate every expected clean TIFF on the selected FOV/round/channel surface.",
+            "reason": f"{policy_label} did not validate every expected clean TIFF on the selected FOV/round/channel surface.",
             "next_debugging_task": "Regenerate or load profiles whose output_files cover every expected clean_fov_{fov}_round_{round}_ch_{channel}.tif artifact.",
             "clean_equivalence_gate": dict(clean_gate),
             "surface_completeness_gate": dict(clean_surface_gate),
@@ -1582,7 +1762,7 @@ def _determine_stage32_policy_verdict(
             "regression": False,
             "recommended_worker_count": None,
             "opt_in_recommendation": "No opt-in worker policy recommendation; source commit/worktree consistency was not proven.",
-            "reason": "Stage32 did not prove serial/default and candidate profiles came from the same source commit and validation worktree.",
+            "reason": f"{policy_label} did not prove serial/default and candidate profiles came from the same source commit and validation worktree.",
             "next_debugging_task": "Regenerate or load all required profiles from the same PyStar source commit and validation worktree.",
             "clean_equivalence_gate": dict(clean_gate),
             "surface_completeness_gate": dict(clean_surface_gate),
@@ -1598,7 +1778,7 @@ def _determine_stage32_policy_verdict(
             "regression": False,
             "recommended_worker_count": None,
             "opt_in_recommendation": "No opt-in worker policy recommendation; required serial/default and workers4 profiles are incomplete.",
-            "reason": "Stage32 policy mode requires completed serial/default and candidate worker profiles.",
+            "reason": f"{policy_label} policy mode requires completed serial/default and candidate worker profiles.",
             "next_debugging_task": "Run or load the missing required worker profiles before evaluating the policy gate.",
             "clean_equivalence_gate": dict(clean_gate),
             "surface_completeness_gate": dict(clean_surface_gate),
@@ -1613,9 +1793,11 @@ def _determine_stage32_policy_verdict(
             "status": "inconclusive",
             "regression": False,
             "recommended_worker_count": None,
-            "opt_in_recommendation": "Exact equivalence held on the measured limited surface, but no full-surface opt-in policy recommendation is made.",
-            "reason": "Stage32 was run on a limited surface; do not claim full-surface policy readiness.",
-            "next_debugging_task": "Rerun Stage32 with --surface-scope full and all configured FOVs/rounds.",
+            "opt_in_recommendation": limited_opt_in_recommendation
+            or "Exact equivalence held on the measured limited surface, but no full-surface opt-in policy recommendation is made.",
+            "reason": limited_reason or f"{policy_label} was run on a limited surface; do not claim full-surface policy readiness.",
+            "next_debugging_task": limited_next_debugging_task
+            or f"Rerun {policy_label} with --surface-scope full and all configured FOVs/rounds.",
             "clean_equivalence_gate": dict(clean_gate),
             "surface_completeness_gate": dict(clean_surface_gate),
             "source_consistency_gate": dict(source_consistency_gate),
@@ -1638,7 +1820,7 @@ def _determine_stage32_policy_verdict(
             "regression": False,
             "recommended_worker_count": None,
             "opt_in_recommendation": "No opt-in worker policy recommendation; required timing rows are missing.",
-            "reason": "Stage32 correctness gates passed but serial/default vs candidate wall-time comparison was incomplete.",
+            "reason": f"{policy_label} correctness gates passed but serial/default vs candidate wall-time comparison was incomplete.",
             "next_debugging_task": "Regenerate profiles with complete timing summaries for serial/default and workers4.",
             "clean_equivalence_gate": dict(clean_gate),
             "surface_completeness_gate": dict(clean_surface_gate),
@@ -1673,10 +1855,15 @@ def _determine_stage32_policy_verdict(
         "regression": False,
         "recommended_worker_count": best_worker,
         "opt_in_recommendation": (
+            pass_opt_in_recommendation.format(best_worker=best_worker, policy_label=policy_label)
+            if pass_opt_in_recommendation is not None
+            else (
             f"Recommend native_volume_workers={best_worker} only as an opt-in setting under the validated Stage32 "
             "full-surface constraints; default/omitted native_volume_workers remains serial (1)."
+            )
         ),
-        "reason": "Stage32 full-surface correctness gates passed and the candidate worker setting improved measured preprocessing wall time.",
+        "reason": pass_reason
+        or f"{policy_label} full-surface correctness gates passed and the candidate worker setting improved measured preprocessing wall time.",
         "next_debugging_task": None,
         "clean_equivalence_gate": dict(clean_gate),
         "surface_completeness_gate": dict(clean_surface_gate),
@@ -1708,10 +1895,14 @@ def build_sweep_payload(
     skip_reason: str,
     argv: Sequence[str],
     stage32_policy: bool = False,
+    stage33_fov1_policy: bool = False,
     policy_candidate_workers: Sequence[int] = DEFAULT_STAGE32_POLICY_CANDIDATE_WORKERS,
     surface_scope: str = "limited",
     limited_surface_reason: str = "bounded validation surface; full configured round surface was not asserted",
 ) -> dict[str, object]:
+    if stage32_policy and stage33_fov1_policy:
+        raise ValueError("--stage32-policy and --stage33-fov1-policy are mutually exclusive")
+    policy_enabled = stage32_policy or stage33_fov1_policy
     if repeats <= 0:
         raise ValueError(f"--repeats must be positive; got {repeats!r}")
     if compare_repeat_index < 0:
@@ -1723,11 +1914,11 @@ def build_sweep_payload(
         )
 
     policy_candidate_workers = tuple(int(worker) for worker in policy_candidate_workers)
-    if stage32_policy and not policy_candidate_workers:
-        raise ValueError("Stage32 policy mode requires at least one candidate worker count")
-    if stage32_policy and STAGE32_POLICY_BASELINE_WORKER in policy_candidate_workers:
+    if policy_enabled and not policy_candidate_workers:
+        raise ValueError("Worker policy mode requires at least one candidate worker count")
+    if policy_enabled and STAGE32_POLICY_BASELINE_WORKER in policy_candidate_workers:
         raise ValueError(
-            "Stage32 policy candidate worker counts must exclude the serial/default baseline worker count "
+            "Policy candidate worker counts must exclude the serial/default baseline worker count "
             f"{STAGE32_POLICY_BASELINE_WORKER}"
         )
     if stage32_policy and surface_scope not in STAGE32_SURFACE_SCOPES:
@@ -1738,6 +1929,8 @@ def build_sweep_payload(
     base_config = load_config(str(config_path))
     config_fovs = [int(value) for value in base_config.dataset.parsed_fovs]
     normalized_fovs = None if fov_ids is None else tuple(int(value) for value in fov_ids)
+    if stage33_fov1_policy and normalized_fovs is None:
+        normalized_fovs = tuple(int(value) for value in STAGE33_FOV1_POLICY_FOV_IDS)
     normalized_rounds = None if target_rounds is None else tuple(int(value) for value in target_rounds)
     expected_fov_ids = config_fovs[:1] if normalized_fovs is None else list(normalized_fovs)
     production_root_base = production_root_base.expanduser().resolve(strict=False)
@@ -1746,7 +1939,11 @@ def build_sweep_payload(
         production_root_base=production_root_base,
         base_production_output_dir=Path(base_config.pipeline.output.directory),
     )
-    output_dir = _prepare_sweep_output_dir(output_dir, stage32_policy=stage32_policy)
+    output_dir = _prepare_sweep_output_dir(
+        output_dir,
+        stage32_policy=stage32_policy,
+        stage33_fov1_policy=stage33_fov1_policy,
+    )
 
     profile_records: list[dict[str, object]] = []
     profile_payloads: dict[str, dict[str, object]] = {}
@@ -1763,7 +1960,7 @@ def build_sweep_payload(
             baseline_validation = _validate_loaded_profile_payload(
                 label="baseline",
                 profile_payload=baseline_payload,
-                expected_worker_count=STAGE32_POLICY_BASELINE_WORKER if stage32_policy else None,
+                expected_worker_count=STAGE32_POLICY_BASELINE_WORKER if policy_enabled else None,
                 expected_fov_ids=expected_fov_ids,
                 expected_target_rounds=normalized_rounds,
                 expected_repeats=repeats,
@@ -1984,16 +2181,67 @@ def build_sweep_payload(
     policy_surface: dict[str, object] | None = None
     clean_surface_gate: dict[str, object] | None = None
     source_consistency_gate: dict[str, object] | None = None
-    if stage32_policy:
-        policy_surface = _stage32_surface_policy(
-            surface_scope=surface_scope,
-            limited_surface_reason=limited_surface_reason,
-            config_fovs=config_fovs,
-            selected_fovs=selected_fovs,
-            config_rounds=config_round_ids,
-            selected_rounds=selected_round_ids,
-            policy_candidate_workers=policy_candidate_workers,
-        )
+    if stage32_policy or stage33_fov1_policy:
+        if stage33_fov1_policy:
+            policy_surface = _stage33_fov1_surface_policy(
+                config_fovs=config_fovs,
+                selected_fovs=selected_fovs,
+                config_rounds=config_round_ids,
+                selected_rounds=selected_round_ids,
+                policy_candidate_workers=policy_candidate_workers,
+            )
+            policy_label = "Stage33 FOV1"
+            pass_opt_in_recommendation = (
+                "Recommend native_volume_workers={best_worker} only as an opt-in setting under the validated "
+                "FOV1 native preprocessing constraints; default/omitted native_volume_workers remains serial (1); "
+                "no multi-FOV readiness is claimed."
+            )
+            pass_reason = (
+                "Stage33 FOV1 correctness gates passed for FOV 1 across all configured rounds and the candidate "
+                "worker setting improved measured preprocessing wall time."
+            )
+            limited_opt_in_recommendation = (
+                "No FOV1 opt-in worker policy recommendation; the measured surface did not cover exactly FOV 1 "
+                "and every configured round for the FOV1 policy surface."
+            )
+            limited_reason = (
+                "Stage33 FOV1 did not validate the complete FOV1 policy surface; do not claim FOV1 readiness."
+            )
+            limited_next_debugging_task = (
+                "Rerun Stage33 FOV1 with selected FOV 1 and all configured rounds, or use an isolated FOV1-only "
+                "validation config whose configured rounds match the intended policy surface."
+            )
+            invalid_surface_opt_in_recommendation = (
+                "Do not recommend native_volume_workers=4; Stage33 FOV1 policy mode only accepts selected FOV 1 "
+                "and configured FOV1 policy rounds."
+            )
+            invalid_surface_reason = (
+                "Stage33 FOV1 policy selection was invalid; FOV1 is the only policy surface and no multi-FOV "
+                "or non-FOV1 readiness can be claimed."
+            )
+            invalid_surface_next_debugging_task = (
+                "Rerun Stage33 FOV1 with --fovs 1 or omit --fovs so the helper selects FOV 1, and do not include "
+                "round IDs outside the configured FOV1 policy surface."
+            )
+        else:
+            policy_surface = _stage32_surface_policy(
+                surface_scope=surface_scope,
+                limited_surface_reason=limited_surface_reason,
+                config_fovs=config_fovs,
+                selected_fovs=selected_fovs,
+                config_rounds=config_round_ids,
+                selected_rounds=selected_round_ids,
+                policy_candidate_workers=policy_candidate_workers,
+            )
+            policy_label = "Stage32"
+            pass_opt_in_recommendation = None
+            pass_reason = None
+            limited_opt_in_recommendation = None
+            limited_reason = None
+            limited_next_debugging_task = None
+            invalid_surface_opt_in_recommendation = None
+            invalid_surface_reason = None
+            invalid_surface_next_debugging_task = None
         clean_surface_gate = _stage32_clean_surface_completeness_gate(
             clean_record_maps=clean_record_maps,
             policy_surface=policy_surface,
@@ -2019,10 +2267,19 @@ def build_sweep_payload(
             clean_gate=clean_gate,
             clean_surface_gate=clean_surface_gate,
             source_consistency_gate=source_consistency_gate,
+            policy_label=policy_label,
+            pass_opt_in_recommendation=pass_opt_in_recommendation,
+            pass_reason=pass_reason,
+            limited_opt_in_recommendation=limited_opt_in_recommendation,
+            limited_reason=limited_reason,
+            limited_next_debugging_task=limited_next_debugging_task,
+            invalid_surface_opt_in_recommendation=invalid_surface_opt_in_recommendation,
+            invalid_surface_reason=invalid_surface_reason,
+            invalid_surface_next_debugging_task=invalid_surface_next_debugging_task,
         )
     else:
         verdict = stage30a_verdict
-    contract = _sweep_contract(stage32_policy)
+    contract = _sweep_contract(stage32_policy, stage33_fov1_policy=stage33_fov1_policy)
     return {
         "schema_name": contract["schema_name"],
         "schema_version": contract["schema_version"],
@@ -2045,6 +2302,8 @@ def build_sweep_payload(
             "stage30a_replay_command": _stage30a_replay_command(source_root=source_root, argv=argv),
             "stage32_command": _shell_command(argv) if stage32_policy else None,
             "stage32_replay_command": _stage30a_replay_command(source_root=source_root, argv=argv) if stage32_policy else None,
+            "stage33_command": _shell_command(argv) if stage33_fov1_policy else None,
+            "stage33_replay_command": _stage30a_replay_command(source_root=source_root, argv=argv) if stage33_fov1_policy else None,
             "profile_invocations": profile_commands,
         },
         "resources": _system_resource_notes(
@@ -2074,6 +2333,9 @@ def build_sweep_payload(
             "production_root_base": str(production_root_base),
             "stage32_surface_scope": surface_scope if stage32_policy else None,
             "stage32_limited_surface_reason": limited_surface_reason if stage32_policy else None,
+            "stage33_fov1_policy_enabled": stage33_fov1_policy,
+            "stage33_policy_fov_ids": list(STAGE33_FOV1_POLICY_FOV_IDS) if stage33_fov1_policy else None,
+            "stage33_policy_surface_kind": "fov1_only" if stage33_fov1_policy else None,
         },
         "contracts": {
             "production_algorithm_changed_by_this_script": False,
@@ -2084,6 +2346,9 @@ def build_sweep_payload(
             "histogram_attribution_schema_version": HISTOGRAM_REAL_MATCH_ATTRIBUTION_SCHEMA_VERSION,
             "stage32_policy_verdict_statuses": ["pass", "fail", "inconclusive"] if stage32_policy else None,
             "stage32_opt_in_candidate_workers": [int(worker) for worker in policy_candidate_workers] if stage32_policy else None,
+            "stage33_fov1_policy_verdict_statuses": ["pass", "fail", "inconclusive"] if stage33_fov1_policy else None,
+            "stage33_fov1_opt_in_candidate_workers": [int(worker) for worker in policy_candidate_workers] if stage33_fov1_policy else None,
+            "stage33_multi_fov_readiness_claimed": False if stage33_fov1_policy else None,
         },
         "generated_worker_configs": generated_worker_configs,
         "profiles": profile_records,
@@ -2100,7 +2365,9 @@ def build_sweep_payload(
         "downstream_metrics": {
             "status": "not_run",
             "reason": (
-                "Stage32 policy validation reuses the preprocessing-only native calibration profiles; Pearson/Spearman pseudobulk and matched spot statistics were not measured, so no downstream parity or full-pipeline speedup claim is made."
+                "Stage33 FOV1 policy validation reuses preprocessing-only native calibration profiles for FOV1; Pearson/Spearman pseudobulk and matched spot statistics were not measured, so no downstream parity, full-pipeline speedup, or multi-FOV readiness claim is made."
+                if stage33_fov1_policy
+                else "Stage32 policy validation reuses the preprocessing-only native calibration profiles; Pearson/Spearman pseudobulk and matched spot statistics were not measured, so no downstream parity or full-pipeline speedup claim is made."
                 if stage32_policy
                 else "Stage30a helper runs preprocessing-only native calibration profiles; Pearson/Spearman pseudobulk and matched spot statistics were not measured."
             ),
@@ -2114,7 +2381,7 @@ def build_sweep_payload(
             "source_consistency_gate": source_consistency_gate,
             "stage30a_compatibility_verdict": stage30a_verdict,
             "default_serial_behavior_unchanged": True,
-        } if stage32_policy else {"enabled": False},
+        } if policy_enabled else {"enabled": False},
         "verdict": verdict,
     }
 
@@ -2205,6 +2472,9 @@ def render_sweep_markdown(payload: Mapping[str, object]) -> str:
         f"| Skipped workers | `{surface.get('skipped_workers')}` |",
         f"| Stage32 surface scope | `{surface.get('stage32_surface_scope')}` |",
         f"| Stage32 limited-surface reason | `{surface.get('stage32_limited_surface_reason')}` |",
+        f"| Stage33 FOV1 policy enabled | `{surface.get('stage33_fov1_policy_enabled')}` |",
+        f"| Stage33 policy FOV IDs | `{surface.get('stage33_policy_fov_ids')}` |",
+        f"| Stage33 policy surface kind | `{surface.get('stage33_policy_surface_kind')}` |",
         f"| CPU count | `{resources.get('cpu_count')}` |",
         f"| MemTotal KiB | `{resources.get('mem_total_kib')}` |",
         f"| Disk usage | `{resources.get('disk_usage')}` |",
@@ -2222,13 +2492,13 @@ def render_sweep_markdown(payload: Mapping[str, object]) -> str:
         f"{label} command:",
         "",
         "```bash",
-        str(commands.get("stage32_command") or commands.get("stage30a_command")),
+        str(commands.get("stage33_command") or commands.get("stage32_command") or commands.get("stage30a_command")),
         "```",
         "",
         "Replay command with explicit source path:",
         "",
         "```bash",
-        str(commands.get("stage32_replay_command") or commands.get("stage30a_replay_command")),
+        str(commands.get("stage33_replay_command") or commands.get("stage32_replay_command") or commands.get("stage30a_replay_command")),
         "```",
         "",
         "Equivalent profile invocations generated by the sweep helper:",
@@ -2241,7 +2511,7 @@ def render_sweep_markdown(payload: Mapping[str, object]) -> str:
         source_gate = cast(Mapping[str, object], worker_policy.get("source_consistency_gate", {}))
         lines.extend(
             [
-                "## Stage32 Worker Policy Gate",
+                f"## {label} Worker Policy Gate",
                 "",
                 f"- Declared surface scope: `{policy_surface.get('declared_surface_scope')}`",
                 f"- Effective surface scope: `{policy_surface.get('effective_surface_scope')}`",
@@ -2485,9 +2755,14 @@ def render_sweep_markdown(payload: Mapping[str, object]) -> str:
 def write_sweep_artifacts(payload: dict[str, object], output_dir: Path) -> tuple[Path, Path]:
     contract = _sweep_contract_for_payload(payload)
     stage32_policy = payload.get("schema_name") == STAGE32_POLICY_SCHEMA_NAME
+    stage33_fov1_policy = payload.get("schema_name") == STAGE33_FOV1_POLICY_SCHEMA_NAME
     label = str(contract["label"])
     report_filenames = cast(Mapping[str, str], contract["report_filenames"])
-    output_dir = _prepare_sweep_output_dir(output_dir, stage32_policy=stage32_policy)
+    output_dir = _prepare_sweep_output_dir(
+        output_dir,
+        stage32_policy=stage32_policy,
+        stage33_fov1_policy=stage33_fov1_policy,
+    )
     json_path = output_dir / report_filenames["json"]
     markdown_path = output_dir / report_filenames["markdown"]
     temp_json_path = json_path.with_name(f"{json_path.name}.tmp")
@@ -2510,12 +2785,12 @@ def write_sweep_artifacts(payload: dict[str, object], output_dir: Path) -> tuple
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Run or assemble Stage30a/Stage32 real-data evidence for the native preprocessing "
+            "Run or assemble Stage30a/Stage32/Stage33 real-data evidence for the native preprocessing "
             "volume-worker sweep and opt-in worker policy. Outputs are validation-only JSON/Markdown reports."
         )
     )
     _ = parser.add_argument("--config", required=True, type=Path, help="Base experiment YAML config shared by all worker runs.")
-    _ = parser.add_argument("--output-dir", required=True, type=Path, help="Dedicated Stage30a/Stage32 evidence output directory.")
+    _ = parser.add_argument("--output-dir", required=True, type=Path, help="Dedicated Stage30a/Stage32/Stage33 evidence output directory.")
     _ = parser.add_argument("--workers", default="1,2,3,4", help="Comma-separated worker counts to run or load. Defaults to 1,2,3,4.")
     _ = parser.add_argument("--expected-workers", default="1,2,3,4", help="Expected sweep values for skipped-worker documentation.")
     _ = parser.add_argument("--fovs", default=None, help="Optional comma-separated FOV ids. Defaults to the first configured FOV in the profile harness.")
@@ -2540,9 +2815,14 @@ def main() -> None:
         help="Emit the Stage32 pass/fail/inconclusive policy payload and require serial/default vs candidate worker policy gates.",
     )
     _ = parser.add_argument(
+        "--stage33-fov1-policy",
+        action="store_true",
+        help="Emit the Stage33 FOV1-only policy payload. This validates FOV1 readiness only and never claims multi-FOV readiness.",
+    )
+    _ = parser.add_argument(
         "--policy-candidate-workers",
         default="4",
-        help="Comma-separated opt-in candidate worker counts for Stage32 policy mode. Defaults to 4.",
+        help="Comma-separated opt-in candidate worker counts for Stage32/Stage33 policy mode. Defaults to 4.",
     )
     _ = parser.add_argument(
         "--surface-scope",
@@ -2564,7 +2844,7 @@ def main() -> None:
 
     worker_counts = _parse_positive_int_list(cast(str, args.workers), field_name="worker count")
     expected_worker_counts = _parse_positive_int_list(cast(str, args.expected_workers), field_name="expected worker count")
-    policy_candidate_workers = _parse_positive_int_list(cast(str, args.policy_candidate_workers), field_name="Stage32 policy candidate worker count")
+    policy_candidate_workers = _parse_positive_int_list(cast(str, args.policy_candidate_workers), field_name="policy candidate worker count")
     fov_ids = _parse_nonnegative_int_list(cast(str | None, args.fovs), field_name="FOV id")
     target_rounds = _parse_nonnegative_int_list(cast(str | None, args.rounds), field_name="round id")
     output_dir = cast(Path, args.output_dir)
@@ -2590,6 +2870,7 @@ def main() -> None:
         skip_reason=cast(str, args.skip_reason),
         argv=sys.argv,
         stage32_policy=cast(bool, args.stage32_policy),
+        stage33_fov1_policy=cast(bool, args.stage33_fov1_policy),
         policy_candidate_workers=policy_candidate_workers,
         surface_scope=cast(str, args.surface_scope),
         limited_surface_reason=cast(str, args.limited_surface_reason),
