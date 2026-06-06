@@ -19,14 +19,36 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+
+
+def _prefer_source_root_for_pystar(source_root: Path) -> None:
+    """Ensure validation-worktree sitecustomize cannot pin an older pystar package."""
+
+    source_root_text = str(source_root)
+    sys.path[:] = [entry for entry in sys.path if entry != source_root_text]
+    sys.path.insert(0, source_root_text)
+
+    pystar_module = sys.modules.get("pystar")
+    module_file = getattr(pystar_module, "__file__", None)
+    if module_file is None:
+        return
+
+    try:
+        Path(str(module_file)).resolve().relative_to(source_root.resolve())
+    except ValueError:
+        for module_name in list(sys.modules):
+            if module_name == "pystar" or module_name.startswith("pystar."):
+                del sys.modules[module_name]
+
+
+_prefer_source_root_for_pystar(REPO_ROOT)
 
 from pystar import preprocessing as preprocessing_module
 from pystar.infrastructure import ExperimentConfig, PreprocessingStep, load_config
 from pystar.io import ImageLoader, get_fov_output_structure
 from pystar.preprocessing import (
     DataSanitizer,
+    NativeOutputWriterWithPlanner,
     NATIVE_PREPROCESSING_TIMING_SCHEMA_NAME,
     NATIVE_PREPROCESSING_TIMING_SCHEMA_VERSION,
 )
@@ -376,12 +398,16 @@ def _validate_native_sequence(sequence: Sequence[PreprocessingStep]) -> None:
 
 
 def _writer_for_repeat(sanitizer: DataSanitizer, repeat_output_root: Path, fov_id: int):
-    def write(img: Any, round_id: int, channel_id: int) -> Path:
+    def output_path_for(round_id: int, channel_id: int) -> Path:
         paths = get_fov_output_structure(repeat_output_root, fov_id)
-        _reject_symlink_components(paths["cleaned"], field_name="clean output directory")
-        _assert_path_within(paths["cleaned"], repeat_output_root, field_name="clean output directory")
         output_path = paths["cleaned"] / sanitizer._flat_clean_filename(fov_id, round_id, channel_id)
         _assert_path_within(output_path, repeat_output_root, field_name="clean output file")
+        return output_path
+
+    def write(img: Any, round_id: int, channel_id: int) -> Path:
+        output_path = output_path_for(round_id, channel_id)
+        _reject_symlink_components(output_path.parent, field_name="clean output directory")
+        _assert_path_within(output_path.parent, repeat_output_root, field_name="clean output directory")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         # Reuse the production clean-image writer for the TIFF contract while
         # directing output to the profiling repeat root instead of the configured
@@ -391,7 +417,7 @@ def _writer_for_repeat(sanitizer: DataSanitizer, repeat_output_root: Path, fov_i
         tifffile.imwrite(output_path, img, compression="zlib")
         return output_path
 
-    return write
+    return NativeOutputWriterWithPlanner(write=write, output_path_for=output_path_for)
 
 
 def _collect_output_fingerprints(output_files: Sequence[object]) -> dict[str, dict[str, object]]:
