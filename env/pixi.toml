@@ -1,0 +1,173 @@
+[workspace]
+channels = [
+    "conda-forge",
+    "bioconda"#,
+    #"https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch",
+    #"https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r/",
+    #"https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/",
+    #"https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/",
+    #"https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge",
+    #"https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/bioconda"
+    ]
+name = "pipeline"
+platforms = ["linux-64"]
+version = "0.1.0"
+authors = ["Zhurui Zenglab"]
+description = "learn pipeline"
+
+[tasks]
+
+
+[dependencies]
+libtiff = "*"
+
+[activation.env]
+PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+[feature.seprateleica.dependencies]
+python = "3.9.*"
+openjdk = "8.*"
+javabridge = "==1.0.19"
+numpy = "1.23.*"
+tifffile = "*"
+boto3 = "*"
+
+[feature.seprateleica.pypi-dependencies]
+python-bioformats = "==4.1.0"
+
+[feature.seprateleica.tasks]
+sepratelif = "python batch_seprate.py"
+getresolution = "python get_resolution.py"
+
+[feature.deconvolution.dependencies]
+python = "3.9.*"
+numpy = "*"
+scipy = "*"
+matplotlib = "*"
+scikit-image = "*"
+tqdm = "*"
+tifffile = "*"
+pillow = "*"
+aicsimageio = "*"
+dask = "*"
+distributed = "*"
+dask-image = "*"
+# 这里的配置会自动拉取适配 CUDA 12 的 cupy 和 dask-cuda
+cuda-version = "12.*"
+cupy = "*"
+dask-cuda = "*"
+
+[feature.deconvolution.pypi-dependencies]
+#sparse_recon = {path = "/media/zenglab/result/zhui/pipeline9919/sparse_recon", editable = true}
+
+[feature.deconvolution.tasks]
+decon = "python batch_decon.py"
+check_gpu = "python -c 'import cupy; print(cupy.cuda.runtime.getDeviceCount())'"
+
+[feature.clustermap.dependencies]
+python = "3.9.*"
+
+numpy = "1.23.*"
+pandas = "1.5.*"
+scipy = "1.10.*"
+scikit-learn = "1.2.*"
+scikit-image = "0.19.*"
+matplotlib = "3.6.*"
+seaborn = "0.12.*"
+psutil = "5.9.*"
+pillow = "*"
+tifffile = "*"
+tqdm = "*"
+pytables = "*"
+
+numba = "*"
+llvmlite = "*"
+
+[feature.clustermap.pypi-dependencies]
+fastdist = "*"
+opencv-python-headless = "*"
+scanpy = "*"
+anndata = "*"
+umap-learn = "*"
+pynndescent = "*"             # umap 的依赖，最好显式加上
+natsort = "*"
+cellpose = "*"
+torch = "*"
+
+[feature.analysis.dependencies]
+python = "3.10.*"
+numpy = "1.26.*"
+scipy = "*"
+pandas = "*"
+matplotlib = "*"
+seaborn = "*"
+scikit-learn = "*"
+scikit-image = "*"
+scanpy = "*"
+anndata = "*"
+spatialdata = "*"
+squidpy = "*"
+ome-zarr = "*"
+dask = "*"
+zarr = "*"
+h5py = "*"
+pytorch = "2.1.*"
+torchvision = "*"
+tqdm = "*"
+jupyterlab = "*"
+ipykernel = "*"
+
+[feature.analysis.pypi-dependencies]
+cellpose = "==3.0.10"
+fastremap = "*"
+roifile = "*"
+opencv-python-headless = "*"
+
+[feature.analysis.tasks]
+lab = "jupyter lab"
+check_env = "python -c 'import scanpy; import cellpose; print(\"Analysis environment loaded successfully\")'"
+
+[feature.pystar.dependencies]
+python = "3.11.*"
+numpy = "*"
+pandas = "*"
+tifffile = "*"
+dask = "*"
+distributed = "*"
+ipywidgets = "*"
+pyyaml = "*"
+pydantic = "*"
+toolz = "*"
+xarray = "*"
+scipy = "*"
+seaborn = "*"
+matplotlib = "*"
+#opencv = "*"
+scikit-image = "*"
+simpleitk = "*"
+tqdm = "*"
+pillow = "*"
+aicsimageio = "*"
+dask-image = "*"
+cuda-version = "12.*"
+cupy = "*"
+dask-cuda = "*"
+jupyterlab = "*"
+ipykernel = "*"
+h5py = "*"
+
+[feature.pystar.pypi-dependencies]
+spotiflow = "*"
+opencv-python-headless = "*"
+
+[feature.pystar.tasks]
+infrastructure = "python pystar/infrastructure.py"
+load = "python test_pystar_load.py"
+reg = "python test_pystar_reg.py"
+
+[environments]
+seprateleica = ["seprateleica"]
+decon = ["deconvolution"]
+clustermap = ["clustermap"]
+pystar = ["pystar"]
+analysis = ["analysis"]

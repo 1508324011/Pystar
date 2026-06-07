@@ -107,6 +107,6 @@ MATLAB provider 不做静默 fallback：MATLAB runtime、MATLAB Engine、entrypo
 
 ## MATLAB provider 状态
 
-当前 PyStar 可以通过 MATLAB provider 调用 MATLAB-backed preprocessing/registration/spot finding/extraction seam；内部 benchmark 中，全 MATLAB-provider 路线已经能接近 STATE。这个能力按合同验证发布：provider 名称本身不会自动把 release contract 降级为 `debug_only`，但 runtime manifest、transform manifest、`flow_3d` sidecar、field semantics、scope metadata、spot/intensity schema 任一不满足合同都会 fail loudly，`image_warp` 也仍要求 `release_gate.status == "valid"`。
+当前 PyStar 可以通过 MATLAB provider 调用 MATLAB-backed preprocessing/registration/spot finding/extraction seam；内部 benchmark 中，全 MATLAB-provider 路线已经能接近 STATE。这个能力仍处于测试阶段，不是默认生产路径，也不替代 Python-native 示例配置；release-valid 状态按 artifact 合同验证决定：provider 名称本身不会自动把 release contract 降级为 `debug_only`，但 runtime manifest、transform manifest、`flow_3d` sidecar、field semantics、scope metadata、spot/intensity schema 任一不满足合同都会 fail loudly，`image_warp` 也仍要求 `release_gate.status == "valid"`。
 
-如果需要复现 all-MATLAB provider 路线，请从 `experiment_config_matlab_provider.yaml` 开始改路径。该示例的算法参数对齐 2026-04-28 Experiment 1 MATLAB-provider as-run 配置；它保留 `scope_mode: full_fov`，但 local registration 使用 MATLAB subtile 4x4 tiling；这和“只处理一个 tile_local”不同，输出仍覆盖完整 Position。`coordinate_mapping` 仍是 legacy diagnostic 路线，不随 MATLAB provider 的 `image_warp` 合同提升而变成 release-valid。
+如果需要复现实验性 all-MATLAB provider 路线，请从 `experiment_config_matlab_provider.yaml` 开始改路径。该示例的算法参数对齐 2026-04-28 Experiment 1 MATLAB-provider as-run 配置；它保留 `scope_mode: full_fov`，但 local registration 使用 MATLAB subtile 4x4 tiling；这和“只处理一个 tile_local”不同，输出仍覆盖完整 Position。`coordinate_mapping` 仍是 legacy diagnostic 路线，不随 MATLAB provider 的 `image_warp` 合同提升而变成 release-valid。
