@@ -3,6 +3,13 @@
 # =================================================================
 # 自动读取 Config，计算 Array 长度，提交任务
 # 用法: bash run_pystar.sh [config_path]
+#
+# 注意：这是 SLURM 集群提交模板，不是通用本地运行脚本。
+# 使用前请按你的集群修改 partition、qos、time、Batch_FOV、
+# CPUS_PER_FOV、MATLAB_LOCAL_WORKERS 等资源设置。
+# 本地单 FOV smoke test 请直接调用：
+#   pixi run --manifest-path env/pixi.toml -e pystar \
+#     python scripts/batch_pystar.py --config my_config.yaml --task_id 1
 # =================================================================
 
 set -euo pipefail
