@@ -197,6 +197,16 @@ providers:
     # true 只表示 runtime seam 可用；MATLAB runtime/Engine 不可用时应直接失败，不做 silent fallback。
     enabled: true
 
+    # 可选共享 MATLAB Engine session（批处理路径使用）。
+    # enabled=false 保持旧的每个 MATLAB backend 自管 Engine 生命周期；如果要减少多 stage 冷启动，改成 true。
+    # name=null 时 PyStar 生成 pystar_{config_stem}_{config_hash8}_{run_id}，Slurm array worker 会带 job/task id，普通进程带 pid。
+    # 共享 session 只连接确定名称，并在健康检查/sentinel 身份不匹配时直接失败，不会静默改连其它 session 或回退 native。
+    shared_session:
+      enabled: false
+      name: null
+      lifetime: "run"
+      health_check_timeout_s: 30
+
     preprocessing:
       # MATLAB preprocessing runtime 目录和入口函数。
       # runtime_path 相对仓库根目录；entrypoint 必须是 MATLAB path 中可调用的函数名。

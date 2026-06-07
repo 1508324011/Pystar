@@ -1,4 +1,5 @@
 # pystar/decoding.py
+from json import loads
 from pathlib import Path
 from typing import Any, Callable, Dict, Tuple, cast
 
@@ -7,6 +8,31 @@ import numpy.typing as npt
 import pandas as pd
 from tqdm import tqdm
 
+from ._artifact_schemas import (
+    SpotTableSchema,
+    build_intensity_matrix_spec,
+    build_spot_row_lineage,
+    empty_decoded_table,
+    intensity_matrix_metadata_expected_description,
+    intensity_matrix_metadata_path,
+    spot_row_lineage_from_intensity_metadata_payload,
+    validate_decoded_table,
+    validate_intensity_matrix,
+    validate_intensity_matrix_consumer_contract,
+    validate_intensity_matrix_metadata_payload,
+    validate_spot_row_lineage_consumer_contract,
+    validate_spot_table,
+    wrap_array_read_error,
+    wrap_payload_read_error,
+    wrap_table_read_error,
+)
+from ._codebook_contracts import (
+    CompiledCodebook,
+    build_reverse_lookups,
+    build_single_reverse_lookup,
+    compile_codebook_contract,
+    create_encoder,
+)
 from .io import get_fov_output_structure
 from .infrastructure import ExperimentConfig
 
@@ -139,252 +165,187 @@ class Decoder:
         self.cfg = config
         self.output_dir = Path(self.cfg.pipeline.output.directory)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 加载并编译码本
-        self.gene_map, self.barcode_map = self._compile_codebook()
-        self.reverse_lookups = self._build_reverse_lookups()
+
+        # Load and validate the codebook once. Keep the legacy debug CSV at the
+        # configured output root; decode_fov also writes it into the concrete
+        # Position<fov>/output_pystar root used by runtime artifacts.
+        self.compiled_codebook = compile_codebook_contract(self.cfg.codebook, output_dir=self.output_dir)
+        self.gene_map = self.compiled_codebook.gene_map
+        self.barcode_map = self.compiled_codebook.dataframe
+        self.reverse_lookups = self.compiled_codebook.reverse_lookups
+
+    def _sequencing_channels(self) -> list[int]:
+        roles = self.cfg.dataset.channel_roles
+        return sorted([channel_id for channel_id, role in roles.items() if role == 'seq'])
+
+    def _decoded_artifact_extra_columns(self) -> tuple[str, ...]:
+        return ("channel", "fov", "algo", "pattern_valid", "in_codebook", "gating_mode")
+
+    def _write_decoded_artifact(
+        self,
+        df: pd.DataFrame,
+        *,
+        fov_id: int,
+        path: Path,
+        context: str,
+    ) -> pd.DataFrame:
+        validated = validate_decoded_table(
+            df,
+            fov_id=fov_id,
+            path=path,
+            context=context,
+        )
+        validated.to_csv(path, index=False)
+        return validated
+
+    def _write_empty_decoded_family(
+        self,
+        *,
+        fov_id: int,
+        paths: dict[str, Path],
+        pre_pattern_df: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        """Write the three decoded CSV artifacts with canonical empty schemas."""
+
+        decoded_empty = empty_decoded_table(extra_columns=self._decoded_artifact_extra_columns())
+        written_empty = self._write_decoded_artifact(
+            decoded_empty,
+            fov_id=fov_id,
+            path=paths["decoded"] / f"decoded_fov_{fov_id}.csv",
+            context="decoded save",
+        )
+        self._write_decoded_artifact(
+            empty_decoded_table(extra_columns=self._decoded_artifact_extra_columns()),
+            fov_id=fov_id,
+            path=paths["decoded"] / f"decoded_fov_{fov_id}_goodreads.csv",
+            context="decoded goodreads save",
+        )
+        self._write_decoded_artifact(
+            decoded_empty if pre_pattern_df is None else pre_pattern_df,
+            fov_id=fov_id,
+            path=paths["decoded"] / f"decoded_fov_{fov_id}_pre_pattern_check.csv",
+            context="decoded pre-pattern save",
+        )
+        return written_empty
+
+    def _load_validated_intensity_matrix(
+        self,
+        *,
+        fov_id: int,
+        matrix_path: Path,
+        matrix_spec: Any,
+        spots_df: pd.DataFrame,
+        spots_path: Path,
+    ) -> NDArrayAny:
+        expected = matrix_spec.expected_description()
+        try:
+            raw_matrix = np.load(matrix_path, allow_pickle=False)
+        except Exception as exc:
+            raise wrap_array_read_error(
+                exc,
+                "intensity matrix",
+                fov_id=fov_id,
+                path=matrix_path,
+                context="decode load",
+                expected=expected,
+            ) from exc
+
+        metadata_path = intensity_matrix_metadata_path(matrix_path)
+        if metadata_path.exists():
+            metadata_expected = intensity_matrix_metadata_expected_description()
+            try:
+                metadata_payload = loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise wrap_payload_read_error(
+                    exc,
+                    "intensity matrix metadata sidecar",
+                    fov_id=fov_id,
+                    path=metadata_path,
+                    context="decode metadata load",
+                    expected=metadata_expected,
+                ) from exc
+            persisted_spec = validate_intensity_matrix_metadata_payload(
+                metadata_payload,
+                fov_id=fov_id,
+                path=metadata_path,
+                context="decode metadata load",
+            )
+            validate_intensity_matrix_consumer_contract(
+                persisted_spec,
+                matrix_spec,
+                path=metadata_path,
+                context="decode metadata load",
+                matrix_path=matrix_path,
+            )
+            persisted_lineage = spot_row_lineage_from_intensity_metadata_payload(
+                metadata_payload,
+                fov_id=fov_id,
+                path=metadata_path,
+                context="decode metadata load",
+            )
+            if persisted_lineage is not None:
+                consumer_lineage = build_spot_row_lineage(
+                    spots_df,
+                    fov_id=fov_id,
+                    path=spots_path,
+                    context="decode row-lineage build",
+                )
+                validate_spot_row_lineage_consumer_contract(
+                    persisted_lineage,
+                    consumer_lineage,
+                    fov_id=fov_id,
+                    path=metadata_path,
+                    context="decode metadata load",
+                    spot_path=spots_path,
+                )
+                print(
+                    f" -> Validating intensity matrix {matrix_path.name} against metadata sidecar "
+                    f"{metadata_path.name} (round_order={list(persisted_spec.rounds)}, "
+                    f"channel_order={list(persisted_spec.channels)}, "
+                    f"spot_row_lineage={persisted_lineage.fingerprint})"
+                )
+            else:
+                print(
+                    f" -> Intensity metadata sidecar {metadata_path.name} lacks spot_row_lineage; using "
+                    f"explicit legacy compatibility validation for {matrix_path.name} without row-order tamper "
+                    f"detection."
+                )
+            return validate_intensity_matrix(
+                raw_matrix,
+                persisted_spec,
+                path=matrix_path,
+                context="decode load against metadata sidecar",
+            )
+
+        print(
+            f" -> Intensity metadata sidecar absent at {metadata_path}; using explicit legacy config-derived "
+            f"matrix validation for {matrix_path.name} without reordering, reshaping, or reinterpretation."
+        )
+        return validate_intensity_matrix(
+            raw_matrix,
+            matrix_spec,
+            path=matrix_path,
+            context="decode load (legacy config-derived validation; sidecar absent)",
+        )
         
     def _compile_codebook(self) -> tuple[dict[str, str], pd.DataFrame]:
-        """
-        Compile gene sequences into expected color barcodes.
+        """Compatibility wrapper returning the legacy tuple surface."""
 
-        This is the critical forward-simulation step. PyStar does not infer the
-        codebook by reversing the observed reads; it takes each gene sequence,
-        applies the configured topology transform, slices the sequence according
-        to `BlueprintSegment.csv_slice`, encodes each segment with its declared
-        color table, and concatenates segments in `physical_order`. Config
-        slices are 1-based inclusive and become Python's 0-based half-open
-        ranges inside this method.
-        """
-        codebook_cfg = self.cfg.codebook
-        gene_list_path = Path(codebook_cfg.gene_list)
-        topo = codebook_cfg.topology
-        
-        if not gene_list_path.exists():
-            raise FileNotFoundError(f"Gene list not found: {gene_list_path}")
-            
-        # 1. 读取基因表 (假设没有 header，或者根据实际情况修改)
-        # 通常 genes.csv 结构是: GeneName, Sequence
-        try:
-            df_genes = cast(pd.DataFrame, pd.read_csv(gene_list_path, header=None, names=['gene', 'seq']))
-        except Exception:
-            # 兼容带有 header 的情况
-            df_genes = cast(pd.DataFrame, pd.read_csv(gene_list_path))
-            if 'gene' not in df_genes.columns: # fallback
-                df_genes.columns = ['gene', 'seq']
-        
-        # Topology Preprocessing (Global)
-        # ---------------------------------------------------
-        if topo.func == "reverse_string":
-            print(" [Decoder] Applying Topology: Reverse Sequence")
-            # STRING REVERSE in Python
-            df_genes['processed_seq'] = df_genes['seq'].apply(lambda s: s[::-1])
-        else:
-            df_genes['processed_seq'] = df_genes['seq']
-            
-        # 3. Build Encoding Functions (闭包工厂)
-        # 我们把 Config 里的 mapping 转换成 Python 可调用的函数
-        encoders = {}
-        for table_name, mapping in codebook_cfg.encoding_tables.items():
-            encoders[table_name] = self._create_encoder(mapping, codebook_cfg.channel_base_index)
-
-        # 4. Parse Blueprint Structure
-        # 建立一个字典方便按 ID 查找 segment 定义
-        segment_defs = {seg.id: seg for seg in topo.structure}
-        
-        # 验证 physical_order 是否都定义了
-        for seg_id in topo.physical_order:
-            if seg_id not in segment_defs:
-                raise ValueError(f"Topology physical_order references undefined segment ID: {seg_id}")
-
-        # 5. The Assembler (核心循环)
-        def assemble_barcode(seq: str) -> str:
-            full_barcode = ""
-            
-            # 严格按照物理成像顺序 (Physical Order) 拼接
-            # 因为 Miner 提取出来的矩阵是 [R1, R2 ... Rn] 排序的
-            # 如果 R1-5 属于 seqD，R6-10 属于 seqF，那我们就必须先算 seqD 再算 seqF
-            
-            # 注意：这里的 physical_order 实际上应该是指 "Decoder Order"
-            # 你的 config 里 physical_order: ['seqD', 'seqF', 'seqE']
-            # 对应 Rounds: [1..5], [6..10], [11]
-            # 只要这个顺序和 io.py 加载图像的顺序一致，就是对的。
-            
-            for seg_id in topo.physical_order:
-                seg_def = segment_defs[seg_id]
-                
-                # A. Slicing (Config is 1-based Inclusive -> Python 0-based Exclusive)
-                # Config: [1, 6] -> Python: [0 : 6] (Length 6)
-                # Config: [7, 12] -> Python: [6 : 12] (Length 6)
-                start_1b, end_1b = seg_def.csv_slice
-                py_start = max(0, start_1b - 1) # 防止用户输入 0 导致负索引
-                py_end = end_1b
-                
-                # 防御性截取
-                if py_end > len(seq):
-                    # 如果配置切片超出了序列长度，那是 Config 写错了或者 CSV 脏了
-                    return "ERROR_LEN"
-                
-                sub_seq = seq[py_start : py_end]
-                
-                # B. Encoding
-                encoder = encoders[seg_def.encoding_table]
-                encoded_chunk = encoder(sub_seq)
-                
-                # C. Check Expectations
-                # 编码后的长度应该等于该段对应的物理轮次数量
-                expected_rounds = len(seg_def.rounds)
-                if len(encoded_chunk) != expected_rounds:
-                    # 这通常发生在 N 碱基或者逻辑错误
-                    # 比如 seq="GC", rounds=1. encoder("GC")->"1". OK.
-                    # 比如 seq="GNNNNA", rounds=5. encoder-> ".....". OK.
-                    pass # 只要逻辑自洽就行，暂不报错
-                    
-                full_barcode += encoded_chunk
-            
-            return full_barcode
-
-        # Apply Assembly
-        df_genes['barcode'] = df_genes['processed_seq'].apply(assemble_barcode)
-        
-        # 6. Checks & Output
-        # 过滤掉生成失败的
-        valid_df = cast(pd.DataFrame, df_genes[df_genes['barcode'] != "ERROR_LEN"].copy())
-        if len(valid_df) < len(df_genes):
-            print(f" [Warning] {len(df_genes) - len(valid_df)} genes failed barcode generation (Check sequence lengths).")
-
-        # 生成查找表
-        gene_map = dict(zip(valid_df['barcode'], valid_df['gene']))
-        
-        # Save Debug CSV (这是给你检查切片对不对的关键文件)
-        # 我们把切分后的每一段也保存下来方便肉眼Debug，这需要稍微改一下上面的逻辑，但作为Debug
-        # 我们可以直接保存最终结果
-        debug_path = self.output_dir / "compiled_codebook_debug.csv"
-        valid_df.to_csv(debug_path, index=False)
-        print(f"   -> Compiled {len(valid_df)} barcodes. Debug info saved to {debug_path.name}")
-        
-        return gene_map, valid_df
+        compiled = compile_codebook_contract(self.cfg.codebook, output_dir=self.output_dir)
+        return compiled.gene_map, compiled.dataframe
 
     def _create_encoder(self, mapping: Dict[str, int], base_idx: int) -> Callable[[str], str]:
-        """
-        Build a sequence-to-color encoder for one configured table.
-
-        Two cases are supported by the same closure: a direct lookup when the
-        sequence length equals the table key length, and a sliding-window lookup
-        for standard two-base encodings. Color indices are normalized by
-        `base_idx` so the emitted barcode characters match Python argmax channel
-        indices (`0`, `1`, `2`, ...).
-        """
-        # 探测 Window Size
-        keys = list(mapping.keys())
-        if not keys:
-            raise ValueError("Empty encoding table")
-        window_size = len(keys[0]) # e.g. 2 for "AT"
-        
-        # 将 Config 里的 1,2,3 转换为 Python 的 0,1,2 (如果 base_index=1)
-        # 这样生成的 barcode 字符串由 '0', '1', '2' 组成，对应从图像 argmax 出来的 0,1,2
-        normalized_map = {k: str(v - base_idx) for k, v in mapping.items()}
-
-        def encode(seq: str) -> str:
-            res = []
-            N = len(seq)
-            
-            # 情况 1: 序列长度正好等于窗口大小 (例如 Omics "GC" -> 1)
-            # 这种情况下直接查表，不滑动
-            if N == window_size:
-                val = normalized_map.get(seq, ".")
-                return val
-            
-            # 情况 2: 滑动窗口 (Standard STARmap/RIBOmap)
-            # Seq: A G T C (Len 4)
-            # Win=2
-            # 0: AG
-            # 1: GT
-            # 2: TC
-            # Output Len = 4 - 2 + 1 = 3 colors.
-            # 这个逻辑是标准的。
-            
-            # 计算输出长度
-            if N < window_size:
-                return "." * (N) # 序列不够长，这就尴尬了，补坏点
-
-            steps = N - window_size + 1
-            for i in range(steps):
-                chunk = seq[i : i + window_size]
-                val = normalized_map.get(chunk, ".")
-                res.append(val)
-                
-            return "".join(res)
-            
-        return encode
+        return create_encoder(mapping, base_idx)
     
     def _build_reverse_lookups(self) -> Dict[str, Dict[Tuple[str, int], str]]:
-        """
-        构建所有encoding tables的反向查找表
-        
-        用于end bases验证：给定(前一个碱基, 颜色) -> 推断出后一个碱基
-        
-        例如：
-        "AT": 4 -> reverse_lookup[('A', 3)] = 'T'  (假设base_idx=1)
-        "TG": 3 -> reverse_lookup[('T', 2)] = 'G'
-        
-        Returns:
-        --------
-        Dict[table_name, Dict[(prev_base, color), next_base]]
-        """
-        reverse_lookups = {}
-        
-        for table_name, mapping in self.cfg.codebook.encoding_tables.items():
-            reverse_lookups[table_name] = self._build_single_reverse_lookup(
-                mapping, 
-                self.cfg.codebook.channel_base_index
-            )
-        
-        return reverse_lookups
+        return build_reverse_lookups(self.cfg.codebook.encoding_tables, self.cfg.codebook.channel_base_index)
     
     def _build_single_reverse_lookup(
         self, 
         encoding_table: Dict[str, int], 
         base_idx: int
     ) -> Dict[Tuple[str, int], str]:
-        """
-        构建单个encoding table的反向查找表
-        
-        Parameters:
-        -----------
-        encoding_table : Dict[str, int]
-            碱基对 -> 颜色的映射，如 {"AT": 4, "CA": 2, ...}
-        base_idx : int
-            Config中的base index（0或1），用于归一化颜色值
-            
-        Returns:
-        --------
-        reverse : Dict[(prev_base, color), next_base]
-            (前碱基, 归一化颜色) -> 后碱基
-        """
-        reverse = {}
-        
-        for base_pair, color in encoding_table.items():
-            if len(base_pair) != 2:
-                # 跳过非两碱基编码（如果有的话）
-                continue
-            
-            prev_base = base_pair[0]
-            next_base = base_pair[1]
-            normalized_color = color - base_idx  # 转换为0-based
-            
-            key = (prev_base, normalized_color)
-            
-            # 检测编码冲突
-            if key in reverse and reverse[key] != next_base:
-                raise ValueError(
-                    f"Ambiguous encoding in table: "
-                    f"{key} maps to both '{reverse[key]}' and '{next_base}'"
-                )
-            
-            reverse[key] = next_base
-        
-        return reverse
+        return build_single_reverse_lookup(encoding_table, base_idx)
     
     def _decode_color_sequence(
         self, 
@@ -540,21 +501,72 @@ class Decoder:
         
         base_dir = Path(self.cfg.pipeline.output.directory)
         paths = get_fov_output_structure(base_dir, fov_id)
+        compiled_codebook = getattr(self, "compiled_codebook", None)
+        if isinstance(compiled_codebook, CompiledCodebook):
+            _ = compiled_codebook.write_debug_csv(paths["root"])
         
         # 1. 加载数据
         raw_path = paths["extraction"] / f"intensity_matrix_fov_{fov_id}.npy"
         spots_path = paths["spots"] / f"spots_fov_{fov_id}.csv"
+        if hasattr(self, "gene_map"):
+            early_gene_map = getattr(self, "gene_map")
+            if not isinstance(early_gene_map, dict) or not early_gene_map:
+                raise ValueError(
+                    f"Codebook gene-map contract error: compiled gene map is empty before decoding FOV {fov_id}. "
+                    "Decoder requires at least one barcode-to-gene mapping and will not interpret reads against an empty map."
+                )
         
         if not raw_path.exists():
             raise FileNotFoundError(f"Intensity matrix missing: {raw_path}")
             
         # Shape: (N_spots, N_rounds, N_channels)
-        raw_matrix = np.load(raw_path)
-        spots_df = pd.read_csv(spots_path)
+        spot_expected = SpotTableSchema().expected_description()
+        try:
+            raw_spots_df = pd.read_csv(spots_path)
+        except Exception as exc:
+            raise wrap_table_read_error(
+                exc,
+                "spot table",
+                fov_id=fov_id,
+                path=spots_path,
+                context="decode load",
+                expected=spot_expected,
+            ) from exc
+        spots_df = validate_spot_table(
+            raw_spots_df,
+            fov_id=fov_id,
+            path=spots_path,
+            context="decode load",
+        )
         n_spots = len(spots_df)
-        
-        if len(raw_matrix) != len(spots_df):
-            raise ValueError("Matrix and Spots count mismatch! Pipeline broken.")
+        rounds = sorted(list(self.cfg.dataset.round_structure.keys()))
+        channels = self._sequencing_channels()
+        matrix_spec = build_intensity_matrix_spec(
+            fov_id=fov_id,
+            n_spots=n_spots,
+            rounds=rounds,
+            channels=channels,
+        )
+        raw_matrix = self._load_validated_intensity_matrix(
+            fov_id=fov_id,
+            matrix_path=raw_path,
+            matrix_spec=matrix_spec,
+            spots_df=spots_df,
+            spots_path=spots_path,
+        )
+
+        if n_spots == 0:
+            decoded_empty = self._write_empty_decoded_family(fov_id=fov_id, paths=paths)
+            print(" [Decoder] No spots available after artifact load; wrote canonical empty decoded artifacts")
+            return decoded_empty
+
+        gene_map_raw = getattr(self, "gene_map", None)
+        gene_map: dict[str, str] | None = gene_map_raw if isinstance(gene_map_raw, dict) else None
+        if not gene_map:
+            raise ValueError(
+                f"Codebook gene-map contract error: compiled gene map is empty before decoding FOV {fov_id}. "
+                "Decoder requires at least one barcode-to-gene mapping and will not interpret reads against an empty map."
+            )
         
         # 因为 miner 已经过滤过了，raw_matrix 现在全是 seq channel
         # 我们不需要再切片，或者简单检查一下维度匹配
@@ -611,6 +623,11 @@ class Decoder:
         print(f"   Final kept:         {final_pass.sum()} ({final_pass.sum()/n_spots:.2%})")
         print(f"   Removed by quality filter:  {n_spots - final_pass.sum()}")
 
+        if not bool(final_pass.any()):
+            decoded_empty = self._write_empty_decoded_family(fov_id=fov_id, paths=paths)
+            print(" [Decoder] No reads passed base-calling and quality filtering; wrote canonical empty decoded artifacts")
+            return decoded_empty
+
         # 5. Fast String Construction (Vectorized)
         print(" -> Constructing barcodes...")
         
@@ -626,7 +643,7 @@ class Decoder:
         # 这是一个 Numpy 到 Pandas 的技巧
         print(" -> Matching codebook...")
         
-        sample_code = next(iter(self.gene_map.keys()))
+        sample_code = next(iter(gene_map.keys()))
         if raw_matrix.shape[1] != len(sample_code):
             print(f" [Warning] Imaging Rounds ({raw_matrix.shape[1]}) != Codebook Length ({len(sample_code)})")
             
@@ -653,7 +670,7 @@ class Decoder:
         n_pattern_fail = (~pattern_valid).sum()
         pattern_fail_rate = n_pattern_fail / len(df_res) if len(df_res) > 0 else 0
 
-        in_codebook = df_res['barcode'].isin(self.gene_map)
+        in_codebook = df_res['barcode'].isin(gene_map)
         n_codebook = int(in_codebook.sum())
         codebook_rate = n_codebook / len(df_res) if len(df_res) > 0 else 0
 
@@ -661,7 +678,7 @@ class Decoder:
         print(f"   In-codebook after quality filter: {n_codebook} spots ({codebook_rate:.2%})")
 
         # Gene mapping
-        df_res['gene'] = df_res['barcode'].map(self.gene_map).fillna('background')
+        df_res['gene'] = df_res['barcode'].map(gene_map).fillna('background')
 
         df_res['pattern_valid'] = pattern_valid.values
         df_res['in_codebook'] = in_codebook.values
@@ -675,12 +692,17 @@ class Decoder:
             print("   Using pattern-first gate: keeping only pattern-valid reads")
 
         # 过滤掉未保留的spots
-        df_res_true = df_res[final_keep_mask].copy()
+        df_res_true = cast(pd.DataFrame, df_res[final_keep_mask].copy())
 
         if len(df_res_true) == 0:
             print(f" [ERROR] No spots left after gating mode '{gating_mode}'!")
             print(" [HINT] Check your anchor_base configuration and codebook compatibility in experiment_config.yaml")
-            return pd.DataFrame()
+            decoded_empty = self._write_empty_decoded_family(
+                fov_id=fov_id,
+                paths=paths,
+                pre_pattern_df=df_res,
+            )
+            return decoded_empty
         
         # 计算每轮的平均质量分数（用于诊断）
         valid_finite_scores = valid_base_scores.copy()
@@ -714,23 +736,36 @@ class Decoder:
         
         # Top genes
         if n_mapped > 0:
-            top_genes = df_res_true[df_res_true['gene'] != 'background']['gene'].value_counts().head(10)
+            gene_only_df = cast(pd.DataFrame, df_res_true[df_res_true['gene'] != 'background'].copy())
+            top_genes = gene_only_df['gene'].value_counts().head(10)
             print(f"\n [Top 10 Detected Genes]")
             for gene, count in top_genes.items():
                 print(f"   {gene}: {count}")
         # 8. 保存
         out_path = paths["decoded"] / f"decoded_fov_{fov_id}.csv"
-        df_res_true.to_csv(out_path, index=False)
+        df_res_true = self._write_decoded_artifact(
+            df_res_true,
+            fov_id=fov_id,
+            path=out_path,
+            context="decoded save",
+        )
         print(f" [Decoder] Saved decoded list to {out_path.name}")
 
         goodreads_path = paths["decoded"] / f"decoded_fov_{fov_id}_goodreads.csv"
-        df_goodreads = df_res_true[df_res_true['gene'] != 'background'].copy()
-        df_goodreads.to_csv(goodreads_path, index=False)
+        df_goodreads = cast(pd.DataFrame, df_res_true[df_res_true['gene'] != 'background'].copy())
+        df_goodreads = self._write_decoded_artifact(
+            df_goodreads,
+            fov_id=fov_id,
+            path=goodreads_path,
+            context="decoded goodreads save",
+        )
         print(f" [Decoder] Saved decoded good reads to {goodreads_path.name} ({len(df_goodreads)} rows)")
         
-        df_res.to_csv(
-            paths["decoded"] / f"decoded_fov_{fov_id}_pre_pattern_check.csv", 
-            index=False
+        self._write_decoded_artifact(
+            df_res,
+            fov_id=fov_id,
+            path=paths["decoded"] / f"decoded_fov_{fov_id}_pre_pattern_check.csv",
+            context="decoded pre-pattern save",
         )
         
         return df_res_true

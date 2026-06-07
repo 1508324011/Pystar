@@ -35,9 +35,18 @@
 
 ## `providers`
 
-`providers.matlab` 记录 MATLAB provider seam 的 runtime 路径和入口函数。它用于开发验证和兼容性测试；默认 pipeline 仍使用 `provider: native`。
+`providers.matlab` 记录 MATLAB provider seam 的 runtime 路径和入口函数。默认 pipeline 仍使用 `provider: native`；当用户显式选择 MATLAB provider 且 runtime manifest、entrypoint、transform artifact、`flow_3d` sidecar、scope metadata 与 schema 合同都验证通过时，MATLAB provider 路线可以参与 release-valid `image_warp` provenance。
 
-如果手动启用 MATLAB provider，请把它视为实验功能。MATLAB provider 不做静默 fallback：MATLAB runtime 或 MATLAB Engine 不可用时应直接失败。
+MATLAB provider 不做静默 fallback：MATLAB runtime、MATLAB Engine、entrypoint、sidecar 或输出 schema 不可用/不合法时应直接失败，而不是自动回退到 native provider。
+
+`providers.matlab.shared_session` 是可选的 MATLAB Engine 复用配置，当前由 `scripts/batch_pystar.py` 使用：
+
+- `enabled`：默认 `false`，保持旧的每个 MATLAB backend 自管 Engine 生命周期。设为 `true` 后，批处理会创建一个显式共享 owner，并把同一个 owner 注入 preprocessing、registration、spot finding 和 extraction。
+- `name`：可填具体共享 session 名；为 `null` 时自动生成 `pystar_{config_stem}_{config_hash8}_{run_id}`。Slurm array 任务使用 `slurm_{SLURM_JOB_ID}_{SLURM_ARRAY_TASK_ID}` 作为 `run_id`，普通进程使用 `pid_{os.getpid()}`，避免同一 YAML 的并行 worker 误连同一个 MATLAB session。
+- `lifetime`：`run` 或 `fov`，默认 `run`。当前批处理 worker 一次处理一个 FOV，因此两者都在该 worker 边界释放 PyStar-owned session；`fov` 保留给隔离/调试。
+- `health_check_timeout_s`：共享 session attach/start 后的健康检查超时。
+
+共享 session 只按确定名称连接：不会调用未命名 `connect_matlab()`，不会连接“第一个可用 session”，健康检查或 sentinel 身份不匹配时会 fail loudly，也不会静默启动替代 session 或回退到 native provider。
 
 ## `pipeline`
 
@@ -55,7 +64,9 @@
 - `histogram_match` with `scope: intra_round`：round 内 channel 直方图匹配。
 - `morpho_reconstruction_contrast`：形态学重建增强；当前参考参数为 `radius: 6`、`downsample_factor: 0.25`。
 
-默认每步 `provider: native`，对应纯 Python 实现。
+默认每步 `provider: native`，对应纯 Python 实现。`native_volume_workers` 是可选的 native FOV-volume 调度开关，省略或设为 `1` 时保持历史串行执行；设为正整数时，只有在 inter-round / intra-round 参考图已经物化后，eligible volume 才会以有界 worker 数并行处理。该开关只改变调度，不改变 `histogram_match` 语义、clean TIFF 文件名或 production provenance schema。
+
+`native_volume_workers` 的真实数据验证计划：在声明任何端到端加速前，必须用同一验证目录、同一 config、同一 FOV / round / channel 范围分别运行基线提交 `fec32e7` 和候选提交；报告需记录 PyStar 源路径与 commit hash、验证 config、输出 artifact 路径、clean TIFF 文件 SHA/数组等价性、Stage29 histogram real-match/no-reference attribution，以及 paired wall-time/profile 对比。如果 clean 输出不等价，或只验证了不同数据面，不得宣称速度提升。
 
 ### `pipeline.registration`
 
@@ -96,6 +107,6 @@
 
 ## MATLAB provider 状态
 
-当前 PyStar 可以通过 MATLAB provider 调用 MATLAB-backed preprocessing/registration/spot finding/extraction seam；内部 benchmark 中，全 MATLAB-provider 路线已经能接近 STATE。这个能力仍处于测试阶段，不是默认生产路径，也不替代 Python-native 示例配置。
+当前 PyStar 可以通过 MATLAB provider 调用 MATLAB-backed preprocessing/registration/spot finding/extraction seam；内部 benchmark 中，全 MATLAB-provider 路线已经能接近 STATE。这个能力仍处于测试阶段，不是默认生产路径，也不替代 Python-native 示例配置；release-valid 状态按 artifact 合同验证决定：provider 名称本身不会自动把 release contract 降级为 `debug_only`，但 runtime manifest、transform manifest、`flow_3d` sidecar、field semantics、scope metadata、spot/intensity schema 任一不满足合同都会 fail loudly，`image_warp` 也仍要求 `release_gate.status == "valid"`。
 
-如果需要复现实验性 all-MATLAB provider 路线，请从 `experiment_config_matlab_provider.yaml` 开始改路径。该示例的算法参数对齐 2026-04-28 Experiment 1 MATLAB-provider as-run 配置；它保留 `scope_mode: full_fov`，但 local registration 使用 MATLAB subtile 4x4 tiling；这和“只处理一个 tile_local”不同，输出仍覆盖完整 Position。
+如果需要复现实验性 all-MATLAB provider 路线，请从 `experiment_config_matlab_provider.yaml` 开始改路径。该示例的算法参数对齐 2026-04-28 Experiment 1 MATLAB-provider as-run 配置；它保留 `scope_mode: full_fov`，但 local registration 使用 MATLAB subtile 4x4 tiling；这和“只处理一个 tile_local”不同，输出仍覆盖完整 Position。`coordinate_mapping` 仍是 legacy diagnostic 路线，不随 MATLAB provider 的 `image_warp` 合同提升而变成 release-valid。

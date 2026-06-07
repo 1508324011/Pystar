@@ -11,7 +11,6 @@ any intensities are accepted.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from pathlib import Path
@@ -20,128 +19,70 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 import numpy as np
 import pandas as pd
-import tifffile
 
+from ._artifact_schemas import wrap_table_read_error
 from .infrastructure import ExperimentConfig
 from .matlab_engine_bootstrap import (
     MATLABSessionCapsule,
+    MatlabSharedSessionOwner,
     create_matlab_boundary_trace,
     finalize_matlab_boundary_trace,
     load_matlab_engine_factory,
     record_matlab_boundary_phase,
     snapshot_matlab_session_lifecycle,
 )
+from .matlab_runtime import (
+    collect_runtime_file_records as _collect_runtime_file_records_from_manifest,
+    format_exception_message as _format_exception_message,
+    load_validated_runtime_manifest,
+    resolve_repo_runtime_path,
+    resolve_staged_output_path,
+    trusted_matlab_runtime_root,
+    validate_expected_3d_staged_volume_shape,
+    validate_configured_entrypoint_contract,
+    validate_runtime_step_metadata,
+    write_staged_3d_volume_tiff,
+)
 
 
 MATLAB_EXTRACTION_RUNTIME_MANIFEST_NAME = "runtime_manifest.json"
 MATLAB_EXTRACTION_PACKAGE_NAME = "pystar_extraction"
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def _trusted_matlab_runtime_root() -> Path:
-    return (_repo_root() / "matlab_runtime").resolve()
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return f"sha256:{digest.hexdigest()}"
-
-
-def _format_exception_message(prefix: str, exc: Exception) -> str:
-    detail = str(exc).strip()
-    if detail:
-        return f"{prefix}: {detail}"
-    return f"{prefix} ({exc.__class__.__name__})"
+MATLAB_EXTRACTION_OUTPUT_EXPECTED_SCHEMA = (
+    "required columns ['spot_index', 'intensity']; 'spot_index' must be sequential 0..N-1 "
+    "and 'intensity' must be numeric with one row per staged spot"
+)
 
 
 def resolve_matlab_extraction_runtime_path(config: ExperimentConfig) -> Path:
     """Resolve and validate the repo-local MATLAB extraction runtime path."""
 
-    runtime_path = config.providers.matlab.extraction.runtime_path
-    if not runtime_path.is_absolute():
-        runtime_path = _repo_root() / runtime_path
-    resolved_runtime_path = runtime_path.resolve()
-    trusted_root = _trusted_matlab_runtime_root()
-    try:
-        resolved_runtime_path.relative_to(trusted_root)
-    except ValueError as exc:
-        raise ValueError(
-            "providers.matlab.extraction.runtime_path must resolve inside the repo-local "
-            f"'{trusted_root}' runtime root; got {resolved_runtime_path}"
-        ) from exc
-    return resolved_runtime_path
+    return resolve_repo_runtime_path(
+        config.providers.matlab.extraction.runtime_path,
+        config_label="providers.matlab.extraction.runtime_path",
+        trusted_root=trusted_matlab_runtime_root(),
+    )
 
 
 def load_matlab_extraction_runtime_manifest(runtime_dir: Path) -> Dict[str, Any]:
     """Load the MATLAB extraction runtime manifest and validate its schema."""
 
-    manifest_path = runtime_dir / MATLAB_EXTRACTION_RUNTIME_MANIFEST_NAME
-    if not manifest_path.exists():
-        raise FileNotFoundError(
-            f"MATLAB extraction runtime manifest is missing: {manifest_path}. "
-            "Expected repo-local manifest for MATLAB extraction provider."
-        )
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError(f"MATLAB extraction runtime manifest must be a JSON object: {manifest_path}")
-
-    required_files = manifest.get("required_files")
-    optional_files = manifest.get("optional_files", [])
-    entrypoint = manifest.get("entrypoint")
-    package_name = manifest.get("package_name")
-    if not isinstance(required_files, list) or not required_files:
-        raise ValueError("MATLAB extraction runtime manifest must declare a non-empty required_files list")
-    if not isinstance(optional_files, list):
-        raise ValueError("MATLAB extraction runtime manifest optional_files must be a list")
-    if not isinstance(entrypoint, str) or not entrypoint.strip():
-        raise ValueError("MATLAB extraction runtime manifest must declare a non-empty entrypoint")
-    if package_name != MATLAB_EXTRACTION_PACKAGE_NAME:
-        raise ValueError(
-            "MATLAB extraction runtime manifest package_name mismatch: "
-            f"expected {MATLAB_EXTRACTION_PACKAGE_NAME!r}, got {package_name!r}"
-        )
-
-    for bucket_name, bucket in (("required_files", required_files), ("optional_files", optional_files)):
-        for item in bucket:
-            if not isinstance(item, dict):
-                raise ValueError(f"MATLAB extraction runtime manifest {bucket_name} entries must be JSON objects")
-            for key in ("name", "source_path", "role"):
-                value = item.get(key)
-                if not isinstance(value, str) or not value.strip():
-                    raise ValueError(
-                        f"MATLAB extraction runtime manifest entry in {bucket_name} is missing non-empty '{key}'"
-                    )
-
+    manifest = load_validated_runtime_manifest(
+        runtime_dir,
+        manifest_label="MATLAB extraction runtime manifest",
+        missing_hint="Expected repo-local manifest for MATLAB extraction provider.",
+        package_name=MATLAB_EXTRACTION_PACKAGE_NAME,
+        manifest_name=MATLAB_EXTRACTION_RUNTIME_MANIFEST_NAME,
+    )
     return manifest
 
 
 def _validate_runtime_entrypoint_contract(runtime_manifest: Mapping[str, Any], configured_entrypoint: str) -> None:
-    manifest_entrypoint = runtime_manifest.get("entrypoint")
-    if configured_entrypoint != manifest_entrypoint:
-        raise ValueError(
-            "providers.matlab.extraction.entrypoint must match the repo-local MATLAB runtime manifest. "
-            f"Config entrypoint={configured_entrypoint!r}, manifest entrypoint={manifest_entrypoint!r}"
-        )
-
-    declared_filenames = {
-        item["name"]
-        for bucket_name in ("required_files", "optional_files")
-        for item in runtime_manifest.get(bucket_name, [])
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
-    expected_entrypoint_file = f"{configured_entrypoint}.m"
-    if expected_entrypoint_file not in declared_filenames:
-        raise ValueError(
-            "MATLAB extraction runtime manifest must declare the configured entrypoint file. "
-            f"Missing {expected_entrypoint_file!r} in runtime manifest"
-        )
+    validate_configured_entrypoint_contract(
+        runtime_manifest,
+        configured_entrypoint,
+        config_label="providers.matlab.extraction.entrypoint",
+        manifest_label="MATLAB extraction runtime manifest",
+    )
 
 
 def build_matlab_extraction_plan(
@@ -188,13 +129,7 @@ def _load_matlab_engine_factory() -> Callable[[], Any]:
 
 
 def _write_staged_volume_tiff(volume_path: Path, volume: Any) -> None:
-    staged_volume = np.asarray(volume)
-    if staged_volume.ndim != 3:
-        raise ValueError(f"MATLAB extraction expects a 3D staged volume, got ndim={staged_volume.ndim}")
-
-    with tifffile.TiffWriter(volume_path) as writer:
-        for plane in staged_volume:
-            writer.write(np.asarray(plane), photometric="minisblack", metadata=None)
+    write_staged_3d_volume_tiff(volume_path, volume, owner_label="MATLAB extraction")
 
 
 class MATLABExtractionBackend:
@@ -211,9 +146,11 @@ class MATLABExtractionBackend:
         config: ExperimentConfig,
         *,
         engine_factory: Optional[Callable[[], Any]] = None,
+        matlab_session_owner: MatlabSharedSessionOwner | None = None,
     ) -> None:
         self.config = config
         self.engine_factory = engine_factory
+        self.matlab_session_owner = matlab_session_owner
         self.runtime_dir = resolve_matlab_extraction_runtime_path(config)
         self.runtime_manifest = load_matlab_extraction_runtime_manifest(self.runtime_dir)
         self.entrypoint = config.providers.matlab.extraction.entrypoint
@@ -226,6 +163,8 @@ class MATLABExtractionBackend:
             engine_factory_consumer="extraction.provider='matlab'",
             startup_failure_prefix="Failed to start MATLAB Engine for extraction.provider='matlab'",
             addpath_failure_prefix="Failed to add MATLAB extraction runtime path",
+            session_owner=matlab_session_owner,
+            runtime_file_validator=self._collect_runtime_file_records,
         )
 
     @property
@@ -258,29 +197,12 @@ class MATLABExtractionBackend:
         return self._session_capsule.validate_runtime_files(self._collect_runtime_file_records)
 
     def _collect_runtime_file_records(self) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        for bucket_name, required_default in (("required_files", True), ("optional_files", False)):
-            for item in self.runtime_manifest.get(bucket_name, []):
-                file_path = self.runtime_dir / item["name"]
-                is_required = bool(item.get("required", required_default))
-                is_used = is_required
-                if is_used and not file_path.exists():
-                    raise FileNotFoundError(
-                        f"Required MATLAB extraction runtime file is missing: {file_path}. "
-                        "MATLAB extraction provider cannot proceed."
-                    )
-
-                record = {
-                    "name": item["name"],
-                    "required": is_required,
-                    "used": is_used,
-                    "role": item["role"],
-                    "source_path": item["source_path"],
-                }
-                if file_path.exists():
-                    record["sha256"] = _sha256_file(file_path)
-                records.append(record)
-        return records
+        return _collect_runtime_file_records_from_manifest(
+            self.runtime_manifest,
+            self.runtime_dir,
+            missing_required_prefix="Required MATLAB extraction runtime file is missing",
+            missing_required_suffix="MATLAB extraction provider cannot proceed.",
+        )
 
     def _normalize_input_volume(self, volume: Any) -> Any:
         if volume.ndim != 3:
@@ -334,44 +256,25 @@ class MATLABExtractionBackend:
                 f"MATLAB extraction metadata n_spots mismatch: expected {expected_count}, got {metadata_count!r}"
             )
 
-        volume_shape = metadata.get("volume_shape_zyx")
-        if not isinstance(volume_shape, list) or [int(v) for v in volume_shape] != [int(v) for v in expected_shape_zyx]:
-            raise ValueError(
-                "MATLAB extraction metadata volume_shape_zyx mismatch: "
-                f"expected {list(expected_shape_zyx)}, got {volume_shape!r}"
-            )
+        validate_expected_3d_staged_volume_shape(
+            metadata.get("volume_shape_zyx"),
+            expected_shape_zyx=expected_shape_zyx,
+            mismatch_prefix="MATLAB extraction metadata volume_shape_zyx mismatch",
+        )
 
-        output_path_value = metadata.get("output_path")
-        if not isinstance(output_path_value, str) or not output_path_value.strip():
-            raise ValueError("MATLAB extraction metadata must declare a non-empty output_path")
-        output_path = Path(output_path_value)
-        if not output_path.is_absolute():
-            output_path = tmpdir_path / output_path
-        output_path = output_path.resolve()
-        if output_path.parent != tmpdir_path.resolve():
-            raise ValueError(
-                "MATLAB extraction output must stay inside the staged temporary directory: "
-                f"{output_path}"
-            )
-        if not output_path.exists():
-            raise FileNotFoundError(
-                f"MATLAB extraction reported output that does not exist: {output_path}"
-            )
+        output_path = resolve_staged_output_path(
+            metadata.get("output_path"),
+            tmpdir_path=tmpdir_path,
+            missing_output_path_message="MATLAB extraction metadata must declare a non-empty output_path",
+            outside_tmpdir_prefix="MATLAB extraction output must stay inside the staged temporary directory",
+            missing_output_prefix="MATLAB extraction reported output that does not exist",
+        )
 
-        steps = metadata.get("steps")
-        if not isinstance(steps, list) or not steps:
-            raise ValueError("MATLAB extraction metadata must declare a non-empty steps list")
-        for index, step in enumerate(steps):
-            if not isinstance(step, Mapping):
-                raise ValueError(f"MATLAB extraction step #{index} must be a mapping")
-            name = step.get("name")
-            duration_ms = step.get("duration_ms")
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"MATLAB extraction step #{index} is missing a non-empty name")
-            if not isinstance(duration_ms, (int, float)) or duration_ms < 0:
-                raise ValueError(
-                    f"MATLAB extraction step '{name}' must report a non-negative duration_ms"
-                )
+        validate_runtime_step_metadata(
+            metadata.get("steps"),
+            missing_steps_message="MATLAB extraction metadata must declare a non-empty steps list",
+            step_label="MATLAB extraction step",
+        )
 
         return output_path
 
@@ -531,20 +434,51 @@ class MATLABExtractionBackend:
                 expected_count=int(len(coords)),
                 expected_shape_zyx=(int(volume_for_matlab.shape[0]), int(volume_for_matlab.shape[1]), int(volume_for_matlab.shape[2])),
             )
-            output_df = pd.read_csv(output_path)
+            try:
+                output_df = pd.read_csv(output_path)
+            except Exception as exc:
+                raise wrap_table_read_error(
+                    exc,
+                    "MATLAB extraction output",
+                    fov_id=fov_id,
+                    path=output_path,
+                    context="matlab extraction output load",
+                    expected=MATLAB_EXTRACTION_OUTPUT_EXPECTED_SCHEMA,
+                ) from exc
             if "spot_index" not in output_df.columns or "intensity" not in output_df.columns:
-                raise ValueError("MATLAB extraction output must contain 'spot_index' and 'intensity' columns")
-            spot_index = np.asarray(pd.to_numeric(output_df["spot_index"], errors="raise"), dtype=np.int64)
+                raise ValueError(
+                    f"FOV {fov_id} MATLAB extraction output schema error during matlab extraction output load "
+                    f"at {output_path}: missing required columns 'spot_index' and/or 'intensity'. "
+                    f"Expected schema: {MATLAB_EXTRACTION_OUTPUT_EXPECTED_SCHEMA}"
+                )
+            try:
+                spot_index = np.asarray(pd.to_numeric(output_df["spot_index"], errors="raise"), dtype=np.int64)
+            except Exception as exc:
+                raise ValueError(
+                    f"FOV {fov_id} MATLAB extraction output schema error during matlab extraction output load "
+                    f"at {output_path}: column 'spot_index' contains non-numeric values. "
+                    f"Expected schema: {MATLAB_EXTRACTION_OUTPUT_EXPECTED_SCHEMA}"
+                ) from exc
             expected_index = np.arange(len(coords), dtype=np.int64)
             if not np.array_equal(spot_index, expected_index):
                 raise ValueError(
-                    "MATLAB extraction output spot_index ordering mismatch: expected sequential indices "
-                    f"0..{len(coords) - 1}"
+                    f"FOV {fov_id} MATLAB extraction output schema error during matlab extraction output load "
+                    f"at {output_path}: spot_index ordering mismatch; expected sequential indices "
+                    f"0..{len(coords) - 1}. Expected schema: {MATLAB_EXTRACTION_OUTPUT_EXPECTED_SCHEMA}"
                 )
-            intensities = np.asarray(pd.to_numeric(output_df["intensity"], errors="raise"), dtype=np.float32)
+            try:
+                intensities = np.asarray(pd.to_numeric(output_df["intensity"], errors="raise"), dtype=np.float32)
+            except Exception as exc:
+                raise ValueError(
+                    f"FOV {fov_id} MATLAB extraction output schema error during matlab extraction output load "
+                    f"at {output_path}: column 'intensity' contains non-numeric values. "
+                    f"Expected schema: {MATLAB_EXTRACTION_OUTPUT_EXPECTED_SCHEMA}"
+                ) from exc
             if len(intensities) != len(coords):
                 raise ValueError(
-                    f"MATLAB extraction output length mismatch: expected {len(coords)}, got {len(intensities)}"
+                    f"FOV {fov_id} MATLAB extraction output schema error during matlab extraction output load "
+                    f"at {output_path}: output length mismatch; expected {len(coords)}, got {len(intensities)}. "
+                    f"Expected schema: {MATLAB_EXTRACTION_OUTPUT_EXPECTED_SCHEMA}"
                 )
             record_matlab_boundary_phase(
                 boundary_trace,

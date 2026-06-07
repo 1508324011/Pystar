@@ -11,7 +11,6 @@ are never hidden behind a native fallback.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from datetime import datetime, timezone
@@ -24,6 +23,7 @@ import yaml
 
 from .infrastructure import ExperimentConfig
 from .io import (
+    MATLAB_STAGE_ARTIFACT_CONTRACT_SUPPORTED,
     MATLAB_STAGE_CONFIG_SURFACES,
     MATLAB_STAGE_PYTHON_OWNED_ARTIFACTS,
     get_fov_output_structure,
@@ -31,16 +31,27 @@ from .io import (
 )
 from .matlab_engine_bootstrap import (
     MATLABSessionCapsule,
+    MatlabSharedSessionOwner,
     create_matlab_boundary_trace,
     finalize_matlab_boundary_trace,
     load_matlab_engine_factory,
     record_matlab_boundary_phase,
     snapshot_matlab_session_lifecycle,
 )
+from .matlab_runtime import (
+    collect_runtime_file_records as _collect_runtime_file_records_from_manifest,
+    format_exception_message as _format_exception_message,
+    load_validated_runtime_manifest,
+    resolve_repo_runtime_path,
+    trusted_matlab_runtime_root,
+    validate_configured_entrypoint_contract,
+    validate_runtime_step_metadata,
+)
 
 
 PREPROCESSING_PROVENANCE_VERSION = "1.0"
 MATLAB_RUNTIME_MANIFEST_NAME = "runtime_manifest.json"
+MATLAB_PREPROCESSING_PACKAGE_NAME = "pystar_preprocessing"
 MATLAB_SUPPORTED_SEQUENCE_METHODS = {
     "none",
     "min_max_normalize",
@@ -52,17 +63,6 @@ MATLAB_SUPPORTED_HISTOGRAM_SCOPES = {"inter_round", "intra_round"}
 
 def _iso_utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _format_exception_message(prefix: str, exc: Exception) -> str:
-    detail = str(exc).strip()
-    if detail:
-        return f"{prefix}: {detail}"
-    return f"{prefix} ({exc.__class__.__name__})"
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
 
 
 def write_preprocessing_provenance(base_dir: Path, fov_id: int, provenance: Mapping[str, Any]) -> Path:
@@ -103,15 +103,10 @@ def write_preprocessing_provenance(base_dir: Path, fov_id: int, provenance: Mapp
             "artifact_owner": "python_pystar",
             "python_owned_artifacts": list(MATLAB_STAGE_PYTHON_OWNED_ARTIFACTS["preprocessing"]),
             "failure_contract": "fail_loud_no_fallback",
-            "current_support_status": "debug_only" if matlab_requested else "not_selected",
-            "promotion_blockers": (
-                [
-                    "representative_benchmark_recovery_pending",
-                    "production_verification_pending",
-                ]
-                if matlab_requested
-                else []
+            "current_support_status": (
+                MATLAB_STAGE_ARTIFACT_CONTRACT_SUPPORTED if matlab_requested else "not_selected"
             ),
+            "promotion_blockers": [],
         }
     merged_provenance["matlab_stage_contract"] = stage_contract
     temp_path.write_text(
@@ -125,49 +120,23 @@ def write_preprocessing_provenance(base_dir: Path, fov_id: int, provenance: Mapp
 def resolve_matlab_runtime_path(config: ExperimentConfig) -> Path:
     """Resolve the configured MATLAB preprocessing runtime inside the repo tree."""
 
-    matlab_cfg = config.providers.matlab.preprocessing
-
-    runtime_path = matlab_cfg.runtime_path
-    if not runtime_path.is_absolute():
-        runtime_path = _repo_root() / runtime_path
-    return runtime_path.resolve()
+    return resolve_repo_runtime_path(
+        config.providers.matlab.preprocessing.runtime_path,
+        config_label="providers.matlab.preprocessing.runtime_path",
+        trusted_root=trusted_matlab_runtime_root(),
+    )
 
 
 def load_matlab_runtime_manifest(runtime_dir: Path) -> Dict[str, Any]:
     """Load and validate the preprocessing MATLAB runtime manifest."""
 
-    manifest_path = runtime_dir / MATLAB_RUNTIME_MANIFEST_NAME
-    if not manifest_path.exists():
-        raise FileNotFoundError(
-            f"MATLAB runtime manifest is missing: {manifest_path}. "
-            "Expected repo-local manifest for matlab_extracted preprocessing backend."
-        )
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError(f"MATLAB runtime manifest must be a JSON object: {manifest_path}")
-
-    required_files = manifest.get("required_files")
-    optional_files = manifest.get("optional_files", [])
-    entrypoint = manifest.get("entrypoint")
-    if not isinstance(required_files, list) or not required_files:
-        raise ValueError("MATLAB runtime manifest must declare a non-empty required_files list")
-    if not isinstance(optional_files, list):
-        raise ValueError("MATLAB runtime manifest optional_files must be a list")
-    if not isinstance(entrypoint, str) or not entrypoint.strip():
-        raise ValueError("MATLAB runtime manifest must declare a non-empty entrypoint")
-
-    for bucket_name, bucket in (("required_files", required_files), ("optional_files", optional_files)):
-        for item in bucket:
-            if not isinstance(item, dict):
-                raise ValueError(f"MATLAB runtime manifest {bucket_name} entries must be JSON objects")
-            for key in ("name", "source_path", "role"):
-                value = item.get(key)
-                if not isinstance(value, str) or not value.strip():
-                    raise ValueError(
-                        f"MATLAB runtime manifest entry in {bucket_name} is missing non-empty '{key}'"
-                    )
-
+    manifest = load_validated_runtime_manifest(
+        runtime_dir,
+        manifest_label="MATLAB runtime manifest",
+        missing_hint="Expected repo-local manifest for matlab_extracted preprocessing backend.",
+        package_name=MATLAB_PREPROCESSING_PACKAGE_NAME,
+        manifest_name=MATLAB_RUNTIME_MANIFEST_NAME,
+    )
     return manifest
 
 
@@ -175,33 +144,12 @@ def _validate_runtime_entrypoint_contract(
     runtime_manifest: Mapping[str, Any],
     configured_entrypoint: str,
 ) -> None:
-    manifest_entrypoint = runtime_manifest.get("entrypoint")
-    if configured_entrypoint != manifest_entrypoint:
-        raise ValueError(
-            "providers.matlab.preprocessing.entrypoint must match the repo-local MATLAB runtime manifest. "
-            f"Config entrypoint={configured_entrypoint!r}, manifest entrypoint={manifest_entrypoint!r}"
-        )
-
-    declared_filenames = {
-        item["name"]
-        for bucket_name in ("required_files", "optional_files")
-        for item in runtime_manifest.get(bucket_name, [])
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
-    expected_entrypoint_file = f"{configured_entrypoint}.m"
-    if expected_entrypoint_file not in declared_filenames:
-        raise ValueError(
-            "MATLAB runtime manifest must declare the configured entrypoint file. "
-            f"Missing {expected_entrypoint_file!r} in runtime manifest"
-        )
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return f"sha256:{digest.hexdigest()}"
+    validate_configured_entrypoint_contract(
+        runtime_manifest,
+        configured_entrypoint,
+        config_label="providers.matlab.preprocessing.entrypoint",
+        manifest_label="MATLAB runtime manifest",
+    )
 
 
 def _validate_filename_pattern_for_matlab_backend(filename_pattern: str) -> None:
@@ -397,9 +345,11 @@ class MATLABPreprocessingBackend:
         config: ExperimentConfig,
         *,
         engine_factory: Optional[Callable[[], Any]] = None,
+        matlab_session_owner: MatlabSharedSessionOwner | None = None,
     ) -> None:
         self.config = config
         self.engine_factory = engine_factory
+        self.matlab_session_owner = matlab_session_owner
         self.runtime_dir = resolve_matlab_runtime_path(config)
         self.runtime_manifest = load_matlab_runtime_manifest(self.runtime_dir)
         self.entrypoint = config.providers.matlab.preprocessing.entrypoint
@@ -412,6 +362,8 @@ class MATLABPreprocessingBackend:
             engine_factory_consumer="preprocessing step provider='matlab'",
             startup_failure_prefix="Failed to start MATLAB Engine for preprocessing provider='matlab'",
             addpath_failure_prefix="Failed to add MATLAB preprocessing runtime path",
+            session_owner=matlab_session_owner,
+            runtime_file_validator=self._collect_runtime_file_records,
         )
 
     @property
@@ -444,30 +396,12 @@ class MATLABPreprocessingBackend:
         return self._session_capsule.validate_runtime_files(self._collect_runtime_file_records)
 
     def _collect_runtime_file_records(self) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        for bucket_name, required_default in (("required_files", True), ("optional_files", False)):
-            for item in self.runtime_manifest.get(bucket_name, []):
-                file_path = self.runtime_dir / item["name"]
-                is_required = bool(item.get("required", required_default))
-                is_used = is_required
-                if is_used and not file_path.exists():
-                    raise FileNotFoundError(
-                        f"Required MATLAB runtime file is missing: {file_path}. "
-                        "matlab_extracted preprocessing cannot proceed."
-                    )
-
-                record = {
-                    "name": item["name"],
-                    "required": is_required,
-                    "used": is_used,
-                    "role": item["role"],
-                    "source_path": item["source_path"],
-                }
-                if file_path.exists():
-                    record["sha256"] = _sha256_file(file_path)
-                records.append(record)
-
-        return records
+        return _collect_runtime_file_records_from_manifest(
+            self.runtime_manifest,
+            self.runtime_dir,
+            missing_required_prefix="Required MATLAB runtime file is missing",
+            missing_required_suffix="matlab_extracted preprocessing cannot proceed.",
+        )
 
     def _validate_result_metadata(
         self,
@@ -497,20 +431,11 @@ class MATLABPreprocessingBackend:
                 f"expected {plan['expected_z_slices']}, got {output_shape[2]}"
             )
 
-        steps = metadata.get("steps")
-        if not isinstance(steps, list) or not steps:
-            raise ValueError("MATLAB preprocessing entrypoint did not report executed preprocessing steps")
-        for index, step in enumerate(steps):
-            if not isinstance(step, Mapping):
-                raise ValueError(f"MATLAB preprocessing step #{index} must be a mapping")
-            name = step.get("name")
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"MATLAB preprocessing step #{index} is missing a non-empty name")
-            duration_ms = step.get("duration_ms")
-            if not isinstance(duration_ms, (int, float)) or duration_ms < 0:
-                raise ValueError(
-                    f"MATLAB preprocessing step '{name}' must report a non-negative duration_ms"
-                )
+        validate_runtime_step_metadata(
+            metadata.get("steps"),
+            missing_steps_message="MATLAB preprocessing entrypoint did not report executed preprocessing steps",
+            step_label="MATLAB preprocessing step",
+        )
 
         expected_dtype = np.dtype(str(plan["loader_output_dtype"]))
         clean_output_dir = clean_output_dir.resolve()

@@ -1,17 +1,20 @@
 # pystar/preprocessing.py
 import numpy as np
 import tifffile
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
 import shutil
+import os
 from datetime import datetime, timezone
-from tqdm import tqdm
+from dataclasses import dataclass
+from functools import lru_cache
 import cv2
 from skimage import exposure, morphology
 from skimage.transform import resize
 from skimage.util import img_as_ubyte
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, Mapping, Optional, Sequence, cast
 from numpy.typing import NDArray
 from .infrastructure import ExperimentConfig, PreprocessingStep
 from .io import ImageLoader
@@ -21,12 +24,80 @@ from .matlab_preprocessing import (
     MATLABPreprocessingBackend,
     write_preprocessing_provenance,
 )
-from .matlab_engine_bootstrap import summarize_matlab_boundary_traces
+from .matlab_engine_bootstrap import MatlabSharedSessionOwner, summarize_matlab_boundary_traces
 
 ImageArray = NDArray[Any]
 ProcessorParams = dict[str, Any]
 ProcessorContext = dict[str, Any]
 ProcessorFunc = Callable[[ImageArray, ProcessorParams, ProcessorContext], ImageArray]
+NativeOutputWriter = Callable[[ImageArray, int, int], Path]
+
+NATIVE_PREPROCESSING_TIMING_SCHEMA_NAME = "pystar_native_preprocessing_timing"
+NATIVE_PREPROCESSING_TIMING_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class NativeVolumeKey:
+    round_id: int
+    channel_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class NativeReferenceKey:
+    role: str
+    volume_key: NativeVolumeKey
+
+
+@dataclass(frozen=True, slots=True)
+class NativeVolumeWorkItem:
+    order_index: int
+    key: NativeVolumeKey
+    input_path: Path
+    planned_output_path: Path | None
+    calibration_steps: tuple[PreprocessingStep, ...]
+    extraction_steps: tuple[PreprocessingStep, ...]
+    inter_round_reference_key: NativeReferenceKey | None
+    intra_round_reference_key: NativeReferenceKey | None
+    produces_inter_round_reference: bool
+    produces_intra_round_reference: bool
+
+    @property
+    def required_reference_keys(self) -> tuple[NativeReferenceKey, ...]:
+        keys: list[NativeReferenceKey] = []
+        if self.inter_round_reference_key is not None:
+            keys.append(self.inter_round_reference_key)
+        if self.intra_round_reference_key is not None:
+            keys.append(self.intra_round_reference_key)
+        return tuple(keys)
+
+
+@dataclass(frozen=True, slots=True)
+class NativePreprocessingPlan:
+    fov_id: int
+    round_order: tuple[int, ...]
+    items: tuple[NativeVolumeWorkItem, ...]
+    worker_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class NativeVolumeRunResult:
+    work_item: NativeVolumeWorkItem
+    output_path: Path
+    volume_record: dict[str, Any]
+    inter_round_reference_image: ImageArray | None = None
+    intra_round_reference_image: ImageArray | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NativeOutputWriterWithPlanner:
+    write: NativeOutputWriter
+    output_path_for: Callable[[int, int], Path]
+
+    def __call__(self, img: ImageArray, round_id: int, channel_id: int) -> Path:
+        return self.write(img, round_id, channel_id)
+
+    def planned_output_path(self, round_id: int, channel_id: int) -> Path:
+        return self.output_path_for(round_id, channel_id)
 
 # ==============================================================================
 # 1. THE ATOMS
@@ -42,22 +113,28 @@ def op_median_filter(img: ImageArray, params: ProcessorParams, ctx: ProcessorCon
     """
     k = params.get('kernel_size', 3)
     # OpenCV 要求 kernel size 必须是大于1的奇数
-    if k % 2 == 0: k += 1
-    if k < 3: return img
+    if k % 2 == 0:
+        k += 1
+    if k < 3:
+        return img
 
     # Flight check: input is float32 0-1
     # 暂时转回 uint8 域做滤波 (OpenCV 针对 int 优化极好)
     img_u8 = cast(ImageArray, (img * 255).astype(np.uint8))
 
-    def _median_blur_slice(slice_u8: ImageArray) -> ImageArray:
-        blurred = cv2.medianBlur(cast(Any, np.ascontiguousarray(slice_u8)), k)
-        return cast(ImageArray, blurred)
-
     if img_u8.ndim == 3:
-        # 3D stack: 逐层处理
-        res_u8 = cast(ImageArray, np.stack([_median_blur_slice(cast(ImageArray, s)) for s in img_u8]))
+        # 3D stack: 逐层处理。避免 list + np.stack 产生第二个全体积临时对象。
+        if img_u8.shape[0] == 0:
+            _raise_empty_stack_like_np_stack()
+        res_u8 = cast(ImageArray, np.empty_like(img_u8))
+        for z_index in range(img_u8.shape[0]):
+            _ = _median_blur_slice_into(
+                cast(ImageArray, img_u8[z_index]),
+                k,
+                cast(ImageArray, res_u8[z_index]),
+            )
     else:
-        res_u8 = _median_blur_slice(img_u8)
+        res_u8 = _median_blur_slice(img_u8, k)
 
     # 转回 float32
     return res_u8.astype(np.float32) / 255.0
@@ -76,10 +153,21 @@ def op_gaussian_blur(img: ImageArray, params: ProcessorParams, ctx: ProcessorCon
     
     if img.ndim == 3:
         # 3D Stack 必须切片处理，OpenCV 不支持 3D 卷积
-        return np.stack([cv2.GaussianBlur(s, (0, 0), sigmaX=sigma, sigmaY=sigma) for s in img])
+        if img.shape[0] == 0:
+            _raise_empty_stack_like_np_stack()
+        first_slice = _gaussian_blur_slice(cast(ImageArray, img[0]), sigma)
+        res = np.empty((img.shape[0], *first_slice.shape), dtype=first_slice.dtype)
+        res[0] = first_slice
+        for z_index in range(1, img.shape[0]):
+            _ = _gaussian_blur_slice_into(
+                cast(ImageArray, img[z_index]),
+                sigma,
+                cast(ImageArray, res[z_index]),
+            )
+        return cast(ImageArray, res)
     else:
         # 2D 图像
-        return cv2.GaussianBlur(img, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        return _gaussian_blur_slice(img, sigma)
 
 def op_histogram_match(img: ImageArray, params: ProcessorParams, ctx: ProcessorContext) -> ImageArray:
     """
@@ -102,7 +190,7 @@ def op_histogram_match(img: ImageArray, params: ProcessorParams, ctx: ProcessorC
     
     # skimage 的 match_histograms 支持 float 输入
     matched = exposure.match_histograms(img, ref_img)
-    return matched.astype(np.float32)
+    return matched.astype(np.float32, copy=False)
 
 def op_gamma_correction(img: ImageArray, params: ProcessorParams, ctx: ProcessorContext) -> ImageArray:
     """
@@ -111,7 +199,8 @@ def op_gamma_correction(img: ImageArray, params: ProcessorParams, ctx: Processor
     Gamma > 1.0 压暗暗部。
     """
     gamma = params.get('gamma', 1.0)
-    if gamma == 1.0: return img
+    if gamma == 1.0:
+        return img
     
     # 假设输入已经是 float32 [0, 1]，直接幂运算
     # 为了防止负值导致 NaN (虽然理论上不该有负值)，加个绝对值或 clip
@@ -128,22 +217,82 @@ def op_difference_of_gaussians(img: ImageArray, params: ProcessorParams, ctx: Pr
     # 模拟背景的大小 (通常是点的 3-5 倍)
     bg_sigma = params.get('bg_sigma', 5.0)
     
-    # 复用 op_gaussian_blur 的逻辑 (OpenCV 实现)
-    
-    def _blur_slice(s: ImageArray, sig: float) -> ImageArray:
-        return cv2.GaussianBlur(s, (0, 0), sigmaX=sig, sigmaY=sig)
-        
     if img.ndim == 3:
-        g_small = np.stack([_blur_slice(s, spot_sigma) for s in img])
-        g_large = np.stack([_blur_slice(s, bg_sigma) for s in img])
+        if img.shape[0] == 0:
+            _raise_empty_stack_like_np_stack()
+        first_small = _gaussian_blur_slice(cast(ImageArray, img[0]), spot_sigma)
+        res = np.empty((img.shape[0], *first_small.shape), dtype=first_small.dtype)
+        res[0] = first_small
+        scratch = np.empty_like(first_small)
+        _ = _gaussian_blur_slice_into(
+            cast(ImageArray, img[0]),
+            bg_sigma,
+            cast(ImageArray, scratch),
+        )
+        _subtract_and_clip_nonnegative(cast(ImageArray, res[0]), cast(ImageArray, scratch))
+        for z_index in range(1, img.shape[0]):
+            _ = _gaussian_blur_slice_into(
+                cast(ImageArray, img[z_index]),
+                spot_sigma,
+                cast(ImageArray, res[z_index]),
+            )
+            _ = _gaussian_blur_slice_into(
+                cast(ImageArray, img[z_index]),
+                bg_sigma,
+                cast(ImageArray, scratch),
+            )
+            _subtract_and_clip_nonnegative(cast(ImageArray, res[z_index]), cast(ImageArray, scratch))
+        return cast(ImageArray, res)
     else:
-        g_small = _blur_slice(img, spot_sigma)
-        g_large = _blur_slice(img, bg_sigma)
+        g_small = _gaussian_blur_slice(img, spot_sigma)
+        g_large = _gaussian_blur_slice(img, bg_sigma)
         
     # DoG 结果可能为负 (原来的背景区域)，这里我们将负值截断为 0
     # 因为在荧光图像中，负信号没有物理意义
     diff = g_small - g_large
     return np.maximum(diff, 0)
+
+
+def _raise_empty_stack_like_np_stack() -> None:
+    raise ValueError("need at least one array to stack")
+
+
+def _validate_cv2_dst_result(result: Any, dst: ImageArray, *, operation: str) -> ImageArray:
+    result_array = np.asarray(result)
+    if result_array.shape != dst.shape or result_array.dtype != dst.dtype:
+        raise ValueError(
+            f"{operation} OpenCV destination drifted; expected {dst.shape}/{dst.dtype}, got "
+            f"{result_array.shape}/{result_array.dtype}"
+        )
+    if result_array is not dst and not np.may_share_memory(result_array, dst):
+        dst[...] = result_array
+    return dst
+
+
+def _median_blur_slice(slice_u8: ImageArray, kernel_size: int) -> ImageArray:
+    blurred = cv2.medianBlur(cast(Any, np.ascontiguousarray(slice_u8)), kernel_size)
+    return cast(ImageArray, blurred)
+
+
+def _median_blur_slice_into(slice_u8: ImageArray, kernel_size: int, dst: ImageArray) -> ImageArray:
+    contiguous_slice = np.ascontiguousarray(slice_u8)
+    result = cv2.medianBlur(cast(Any, contiguous_slice), kernel_size, dst=dst)
+    return _validate_cv2_dst_result(result, dst, operation="medianBlur")
+
+
+def _gaussian_blur_slice(slice_2d: ImageArray, sigma: float) -> ImageArray:
+    blurred = cv2.GaussianBlur(slice_2d, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    return cast(ImageArray, blurred)
+
+
+def _gaussian_blur_slice_into(slice_2d: ImageArray, sigma: float, dst: ImageArray) -> ImageArray:
+    result = cv2.GaussianBlur(slice_2d, (0, 0), sigmaX=sigma, sigmaY=sigma, dst=dst)
+    return _validate_cv2_dst_result(result, dst, operation="GaussianBlur")
+
+
+def _subtract_and_clip_nonnegative(value: ImageArray, baseline: ImageArray) -> None:
+    _ = np.subtract(value, baseline, out=value)
+    _ = np.maximum(value, 0, out=value)
 
 def op_clip_percentile(img: ImageArray, params: ProcessorParams, ctx: ProcessorContext) -> ImageArray:
     """
@@ -168,6 +317,123 @@ def op_clahe(img: ImageArray, params: ProcessorParams, ctx: ProcessorContext) ->
     # equalize_adapthist 完美支持 float，且输出也是 float
     return exposure.equalize_adapthist(img, clip_limit=clip, nbins=nbins).astype(np.float32)
 
+
+@lru_cache(maxsize=32)
+def _morphology_disk(radius: int | float) -> ImageArray:
+    return cast(ImageArray, morphology.disk(radius))
+
+
+def _morpho_reconstruction_contrast_slice(
+    slice_2d: ImageArray,
+    *,
+    small_shape: tuple[int, int],
+    selem_full: ImageArray,
+    selem_small: ImageArray,
+    full_resolution_scratch: tuple[ImageArray, ImageArray] | None = None,
+) -> ImageArray:
+    h, w = slice_2d.shape
+
+    # --- Step A: 快速估算背景 (The Slow Part Optimization) ---
+    slice_small = resize(slice_2d, small_shape, order=1, preserve_range=True)
+
+    # 在小图上做侵蚀和重建
+    marker_s = morphology.erosion(slice_small, selem_small)
+    bg_rec_s = morphology.reconstruction(marker_s, slice_small, method='dilation')
+
+    # 放大背景
+    bg_full = resize(bg_rec_s, (h, w), order=1, preserve_range=True)
+
+    # --- Step B: 全分辨率去背景 ---
+    # 这一步是快加减法，没压力
+    diff = slice_2d - bg_full
+
+    # --- Step C: 全分辨率增强 (The Detail Part) ---
+    # White/Black Tophat 在 OpenCV/Skimage 里通常优化得不错，比 Reconstruction 快
+    # 为了保留 1-2px 的细节，这步还得在原图跑。
+    if full_resolution_scratch is None:
+        w_th = np.empty_like(diff)
+        b_th = np.empty_like(diff)
+    else:
+        w_th, b_th = full_resolution_scratch
+        expected = (diff.shape, diff.dtype)
+        if (w_th.shape, w_th.dtype) != expected or (b_th.shape, b_th.dtype) != expected:
+            raise ValueError(
+                "morpho_reconstruction_contrast scratch buffers must match the full-resolution "
+                + f"diff shape/dtype {diff.shape}/{diff.dtype}; got "
+                + f"{w_th.shape}/{w_th.dtype} and {b_th.shape}/{b_th.dtype}"
+            )
+        if np.may_share_memory(w_th, slice_2d) or np.may_share_memory(b_th, slice_2d):
+            raise ValueError("morpho_reconstruction_contrast scratch buffers must not alias input slices")
+        if np.may_share_memory(w_th, b_th):
+            raise ValueError("morpho_reconstruction_contrast scratch buffers must not alias each other")
+
+    morphology.white_tophat(diff, selem_full, out=w_th)
+    morphology.black_tophat(diff, selem_full, out=b_th)
+
+    diff += w_th
+    diff -= b_th
+    return cast(ImageArray, diff)
+
+
+def _morpho_reconstruction_contrast_scratch(
+    *,
+    shape: tuple[int, int],
+    dtype: np.dtype[Any],
+) -> tuple[ImageArray, ImageArray]:
+    """Allocate private full-resolution morphology scratch for one call.
+
+    The buffers are intentionally tiny in ownership scope: callers create them
+    for one 3-D volume and pass them slice-by-slice so the top-hat outputs stop
+    allocating new full-resolution arrays for every Z plane. They are not shared
+    across FOVs, volumes, threads, or calls.
+    """
+
+    return (
+        cast(ImageArray, np.empty(shape, dtype=dtype)),
+        cast(ImageArray, np.empty(shape, dtype=dtype)),
+    )
+
+
+def _morpho_reconstruction_contrast_workers(params: ProcessorParams) -> int:
+    raw_workers = params.get("workers", 1)
+    if isinstance(raw_workers, (bool, np.bool_)) or not isinstance(raw_workers, (int, np.integer)):
+        raise ValueError(
+            "morpho_reconstruction_contrast workers must be a positive integer; "
+            + f"got {raw_workers!r}"
+        )
+
+    workers = int(raw_workers)
+    if workers <= 0:
+        raise ValueError(
+            "morpho_reconstruction_contrast workers must be a positive integer; "
+            + f"got {raw_workers!r}"
+        )
+    return workers
+
+
+def _morpho_reconstruction_contrast_parallel_slice(
+    z_index: int,
+    slice_2d: ImageArray,
+    *,
+    small_shape: tuple[int, int],
+    selem_full: ImageArray,
+    selem_small: ImageArray,
+    scratch_shape: tuple[int, int],
+    scratch_dtype: np.dtype[Any],
+) -> tuple[int, ImageArray]:
+    scratch = _morpho_reconstruction_contrast_scratch(
+        shape=scratch_shape,
+        dtype=scratch_dtype,
+    )
+    result = _morpho_reconstruction_contrast_slice(
+        slice_2d,
+        small_shape=small_shape,
+        selem_full=selem_full,
+        selem_small=selem_small,
+        full_resolution_scratch=scratch,
+    )
+    return z_index, result
+
 def op_morpho_reconstruction_contrast(img: ImageArray, params: ProcessorParams, ctx: ProcessorContext) -> ImageArray:
     """
     复杂的背景扣除逻辑：Morphological Reconstruction + TopHat。
@@ -178,48 +444,84 @@ def op_morpho_reconstruction_contrast(img: ImageArray, params: ProcessorParams, 
     3. W-TopHat-Rec = Img - Background
     4. Enhanced = W-TopHat-Rec + WhiteTopHat(W-TopHat-Rec) - BlackTopHat(W-TopHat-Rec)
     """
-    rad = params.get('radius', 10)
-    downsample = params.get('downsample_factor', 0.25)
-    
-    rad_small = max(1, int(rad * downsample))
-    selem_full = morphology.disk(rad)     # 大图用的核
-    selem_small = morphology.disk(rad_small) # 小图用的核
+    rad = float(params.get('radius', 10))
+    downsample = float(params.get('downsample_factor', 0.25))
 
-    def _process_slice_safe(slice_2d: ImageArray) -> ImageArray:
-        h, w = slice_2d.shape
-        
-        # --- Step A: 快速估算背景 (The Slow Part Optimization) ---
-        small_h, small_w = int(h * downsample), int(w * downsample)
-        slice_small = resize(slice_2d, (small_h, small_w), order=1, preserve_range=True)
-        
-        # 在小图上做侵蚀和重建
-        marker_s = morphology.erosion(slice_small, selem_small)
-        bg_rec_s = morphology.reconstruction(marker_s, slice_small, method='dilation')
-        
-        # 放大背景
-        bg_full = resize(bg_rec_s, (h, w), order=1, preserve_range=True)
-        
-        # --- Step B: 全分辨率去背景 ---
-        # 这一步是快加减法，没压力
-        diff = slice_2d - bg_full
-        
-        # --- Step C: 全分辨率增强 (The Detail Part) ---
-        # White/Black Tophat 在 OpenCV/Skimage 里通常优化得不错，比 Reconstruction 快
-        # 为了保留 1-2px 的细节，这步还得在原图跑。
-        
-        # 如果觉得这步还是慢，可以单独给这步开 0.5 的 downsample，而不是 0.25
-        w_th = morphology.white_tophat(diff, selem_full)
-        b_th = morphology.black_tophat(diff, selem_full)
-        
-        final = diff + w_th - b_th
-        return final
+    if downsample <= 0:
+        raise ValueError(
+            f"morpho_reconstruction_contrast expects downsample_factor > 0; got {downsample!r}"
+        )
+
+    if img.ndim not in (2, 3):
+        raise ValueError(
+            f"morpho_reconstruction_contrast expects a 2D image or 3D stack; got ndim={img.ndim}"
+        )
+
+    rad_small = max(1, int(rad * downsample))
+    selem_full = _morphology_disk(rad)     # 大图用的核
+    selem_small = _morphology_disk(rad_small) # 小图用的核
+
+    h, w = img.shape[-2:]
+    small_shape = (max(1, int(h * downsample)), max(1, int(w * downsample)))
 
     if img.ndim == 3:
-        res = np.stack([_process_slice_safe(s) for s in img])
+        if img.shape[0] == 0:
+            raise ValueError("morpho_reconstruction_contrast expects a non-empty 3D stack")
+        workers = _morpho_reconstruction_contrast_workers(params)
+        first_slice = _morpho_reconstruction_contrast_slice(
+            cast(ImageArray, img[0]),
+            small_shape=small_shape,
+            selem_full=selem_full,
+            selem_small=selem_small,
+        )
+        res = np.empty((img.shape[0], *first_slice.shape), dtype=first_slice.dtype)
+        res[0] = first_slice
+        scratch_shape = cast(tuple[int, int], first_slice.shape)
+        scratch_dtype = np.dtype(first_slice.dtype)
+
+        if workers == 1 or img.shape[0] == 1:
+            full_resolution_scratch = _morpho_reconstruction_contrast_scratch(
+                shape=scratch_shape,
+                dtype=scratch_dtype,
+            )
+            for z_index in range(1, img.shape[0]):
+                res[z_index] = _morpho_reconstruction_contrast_slice(
+                    cast(ImageArray, img[z_index]),
+                    small_shape=small_shape,
+                    selem_full=selem_full,
+                    selem_small=selem_small,
+                    full_resolution_scratch=full_resolution_scratch,
+                )
+        else:
+            max_workers = min(workers, img.shape[0] - 1, os.cpu_count() or 1)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        _morpho_reconstruction_contrast_parallel_slice,
+                        z_index,
+                        cast(ImageArray, img[z_index]),
+                        small_shape=small_shape,
+                        selem_full=selem_full,
+                        selem_small=selem_small,
+                        scratch_shape=scratch_shape,
+                        scratch_dtype=scratch_dtype,
+                    )
+                    for z_index in range(1, img.shape[0])
+                ]
+                for future in futures:
+                    z_index, slice_result = future.result()
+                    res[z_index] = slice_result
     else:
-        res = _process_slice_safe(img)
-        
-    return np.clip(res, 0, 1).astype(np.float32)
+        res = _morpho_reconstruction_contrast_slice(
+            img,
+            small_shape=small_shape,
+            selem_full=selem_full,
+            selem_small=selem_small,
+        )
+        if "workers" in params:
+            _ = _morpho_reconstruction_contrast_workers(params)
+
+    return np.clip(res, 0, 1, out=res).astype(np.float32, copy=False)
 
 
 def op_min_max_normalize(img: ImageArray, params: ProcessorParams, ctx: ProcessorContext) -> ImageArray:
@@ -257,6 +559,104 @@ PROCESSOR_MAP: dict[str, ProcessorFunc] = {
     "none": op_noop, # Null Object Pattern
 }
 
+
+def _elapsed_ms_since(start_time: float) -> float:
+    return round((time.perf_counter() - start_time) * 1000.0, 3)
+
+
+def _duration_summary(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {
+            "count": 0,
+            "total_duration_ms": 0.0,
+            "mean_duration_ms": None,
+            "median_duration_ms": None,
+            "min_duration_ms": None,
+            "max_duration_ms": None,
+        }
+
+    sorted_values = sorted(float(value) for value in values)
+    count = len(sorted_values)
+    total = round(sum(sorted_values), 3)
+    midpoint = count // 2
+    if count % 2:
+        median = sorted_values[midpoint]
+    else:
+        median = (sorted_values[midpoint - 1] + sorted_values[midpoint]) / 2.0
+
+    return {
+        "count": count,
+        "total_duration_ms": total,
+        "mean_duration_ms": round(total / count, 3),
+        "median_duration_ms": round(float(median), 3),
+        "min_duration_ms": round(float(sorted_values[0]), 3),
+        "max_duration_ms": round(float(sorted_values[-1]), 3),
+    }
+
+
+def _build_native_preprocessing_timing_payload(
+    *,
+    fov_id: int,
+    round_order: list[int],
+    volumes: list[dict[str, Any]],
+    segment_index: int | None = None,
+) -> dict[str, Any]:
+    method_durations: dict[str, list[float]] = {}
+    phase_durations: dict[str, list[float]] = {
+        "load": [],
+        "calibration_steps": [],
+        "extraction_steps": [],
+        "clip_convert": [],
+        "write": [],
+        "volume_total": [],
+    }
+
+    for volume in volumes:
+        phase_durations["load"].append(float(volume["load_ms"]))
+        phase_durations["clip_convert"].append(float(volume["clip_convert_ms"]))
+        phase_durations["write"].append(float(volume["write_ms"]))
+        phase_durations["volume_total"].append(float(volume["total_ms"]))
+
+        calibration_total = 0.0
+        for step_record in volume["calibration_steps"]:
+            duration_ms = float(step_record["duration_ms"])
+            calibration_total += duration_ms
+            method_durations.setdefault(str(step_record["method"]), []).append(duration_ms)
+        phase_durations["calibration_steps"].append(round(calibration_total, 3))
+
+        extraction_total = 0.0
+        for step_record in volume["extraction_steps"]:
+            duration_ms = float(step_record["duration_ms"])
+            extraction_total += duration_ms
+            method_durations.setdefault(str(step_record["method"]), []).append(duration_ms)
+        phase_durations["extraction_steps"].append(round(extraction_total, 3))
+
+    by_method = {
+        method: _duration_summary(durations)
+        for method, durations in sorted(method_durations.items())
+    }
+    by_phase = {
+        phase: _duration_summary(durations)
+        for phase, durations in phase_durations.items()
+    }
+
+    payload = {
+        "schema_name": NATIVE_PREPROCESSING_TIMING_SCHEMA_NAME,
+        "schema_version": NATIVE_PREPROCESSING_TIMING_SCHEMA_VERSION,
+        "fov_id": int(fov_id),
+        "round_order": [int(round_id) for round_id in round_order],
+        "volume_count": len(volumes),
+        "total_volume_ms": by_phase["volume_total"]["total_duration_ms"],
+        "volumes": volumes,
+        "summary": {
+            "by_method": by_method,
+            "by_phase": by_phase,
+        },
+    }
+    if segment_index is not None:
+        payload["segment_index"] = int(segment_index)
+    return payload
+
 # ==============================================================================
 # 3. THE ENGINE
 # ==============================================================================
@@ -276,9 +676,10 @@ class DataSanitizer:
     switching is explicit provenance, not fallback behavior.
     """
 
-    def __init__(self, config: ExperimentConfig):
+    def __init__(self, config: ExperimentConfig, matlab_session_owner: Optional[MatlabSharedSessionOwner] = None):
         self.cfg = config
         self.loader = ImageLoader(config)
+        self._matlab_session_owner = matlab_session_owner
         self._matlab_backend: Optional[MATLABPreprocessingBackend] = None
 
     def close(self) -> None:
@@ -311,8 +712,9 @@ class DataSanitizer:
         extraction_steps: list[PreprocessingStep],
         output_files: list[str],
         target_rounds: Optional[list[int]],
+        preprocessing_timing: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        return {
+        provenance = {
             "version": PREPROCESSING_PROVENANCE_VERSION,
             "generated_at": finished_at,
             "fov_id": int(fov_id),
@@ -342,6 +744,9 @@ class DataSanitizer:
             ],
             "output_files": output_files,
         }
+        if preprocessing_timing is not None:
+            provenance["preprocessing_timing"] = preprocessing_timing
+        return provenance
 
     def _build_provider_dispatch_provenance(
         self,
@@ -472,6 +877,30 @@ class DataSanitizer:
         tifffile.imwrite(output_path, img, compression='zlib')
         return output_path
 
+    def _make_stage_output_writer(self, output_root: Path, fov_id: int) -> NativeOutputWriter:
+        def write(img: ImageArray, round_id: int, channel_id: int) -> Path:
+            return self._save_stage_clean(img, output_root, fov_id, round_id, channel_id)
+
+        def planned_output_path(round_id: int, channel_id: int) -> Path:
+            return output_root / self._stage_relative_path(fov_id, int(round_id), int(channel_id))
+
+        return NativeOutputWriterWithPlanner(
+            write=write,
+            output_path_for=planned_output_path,
+        )
+
+    def _make_canonical_output_writer(self, fov_id: int) -> NativeOutputWriter:
+        def write(img: ImageArray, round_id: int, channel_id: int) -> Path:
+            return self._save_clean(img, fov_id, round_id, channel_id)
+
+        def planned_output_path(round_id: int, channel_id: int) -> Path:
+            return self.get_clean_path(fov_id, int(round_id), int(channel_id))
+
+        return NativeOutputWriterWithPlanner(
+            write=write,
+            output_path_for=planned_output_path,
+        )
+
     def _flat_clean_filename(self, fov_id: int, round_id: int, channel_id: int) -> str:
         return f"clean_fov_{fov_id}_round_{round_id}_ch_{channel_id}.tif"
 
@@ -527,6 +956,521 @@ class DataSanitizer:
         paths = get_fov_output_structure(base_dir, fov_id)
         return paths['cleaned'] / self._flat_clean_filename(fov_id, round_id, channel_id)
 
+    def _run_pipeline_with_timing(
+        self,
+        img_vol: ImageArray,
+        pipeline_seq: list[PreprocessingStep],
+        context: ProcessorContext,
+    ) -> tuple[ImageArray, list[dict[str, Any]]]:
+        if img_vol.dtype != np.float32:
+            max_val = 255.0 if img_vol.dtype == np.uint8 else 65535.0
+            if np.issubdtype(img_vol.dtype, np.floating) and img_vol.max() > 1.0:
+                current_data = img_vol
+            else:
+                current_data = img_vol.astype(np.float32) / max_val
+        else:
+            current_data = img_vol
+
+        step_timings: list[dict[str, Any]] = []
+        for step_index, step in enumerate(pipeline_seq):
+            func = PROCESSOR_MAP.get(step.method)
+            if func:
+                step_started = time.perf_counter()
+                current_data = func(current_data, step.params, context)
+                step_timings.append(
+                    {
+                        "index": step_index,
+                        "method": step.method,
+                        "provider": step.provider,
+                        "duration_ms": _elapsed_ms_since(step_started),
+                    }
+                )
+
+        return current_data, step_timings
+
+    def _native_volume_worker_count(self, sequence: Sequence[PreprocessingStep]) -> int:
+        if not sequence:
+            return 1
+
+        raw_workers = getattr(self.cfg.pipeline.preprocessing, "native_volume_workers", 1)
+        if isinstance(raw_workers, (bool, np.bool_)) or not isinstance(raw_workers, (int, np.integer)):
+            raise ValueError(
+                "pipeline.preprocessing.native_volume_workers must be a positive integer; "
+                + f"got {raw_workers!r}"
+            )
+
+        worker_count = int(raw_workers)
+        if worker_count <= 0:
+            raise ValueError(
+                "pipeline.preprocessing.native_volume_workers must be a positive integer; "
+                + f"got {raw_workers!r}"
+            )
+        return worker_count
+
+    def _planned_native_output_path(
+        self,
+        output_writer: NativeOutputWriter,
+        *,
+        round_id: int,
+        channel_id: int,
+    ) -> Path | None:
+        planner = getattr(output_writer, "planned_output_path", None)
+        if planner is None:
+            return None
+        planned = planner(round_id, channel_id)
+        return Path(planned)
+
+    def _native_sequence_uses_histogram_scope(
+        self,
+        steps: Sequence[PreprocessingStep],
+        scope: str,
+    ) -> bool:
+        return any(
+            step.method == "histogram_match" and step.params.get("scope", "none") == scope
+            for step in steps
+        )
+
+    def _build_native_preprocessing_plan(
+        self,
+        *,
+        fov_id: int,
+        loader: ImageLoader,
+        calibration_steps: Sequence[PreprocessingStep],
+        extraction_steps: Sequence[PreprocessingStep],
+        final_queue: Sequence[int],
+        output_writer: NativeOutputWriter,
+        worker_count: int,
+    ) -> NativePreprocessingPlan:
+        if worker_count <= 0:
+            raise ValueError(
+                "pipeline.preprocessing.native_volume_workers must be a positive integer; "
+                + f"got {worker_count!r}"
+            )
+
+        roles = self.cfg.dataset.channel_roles
+        items: list[NativeVolumeWorkItem] = []
+        seen_volume_keys: set[NativeVolumeKey] = set()
+        duplicate_volume_keys: list[NativeVolumeKey] = []
+        seen_output_paths: dict[Path, NativeVolumeKey] = {}
+        duplicate_output_paths: list[tuple[Path, NativeVolumeKey, NativeVolumeKey]] = []
+        missing_planned_output_keys: list[NativeVolumeKey] = []
+        reference_round_id = 1
+        order_index = 0
+        all_steps = tuple(calibration_steps) + tuple(extraction_steps)
+        needs_inter_round_reference = self._native_sequence_uses_histogram_scope(all_steps, "inter_round")
+        needs_intra_round_reference = self._native_sequence_uses_histogram_scope(all_steps, "intra_round")
+        available_volume_keys: set[NativeVolumeKey] = set()
+        round_seq_channels: dict[int, list[int]] = {}
+        for round_id in final_queue:
+            channels_in_round = self.cfg.dataset.round_structure[round_id]
+            seq_channels = sorted(channel_id for channel_id in channels_in_round if roles.get(channel_id) == 'seq')
+            round_seq_channels[int(round_id)] = [int(channel_id) for channel_id in seq_channels]
+            for channel_id in seq_channels:
+                available_volume_keys.add(NativeVolumeKey(round_id=int(round_id), channel_id=int(channel_id)))
+
+        for round_id in final_queue:
+            seq_channels = round_seq_channels[int(round_id)]
+            if not seq_channels:
+                continue
+            first_channel_id = int(seq_channels[0])
+            for channel_id in seq_channels:
+                key = NativeVolumeKey(round_id=int(round_id), channel_id=int(channel_id))
+                if key in seen_volume_keys:
+                    duplicate_volume_keys.append(key)
+                else:
+                    seen_volume_keys.add(key)
+                inter_key = None
+                if needs_inter_round_reference and round_id != reference_round_id:
+                    reference_volume_key = NativeVolumeKey(
+                        round_id=reference_round_id,
+                        channel_id=int(channel_id),
+                    )
+                    if worker_count > 1 or reference_volume_key in available_volume_keys:
+                        inter_key = NativeReferenceKey(
+                            role="inter_round",
+                            volume_key=reference_volume_key,
+                        )
+                intra_key = None if (not needs_intra_round_reference or channel_id == first_channel_id) else NativeReferenceKey(
+                    role="intra_round",
+                    volume_key=NativeVolumeKey(
+                        round_id=int(round_id),
+                        channel_id=first_channel_id,
+                    ),
+                )
+                planned_output_path = self._planned_native_output_path(
+                    output_writer,
+                    round_id=int(round_id),
+                    channel_id=int(channel_id),
+                )
+                if planned_output_path is None:
+                    missing_planned_output_keys.append(key)
+                else:
+                    previous_key = seen_output_paths.get(planned_output_path)
+                    if previous_key is not None:
+                        duplicate_output_paths.append((planned_output_path, previous_key, key))
+                    else:
+                        seen_output_paths[planned_output_path] = key
+                items.append(
+                    NativeVolumeWorkItem(
+                        order_index=order_index,
+                        key=key,
+                        input_path=loader._get_path(fov_id, int(round_id), int(channel_id)),
+                        planned_output_path=planned_output_path,
+                        calibration_steps=tuple(calibration_steps),
+                        extraction_steps=tuple(extraction_steps),
+                        inter_round_reference_key=inter_key,
+                        intra_round_reference_key=intra_key,
+                        produces_inter_round_reference=needs_inter_round_reference and round_id == reference_round_id,
+                        produces_intra_round_reference=needs_intra_round_reference and channel_id == first_channel_id,
+                    )
+                )
+                order_index += 1
+
+        if duplicate_volume_keys:
+            raise ValueError(
+                "Native preprocessing reference dependency plan is impossible: duplicate volume identities "
+                + ", ".join(
+                    f"round {key.round_id} channel {key.channel_id}"
+                    for key in duplicate_volume_keys
+                )
+            )
+
+        if worker_count > 1 and missing_planned_output_keys:
+            raise ValueError(
+                "Native preprocessing parallel execution requires planned output paths for every volume; missing "
+                + ", ".join(
+                    f"round {key.round_id} channel {key.channel_id}"
+                    for key in missing_planned_output_keys
+                )
+            )
+
+        if duplicate_output_paths:
+            raise ValueError(
+                "Native preprocessing reference dependency plan has duplicate output paths: "
+                + "; ".join(
+                    f"{path} for round {first_key.round_id} channel {first_key.channel_id} "
+                    f"and round {duplicate_key.round_id} channel {duplicate_key.channel_id}"
+                    for path, first_key, duplicate_key in duplicate_output_paths
+                )
+            )
+
+        item_keys = {item.key for item in items}
+        missing_dependencies: list[str] = []
+        for item in items:
+            for reference_key in item.required_reference_keys:
+                if reference_key.volume_key not in item_keys:
+                    missing_dependencies.append(
+                        f"round {item.key.round_id} channel {item.key.channel_id} requires "
+                        f"{reference_key.role} reference from round {reference_key.volume_key.round_id} "
+                        f"channel {reference_key.volume_key.channel_id}"
+                    )
+        if missing_dependencies:
+            raise ValueError(
+                "Native preprocessing reference dependency plan is impossible: "
+                + "; ".join(missing_dependencies)
+            )
+
+        return NativePreprocessingPlan(
+            fov_id=int(fov_id),
+            round_order=tuple(int(round_id) for round_id in final_queue),
+            items=tuple(items),
+            worker_count=int(worker_count),
+        )
+
+    def _run_native_volume_work_item(
+        self,
+        *,
+        item: NativeVolumeWorkItem,
+        raw_vol: ImageArray,
+        output_writer: NativeOutputWriter,
+        reference_images: Mapping[NativeReferenceKey, ImageArray],
+        load_ms: float,
+        volume_started: float,
+    ) -> NativeVolumeRunResult:
+        missing = [reference_key for reference_key in item.required_reference_keys if reference_key not in reference_images]
+        if missing:
+            raise ValueError(
+                "Native preprocessing volume scheduled before required references were materialized: "
+                + ", ".join(
+                    f"{key.role} reference from round {key.volume_key.round_id} "
+                    f"channel {key.volume_key.channel_id}"
+                    for key in missing
+                )
+            )
+
+        ctx = {
+            'ref_round_image': None
+            if item.inter_round_reference_key is None
+            else reference_images[item.inter_round_reference_key],
+            'ref_channel_image': None
+            if item.intra_round_reference_key is None
+            else reference_images[item.intra_round_reference_key],
+        }
+
+        img_calibrated, calibration_timings = self._run_pipeline_with_timing(
+            raw_vol,
+            list(item.calibration_steps),
+            ctx,
+        )
+        inter_round_reference_image = img_calibrated.copy() if item.produces_inter_round_reference else None
+        intra_round_reference_image = img_calibrated.copy() if item.produces_intra_round_reference else None
+
+        final_vol, extraction_timings = self._run_pipeline_with_timing(
+            img_calibrated,
+            list(item.extraction_steps),
+            ctx,
+        )
+
+        clip_convert_started = time.perf_counter()
+        final_u8 = img_as_ubyte(np.clip(final_vol, 0, 1))
+        clip_convert_ms = _elapsed_ms_since(clip_convert_started)
+
+        write_started = time.perf_counter()
+        output_path = output_writer(final_u8, item.key.round_id, item.key.channel_id)
+        write_ms = _elapsed_ms_since(write_started)
+
+        return NativeVolumeRunResult(
+            work_item=item,
+            output_path=output_path,
+            inter_round_reference_image=inter_round_reference_image,
+            intra_round_reference_image=intra_round_reference_image,
+            volume_record={
+                "round_id": int(item.key.round_id),
+                "channel_id": int(item.key.channel_id),
+                "input_path": str(item.input_path),
+                "output_path": str(output_path),
+                "load_ms": round(float(load_ms), 3),
+                "calibration_steps": calibration_timings,
+                "extraction_steps": extraction_timings,
+                "clip_convert_ms": clip_convert_ms,
+                "write_ms": write_ms,
+                "total_ms": _elapsed_ms_since(volume_started),
+            },
+        )
+
+    def _load_and_run_native_volume_work_item(
+        self,
+        *,
+        item: NativeVolumeWorkItem,
+        loader: ImageLoader,
+        output_writer: NativeOutputWriter,
+        reference_images: Mapping[NativeReferenceKey, ImageArray],
+    ) -> NativeVolumeRunResult:
+        volume_started = time.perf_counter()
+        load_started = time.perf_counter()
+        raw_vol = cast(ImageArray, loader._lazy_load_tiff(item.input_path).compute())
+        load_ms = _elapsed_ms_since(load_started)
+        return self._run_native_volume_work_item(
+            item=item,
+            raw_vol=raw_vol,
+            output_writer=output_writer,
+            reference_images=reference_images,
+            load_ms=load_ms,
+            volume_started=volume_started,
+        )
+
+    def _strip_native_volume_reference_payloads(
+        self,
+        result: NativeVolumeRunResult,
+    ) -> NativeVolumeRunResult:
+        return NativeVolumeRunResult(
+            work_item=result.work_item,
+            output_path=result.output_path,
+            volume_record=result.volume_record,
+        )
+
+    def _prune_native_reference_images(
+        self,
+        reference_images: dict[NativeReferenceKey, ImageArray],
+        remaining_items: Sequence[NativeVolumeWorkItem],
+    ) -> None:
+        still_required = {
+            reference_key
+            for item in remaining_items
+            for reference_key in item.required_reference_keys
+        }
+        stale_keys = [reference_key for reference_key in reference_images if reference_key not in still_required]
+        for reference_key in stale_keys:
+            del reference_images[reference_key]
+
+    def _run_native_volume_serial(
+        self,
+        *,
+        plan: NativePreprocessingPlan,
+        loader: ImageLoader,
+        output_writer: NativeOutputWriter,
+        print_progress: bool,
+    ) -> list[NativeVolumeRunResult]:
+        reference_images: dict[NativeReferenceKey, ImageArray] = {}
+        results: list[NativeVolumeRunResult] = []
+
+        for index, item in enumerate(plan.items):
+            if print_progress and (not results or results[-1].work_item.key.round_id != item.key.round_id):
+                print(f" -> Processing Round {item.key.round_id}...")
+
+            result = self._load_and_run_native_volume_work_item(
+                item=item,
+                loader=loader,
+                output_writer=output_writer,
+                reference_images=dict(reference_images),
+            )
+            self._publish_native_volume_references(result, reference_images)
+            self._prune_native_reference_images(reference_images, plan.items[index + 1:])
+            results.append(self._strip_native_volume_reference_payloads(result))
+
+        return results
+
+    def _publish_native_volume_references(
+        self,
+        result: NativeVolumeRunResult,
+        reference_images: dict[NativeReferenceKey, ImageArray],
+    ) -> None:
+        key = result.work_item.key
+        if result.inter_round_reference_image is not None:
+            reference_images[NativeReferenceKey(role="inter_round", volume_key=key)] = result.inter_round_reference_image
+        if result.intra_round_reference_image is not None:
+            reference_images[NativeReferenceKey(role="intra_round", volume_key=key)] = result.intra_round_reference_image
+
+    def _run_native_volume_parallel(
+        self,
+        *,
+        plan: NativePreprocessingPlan,
+        loader: ImageLoader,
+        output_writer: NativeOutputWriter,
+        print_progress: bool,
+    ) -> list[NativeVolumeRunResult]:
+        reference_images: dict[NativeReferenceKey, ImageArray] = {}
+        pending_items = list(plan.items)
+        completed_results: dict[NativeVolumeKey, NativeVolumeRunResult] = {}
+
+        while pending_items:
+            ready_items: list[NativeVolumeWorkItem] = [
+                item
+                for item in pending_items
+                if all(reference_key in reference_images for reference_key in item.required_reference_keys)
+            ]
+            if not ready_items:
+                unresolved = [
+                    f"round {item.key.round_id} channel {item.key.channel_id} waits for "
+                    + ", ".join(
+                        f"{key.role} reference from round {key.volume_key.round_id} "
+                        f"channel {key.volume_key.channel_id}"
+                        for key in item.required_reference_keys
+                        if key not in reference_images
+                    )
+                    for item in pending_items
+                ]
+                raise ValueError(
+                    "Native preprocessing reference dependency plan is impossible: "
+                    + "; ".join(unresolved)
+                )
+
+            ready_items.sort(key=lambda item: item.order_index)
+            max_workers = min(plan.worker_count, len(ready_items), os.cpu_count() or 1)
+            if max_workers <= 0:
+                raise ValueError(
+                    "pipeline.preprocessing.native_volume_workers must be a positive integer; "
+                    + f"got {plan.worker_count!r}"
+                )
+
+            if print_progress:
+                rounds = sorted({item.key.round_id for item in ready_items})
+                print(
+                    " -> Processing native volume batch "
+                    f"rounds={rounds} workers={max_workers} volumes={len(ready_items)}"
+                )
+
+            completed_batch: list[NativeVolumeRunResult] = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_item: dict[Future[NativeVolumeRunResult], NativeVolumeWorkItem] = {}
+                for item in ready_items:
+                    future = executor.submit(
+                        self._load_and_run_native_volume_work_item,
+                        item=item,
+                        loader=loader,
+                        output_writer=output_writer,
+                        reference_images=dict(reference_images),
+                    )
+                    future_to_item[future] = item
+                for future in as_completed(future_to_item):
+                    completed_batch.append(future.result())
+
+            completed_batch.sort(key=lambda result: result.work_item.order_index)
+            for result in completed_batch:
+                self._publish_native_volume_references(result, reference_images)
+                completed_results[result.work_item.key] = self._strip_native_volume_reference_payloads(result)
+
+            ready_keys: set[NativeVolumeKey] = {item.key for item in ready_items}
+            pending_items = [item for item in pending_items if item.key not in ready_keys]
+            self._prune_native_reference_images(reference_images, pending_items)
+
+        return [completed_results[item.key] for item in sorted(plan.items, key=lambda item: item.order_index)]
+
+    def _run_native_preprocessing_kernel(
+        self,
+        *,
+        fov_id: int,
+        loader: ImageLoader,
+        sequence: list[PreprocessingStep],
+        target_rounds: Optional[list[int]],
+        output_writer: NativeOutputWriter,
+        segment_index: int | None = None,
+        print_progress: bool = False,
+    ) -> dict[str, Any]:
+        if not sequence:
+            raise ValueError("Native preprocessing kernel cannot run an empty sequence")
+
+        seq_calibration, seq_extraction = self._split_sequence(sequence)
+        rounds_to_process = self._resolve_rounds_to_process(target_rounds)
+        if print_progress and target_rounds is not None:
+            print(f" -> DEBUG: Only processing user-selected rounds: {rounds_to_process}")
+        final_queue = self._ordered_round_queue(rounds_to_process)
+        if print_progress:
+            print(f" -> Pipeline Split: {len(seq_calibration)} Calibration steps + {len(seq_extraction)} Extraction steps")
+
+        worker_count = self._native_volume_worker_count(sequence)
+        plan = self._build_native_preprocessing_plan(
+            fov_id=fov_id,
+            loader=loader,
+            calibration_steps=seq_calibration,
+            extraction_steps=seq_extraction,
+            final_queue=final_queue,
+            output_writer=output_writer,
+            worker_count=worker_count,
+        )
+        if worker_count == 1:
+            run_results = self._run_native_volume_serial(
+                plan=plan,
+                loader=loader,
+                output_writer=output_writer,
+                print_progress=print_progress,
+            )
+        else:
+            run_results = self._run_native_volume_parallel(
+                plan=plan,
+                loader=loader,
+                output_writer=output_writer,
+                print_progress=print_progress,
+            )
+
+        ordered_results = sorted(run_results, key=lambda result: result.work_item.order_index)
+        output_files = [str(result.output_path) for result in ordered_results]
+        volume_records = [result.volume_record for result in ordered_results]
+
+        return {
+            "rounds_to_process": rounds_to_process,
+            "round_order": final_queue,
+            "calibration_steps": seq_calibration,
+            "extraction_steps": seq_extraction,
+            "output_files": output_files,
+            "preprocessing_timing": _build_native_preprocessing_timing_payload(
+                fov_id=fov_id,
+                round_order=final_queue,
+                volumes=volume_records,
+                segment_index=segment_index,
+            ),
+        }
+
     def _run_native_sequence_segment(
         self,
         fov_id: int,
@@ -543,40 +1487,16 @@ class DataSanitizer:
             raise ValueError("Native preprocessing segment cannot be empty")
 
         loader = self._make_loader(input_root, input_filename_pattern)
-        seq_calibration, seq_extraction = self._split_sequence(full_seq)
-        rounds_to_process = self._resolve_rounds_to_process(target_rounds)
-        final_queue = self._ordered_round_queue(rounds_to_process)
-        inter_round_ref_cache = {}
         started_at = self._utc_now()
         start_time = time.perf_counter()
-        output_files: list[str] = []
-
-        for r_id in final_queue:
-            intra_round_ref_img = None
-            roles = self.cfg.dataset.channel_roles
-            channels_in_round = self.cfg.dataset.round_structure[r_id]
-            seq_channels = sorted([c for c in channels_in_round if roles.get(c) == 'seq'])
-
-            for c_id in seq_channels:
-                path = loader._get_path(fov_id, r_id, c_id)
-                raw_vol = loader._lazy_load_tiff(path).compute()
-                ctx = {
-                    'ref_round_image': inter_round_ref_cache.get(c_id),
-                    'ref_channel_image': intra_round_ref_img,
-                }
-
-                img_calibrated = self._run_pipeline(raw_vol, seq_calibration, ctx)
-
-                if r_id == 1:
-                    inter_round_ref_cache[c_id] = img_calibrated.copy()
-
-                if intra_round_ref_img is None:
-                    intra_round_ref_img = img_calibrated.copy()
-
-                final_vol = self._run_pipeline(img_calibrated, seq_extraction, ctx)
-                final_u8 = img_as_ubyte(np.clip(final_vol, 0, 1))
-                output_path = self._save_stage_clean(final_u8, output_root, fov_id, r_id, c_id)
-                output_files.append(str(output_path))
+        native_result = self._run_native_preprocessing_kernel(
+            fov_id=fov_id,
+            loader=loader,
+            sequence=full_seq,
+            target_rounds=target_rounds,
+            output_writer=self._make_stage_output_writer(output_root, fov_id),
+            segment_index=segment_index,
+        )
 
         finished_at = self._utc_now()
         duration_ms = round((time.perf_counter() - start_time) * 1000.0, 3)
@@ -589,12 +1509,12 @@ class DataSanitizer:
             "input_contract": {
                 "raw_data_path": str(input_root),
                 "filename_pattern": input_filename_pattern,
-                "rounds_processed": final_queue,
+                "rounds_processed": native_result["round_order"],
                 "target_rounds": list(target_rounds) if target_rounds is not None else None,
             },
             "pipeline_split": {
-                "calibration_steps": [step.method for step in seq_calibration],
-                "extraction_steps": [step.method for step in seq_extraction],
+                "calibration_steps": [step.method for step in native_result["calibration_steps"]],
+                "extraction_steps": [step.method for step in native_result["extraction_steps"]],
             },
             "raw_sequence": [
                 {
@@ -605,7 +1525,8 @@ class DataSanitizer:
                 }
                 for index, step in enumerate(full_seq)
             ],
-            "output_files": output_files,
+            "output_files": native_result["output_files"],
+            "preprocessing_timing": native_result["preprocessing_timing"],
         }
 
     def _split_sequence(
@@ -644,25 +1565,7 @@ class DataSanitizer:
         can either feed it into additional atoms or convert it to the canonical
         clean TIFF dtype at the persistence boundary.
         """
-        # 1. 确保 Float32
-        if img_vol.dtype != np.float32:
-            # 假设输入是 uint8/16，归一化到 0-1
-            max_val = 255.0 if img_vol.dtype == np.uint8 else 65535.0
-            # 简单的防御性检查，有些 TIFF 读进来已经是 float 但数值很大
-            if np.issubdtype(img_vol.dtype, np.floating) and img_vol.max() > 1.0:
-                current_data = img_vol
-            else:
-                current_data = img_vol.astype(np.float32) / max_val
-        else:
-            current_data = img_vol
-
-        # 2. 执行
-        for step in pipeline_seq:
-            func = PROCESSOR_MAP.get(step.method)
-            if func:
-                current_data = func(current_data, step.params, context)
-            # else: warning handled in upper logic or crash
-        
+        current_data, _step_timings = self._run_pipeline_with_timing(img_vol, pipeline_seq, context)
         return current_data
 
     def _native_sanitize_fov(
@@ -696,46 +1599,16 @@ class DataSanitizer:
                 "output_files": [],
             }
 
-        seq_calibration, seq_extraction = self._split_sequence(full_seq)
-        rounds_to_process = self._resolve_rounds_to_process(target_rounds)
-        if target_rounds is not None:
-            print(f" -> DEBUG: Only processing user-selected rounds: {rounds_to_process}")
-        final_queue = self._ordered_round_queue(rounds_to_process)
-
-        print(f" -> Pipeline Split: {len(seq_calibration)} Calibration steps + {len(seq_extraction)} Extraction steps")
-
-        inter_round_ref_cache = {}
         started_at = self._utc_now()
         start_time = time.perf_counter()
-        output_files: list[str] = []
-
-        for r_id in final_queue:
-            print(f" -> Processing Round {r_id}...")
-            intra_round_ref_img = None
-            roles = self.cfg.dataset.channel_roles
-            channels_in_round = self.cfg.dataset.round_structure[r_id]
-            seq_channels = sorted([c for c in channels_in_round if roles.get(c) == 'seq'])
-
-            for c_id in seq_channels:
-                path = self.loader._get_path(fov_id, r_id, c_id)
-                raw_vol = self.loader._lazy_load_tiff(path).compute()
-                ctx = {
-                    'ref_round_image': inter_round_ref_cache.get(c_id),
-                    'ref_channel_image': intra_round_ref_img,
-                }
-
-                img_calibrated = self._run_pipeline(raw_vol, seq_calibration, ctx)
-
-                if r_id == 1:
-                    inter_round_ref_cache[c_id] = img_calibrated.copy()
-
-                if intra_round_ref_img is None:
-                    intra_round_ref_img = img_calibrated.copy()
-
-                final_vol = self._run_pipeline(img_calibrated, seq_extraction, ctx)
-                final_u8 = img_as_ubyte(np.clip(final_vol, 0, 1))
-                output_path = self._save_clean(final_u8, fov_id, r_id, c_id)
-                output_files.append(str(output_path))
+        native_result = self._run_native_preprocessing_kernel(
+            fov_id=fov_id,
+            loader=self.loader,
+            sequence=full_seq,
+            target_rounds=target_rounds,
+            output_writer=self._make_canonical_output_writer(fov_id),
+            print_progress=True,
+        )
 
         finished_at = self._utc_now()
         duration_ms = round((time.perf_counter() - start_time) * 1000.0, 3)
@@ -744,11 +1617,12 @@ class DataSanitizer:
             started_at=started_at,
             finished_at=finished_at,
             duration_ms=duration_ms,
-            rounds_processed=final_queue,
-            calibration_steps=seq_calibration,
-            extraction_steps=seq_extraction,
-            output_files=output_files,
+            rounds_processed=native_result["round_order"],
+            calibration_steps=native_result["calibration_steps"],
+            extraction_steps=native_result["extraction_steps"],
+            output_files=native_result["output_files"],
             target_rounds=target_rounds,
+            preprocessing_timing=native_result["preprocessing_timing"],
         )
 
     def _provider_dispatch_sanitize_fov(
@@ -793,7 +1667,10 @@ class DataSanitizer:
                     )
                 elif provider == "matlab":
                     if self._matlab_backend is None:
-                        self._matlab_backend = MATLABPreprocessingBackend(self.cfg)
+                        self._matlab_backend = MATLABPreprocessingBackend(
+                            self.cfg,
+                            matlab_session_owner=self._matlab_session_owner,
+                        )
                     matlab_output_root = Path(tmpdir) / f"segment_{segment_index}_{provider}_flat"
                     segment_record = self._matlab_backend.execute_sequence(
                         fov_id,

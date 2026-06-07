@@ -11,7 +11,6 @@ call, and failures are raised rather than hidden behind a native fallback.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from pathlib import Path
@@ -20,16 +19,29 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 import numpy as np
 import pandas as pd
-import tifffile
 
+from ._artifact_schemas import SpotTableSchema, validate_spot_table, wrap_table_read_error
 from .infrastructure import ExperimentConfig
 from .matlab_engine_bootstrap import (
     MATLABSessionCapsule,
+    MatlabSharedSessionOwner,
     create_matlab_boundary_trace,
     finalize_matlab_boundary_trace,
     load_matlab_engine_factory,
     record_matlab_boundary_phase,
     snapshot_matlab_session_lifecycle,
+)
+from .matlab_runtime import (
+    collect_runtime_file_records as _collect_runtime_file_records_from_manifest,
+    format_exception_message as _format_exception_message,
+    load_validated_runtime_manifest,
+    resolve_repo_runtime_path,
+    resolve_staged_output_path,
+    trusted_matlab_runtime_root,
+    validate_expected_3d_staged_volume_shape,
+    validate_configured_entrypoint_contract,
+    validate_runtime_step_metadata,
+    write_staged_3d_volume_tiff,
 )
 
 
@@ -38,111 +50,36 @@ MATLAB_SPOTFINDING_REQUIRED_COLUMNS = ("z", "y", "x", "intensity")
 MATLAB_SPOTFINDING_PACKAGE_NAME = "pystar_spotfinding"
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def _trusted_matlab_runtime_root() -> Path:
-    return (_repo_root() / "matlab_runtime").resolve()
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return f"sha256:{digest.hexdigest()}"
-
-
-def _format_exception_message(prefix: str, exc: Exception) -> str:
-    detail = str(exc).strip()
-    if detail:
-        return f"{prefix}: {detail}"
-    return f"{prefix} ({exc.__class__.__name__})"
-
-
 def resolve_matlab_spotfinding_runtime_path(config: ExperimentConfig) -> Path:
     """Resolve and validate the repo-local MATLAB spot-finding runtime path."""
 
-    runtime_path = config.providers.matlab.spot_finding.runtime_path
-    if not runtime_path.is_absolute():
-        runtime_path = _repo_root() / runtime_path
-    resolved_runtime_path = runtime_path.resolve()
-    trusted_root = _trusted_matlab_runtime_root()
-    try:
-        resolved_runtime_path.relative_to(trusted_root)
-    except ValueError as exc:
-        raise ValueError(
-            "providers.matlab.spot_finding.runtime_path must resolve inside the repo-local "
-            f"'{trusted_root}' runtime root; got {resolved_runtime_path}"
-        ) from exc
-    return resolved_runtime_path
+    return resolve_repo_runtime_path(
+        config.providers.matlab.spot_finding.runtime_path,
+        config_label="providers.matlab.spot_finding.runtime_path",
+        trusted_root=trusted_matlab_runtime_root(),
+    )
 
 
 def load_matlab_spotfinding_runtime_manifest(runtime_dir: Path) -> Dict[str, Any]:
     """Load the MATLAB spot-finding runtime manifest and validate its schema."""
 
-    manifest_path = runtime_dir / MATLAB_SPOTFINDING_RUNTIME_MANIFEST_NAME
-    if not manifest_path.exists():
-        raise FileNotFoundError(
-            f"MATLAB spot-finding runtime manifest is missing: {manifest_path}. "
-            "Expected repo-local manifest for MATLAB spot-finding provider."
-        )
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError(f"MATLAB spot-finding runtime manifest must be a JSON object: {manifest_path}")
-
-    required_files = manifest.get("required_files")
-    optional_files = manifest.get("optional_files", [])
-    entrypoint = manifest.get("entrypoint")
-    package_name = manifest.get("package_name")
-    if not isinstance(required_files, list) or not required_files:
-        raise ValueError("MATLAB spot-finding runtime manifest must declare a non-empty required_files list")
-    if not isinstance(optional_files, list):
-        raise ValueError("MATLAB spot-finding runtime manifest optional_files must be a list")
-    if not isinstance(entrypoint, str) or not entrypoint.strip():
-        raise ValueError("MATLAB spot-finding runtime manifest must declare a non-empty entrypoint")
-    if package_name != MATLAB_SPOTFINDING_PACKAGE_NAME:
-        raise ValueError(
-            "MATLAB spot-finding runtime manifest package_name mismatch: "
-            f"expected {MATLAB_SPOTFINDING_PACKAGE_NAME!r}, got {package_name!r}"
-        )
-
-    for bucket_name, bucket in (("required_files", required_files), ("optional_files", optional_files)):
-        for item in bucket:
-            if not isinstance(item, dict):
-                raise ValueError(f"MATLAB spot-finding runtime manifest {bucket_name} entries must be JSON objects")
-            for key in ("name", "source_path", "role"):
-                value = item.get(key)
-                if not isinstance(value, str) or not value.strip():
-                    raise ValueError(
-                        f"MATLAB spot-finding runtime manifest entry in {bucket_name} is missing non-empty '{key}'"
-                    )
-
+    manifest = load_validated_runtime_manifest(
+        runtime_dir,
+        manifest_label="MATLAB spot-finding runtime manifest",
+        missing_hint="Expected repo-local manifest for MATLAB spot-finding provider.",
+        package_name=MATLAB_SPOTFINDING_PACKAGE_NAME,
+        manifest_name=MATLAB_SPOTFINDING_RUNTIME_MANIFEST_NAME,
+    )
     return manifest
 
 
 def _validate_runtime_entrypoint_contract(runtime_manifest: Mapping[str, Any], configured_entrypoint: str) -> None:
-    manifest_entrypoint = runtime_manifest.get("entrypoint")
-    if configured_entrypoint != manifest_entrypoint:
-        raise ValueError(
-            "providers.matlab.spot_finding.entrypoint must match the repo-local MATLAB runtime manifest. "
-            f"Config entrypoint={configured_entrypoint!r}, manifest entrypoint={manifest_entrypoint!r}"
-        )
-
-    declared_filenames = {
-        item["name"]
-        for bucket_name in ("required_files", "optional_files")
-        for item in runtime_manifest.get(bucket_name, [])
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
-    expected_entrypoint_file = f"{configured_entrypoint}.m"
-    if expected_entrypoint_file not in declared_filenames:
-        raise ValueError(
-            "MATLAB spot-finding runtime manifest must declare the configured entrypoint file. "
-            f"Missing {expected_entrypoint_file!r} in runtime manifest"
-        )
+    validate_configured_entrypoint_contract(
+        runtime_manifest,
+        configured_entrypoint,
+        config_label="providers.matlab.spot_finding.entrypoint",
+        manifest_label="MATLAB spot-finding runtime manifest",
+    )
 
 
 def build_matlab_spotfinding_plan(
@@ -186,8 +123,15 @@ def _load_matlab_engine_factory() -> Callable[[], Any]:
     return factory
 
 
-def _normalize_spot_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_spot_dataframe(
+    df: pd.DataFrame,
+    *,
+    fov_id: int,
+    path: Path | str | None,
+) -> pd.DataFrame:
     """Normalize MATLAB spot CSV columns to PyStar's `z, y, x, intensity` schema."""
+
+    expected = SpotTableSchema().expected_description()
 
     if all(column in df.columns for column in MATLAB_SPOTFINDING_REQUIRED_COLUMNS):
         normalized = df.loc[:, list(MATLAB_SPOTFINDING_REQUIRED_COLUMNS)].copy()
@@ -195,23 +139,22 @@ def _normalize_spot_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         normalized = df.loc[:, ["z", "y", "x", "intensity"]].copy()
     else:
         raise ValueError(
-            "MATLAB spot-finding output must contain either [z, y, x, intensity] or [x, y, z, intensity] columns"
+            f"FOV {fov_id} spot table schema error during matlab spot normalization at {path}: "
+            "missing required columns for MATLAB spot output; expected either [z, y, x, intensity] "
+            f"or [x, y, z, intensity]. Expected schema: {expected}"
         )
 
-    for column in MATLAB_SPOTFINDING_REQUIRED_COLUMNS:
-        normalized[column] = pd.to_numeric(normalized[column], errors="raise")
-
-    return normalized.astype({"z": np.float32, "y": np.float32, "x": np.float32, "intensity": np.float32})
+    validated = validate_spot_table(
+        normalized,
+        fov_id=fov_id,
+        path=path,
+        context="matlab spot normalization",
+    )
+    return validated.astype({"z": np.float32, "y": np.float32, "x": np.float32, "intensity": np.float32})
 
 
 def _write_staged_volume_tiff(volume_path: Path, volume: Any) -> None:
-    staged_volume = np.asarray(volume)
-    if staged_volume.ndim != 3:
-        raise ValueError(f"MATLAB spot-finding expects a 3D staged volume, got ndim={staged_volume.ndim}")
-
-    with tifffile.TiffWriter(volume_path) as writer:
-        for plane in staged_volume:
-            writer.write(np.asarray(plane), photometric="minisblack", metadata=None)
+    write_staged_3d_volume_tiff(volume_path, volume, owner_label="MATLAB spot-finding")
 
 
 class MATLABSpotFindingBackend:
@@ -230,9 +173,11 @@ class MATLABSpotFindingBackend:
         config: ExperimentConfig,
         *,
         engine_factory: Optional[Callable[[], Any]] = None,
+        matlab_session_owner: MatlabSharedSessionOwner | None = None,
     ) -> None:
         self.config = config
         self.engine_factory = engine_factory
+        self.matlab_session_owner = matlab_session_owner
         self.runtime_dir = resolve_matlab_spotfinding_runtime_path(config)
         self.runtime_manifest = load_matlab_spotfinding_runtime_manifest(self.runtime_dir)
         self.entrypoint = config.providers.matlab.spot_finding.entrypoint
@@ -245,6 +190,8 @@ class MATLABSpotFindingBackend:
             engine_factory_consumer="spot_finding.provider='matlab'",
             startup_failure_prefix="Failed to start MATLAB Engine for spot_finding.provider='matlab'",
             addpath_failure_prefix="Failed to add MATLAB spot-finding runtime path",
+            session_owner=matlab_session_owner,
+            runtime_file_validator=self._collect_runtime_file_records,
         )
 
     @property
@@ -277,29 +224,12 @@ class MATLABSpotFindingBackend:
         return self._session_capsule.validate_runtime_files(self._collect_runtime_file_records)
 
     def _collect_runtime_file_records(self) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        for bucket_name, required_default in (("required_files", True), ("optional_files", False)):
-            for item in self.runtime_manifest.get(bucket_name, []):
-                file_path = self.runtime_dir / item["name"]
-                is_required = bool(item.get("required", required_default))
-                is_used = is_required
-                if is_used and not file_path.exists():
-                    raise FileNotFoundError(
-                        f"Required MATLAB spot-finding runtime file is missing: {file_path}. "
-                        "MATLAB spot-finding provider cannot proceed."
-                    )
-
-                record = {
-                    "name": item["name"],
-                    "required": is_required,
-                    "used": is_used,
-                    "role": item["role"],
-                    "source_path": item["source_path"],
-                }
-                if file_path.exists():
-                    record["sha256"] = _sha256_file(file_path)
-                records.append(record)
-        return records
+        return _collect_runtime_file_records_from_manifest(
+            self.runtime_manifest,
+            self.runtime_dir,
+            missing_required_prefix="Required MATLAB spot-finding runtime file is missing",
+            missing_required_suffix="MATLAB spot-finding provider cannot proceed.",
+        )
 
     def _normalize_input_volume(self, volume: Any) -> Any:
         if volume.ndim != 3:
@@ -352,44 +282,25 @@ class MATLABSpotFindingBackend:
                 f"MATLAB spot-finding metadata channel_id mismatch: expected {channel_id}, got {metadata_channel_id!r}"
             )
 
-        volume_shape = metadata.get("volume_shape_zyx")
-        if not isinstance(volume_shape, list) or [int(v) for v in volume_shape] != [int(v) for v in expected_shape_zyx]:
-            raise ValueError(
-                "MATLAB spot-finding metadata volume_shape_zyx mismatch: "
-                f"expected {list(expected_shape_zyx)}, got {volume_shape!r}"
-            )
+        validate_expected_3d_staged_volume_shape(
+            metadata.get("volume_shape_zyx"),
+            expected_shape_zyx=expected_shape_zyx,
+            mismatch_prefix="MATLAB spot-finding metadata volume_shape_zyx mismatch",
+        )
 
-        output_path_value = metadata.get("output_path")
-        if not isinstance(output_path_value, str) or not output_path_value.strip():
-            raise ValueError("MATLAB spot-finding metadata must declare a non-empty output_path")
-        output_path = Path(output_path_value)
-        if not output_path.is_absolute():
-            output_path = tmpdir_path / output_path
-        output_path = output_path.resolve()
-        if output_path.parent != tmpdir_path.resolve():
-            raise ValueError(
-                "MATLAB spot-finding output must stay inside the staged temporary directory: "
-                f"{output_path}"
-            )
-        if not output_path.exists():
-            raise FileNotFoundError(
-                f"MATLAB spot-finding reported output that does not exist: {output_path}"
-            )
+        output_path = resolve_staged_output_path(
+            metadata.get("output_path"),
+            tmpdir_path=tmpdir_path,
+            missing_output_path_message="MATLAB spot-finding metadata must declare a non-empty output_path",
+            outside_tmpdir_prefix="MATLAB spot-finding output must stay inside the staged temporary directory",
+            missing_output_prefix="MATLAB spot-finding reported output that does not exist",
+        )
 
-        steps = metadata.get("steps")
-        if not isinstance(steps, list) or not steps:
-            raise ValueError("MATLAB spot-finding metadata must declare a non-empty steps list")
-        for index, step in enumerate(steps):
-            if not isinstance(step, Mapping):
-                raise ValueError(f"MATLAB spot-finding step #{index} must be a mapping")
-            name = step.get("name")
-            duration_ms = step.get("duration_ms")
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"MATLAB spot-finding step #{index} is missing a non-empty name")
-            if not isinstance(duration_ms, (int, float)) or duration_ms < 0:
-                raise ValueError(
-                    f"MATLAB spot-finding step '{name}' must report a non-negative duration_ms"
-                )
+        validate_runtime_step_metadata(
+            metadata.get("steps"),
+            missing_steps_message="MATLAB spot-finding metadata must declare a non-empty steps list",
+            step_label="MATLAB spot-finding step",
+        )
 
         return output_path
 
@@ -523,7 +434,23 @@ class MATLABSpotFindingBackend:
                 round_id=round_id,
                 channel_id=channel_id,
             )
-            spots_df = _normalize_spot_dataframe(pd.read_csv(output_path))
+            try:
+                raw_spots_df = pd.read_csv(output_path)
+            except Exception as exc:
+                raise wrap_table_read_error(
+                    exc,
+                    "MATLAB spot output",
+                    fov_id=fov_id,
+                    path=output_path,
+                    context="matlab spot normalization",
+                    expected=SpotTableSchema().expected_description(),
+                ) from exc
+
+            spots_df = _normalize_spot_dataframe(
+                raw_spots_df,
+                fov_id=fov_id,
+                path=output_path,
+            )
             record_matlab_boundary_phase(
                 boundary_trace,
                 phase_name="result_validation",

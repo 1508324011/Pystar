@@ -11,27 +11,39 @@ coordinate order and semantics match the PyStar contract.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional
 
 import numpy as np
-import tifffile
 from numpy.typing import NDArray
 from scipy.io import loadmat
 
 from .infrastructure import ExperimentConfig
 from .matlab_engine_bootstrap import (
     MATLABSessionCapsule,
+    MatlabSharedSessionOwner,
     create_matlab_boundary_trace,
     finalize_matlab_boundary_trace,
     load_matlab_engine_factory,
     record_matlab_boundary_phase,
     snapshot_matlab_session_lifecycle,
     summarize_matlab_boundary_traces,
+)
+from .matlab_runtime import (
+    collect_runtime_file_records as _collect_runtime_file_records_from_manifest,
+    format_exception_message as _format_exception_message,
+    load_validated_runtime_manifest,
+    resolve_repo_runtime_path,
+    resolve_staged_output_path,
+    trusted_matlab_runtime_root,
+    validate_manifest_declares_entrypoint_file,
+    validate_configured_entrypoint_contract,
+    validate_runtime_step_metadata,
+    write_staged_3d_volume_tiff,
+    sha256_file,
 )
 
 
@@ -158,6 +170,9 @@ def build_matlab_local_registration_plan(
     )
     plan.update(
         {
+            "provider": "matlab",
+            "method": "demons_3d",
+            "coverage_mode": plan.get("scope_mode"),
             "local_method": "demons_3d",
             "iterations": int(reg_cfg.demons_3d.num_iter),
             "accumulated_field_smoothing": float(reg_cfg.demons_3d.smoothing_sigma),
@@ -170,84 +185,42 @@ def build_matlab_local_registration_plan(
     return plan
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+def _runtime_manifest_identity(runtime_manifest_path: Path) -> Dict[str, str]:
+    """Return stable runtime manifest identity for request equivalence evidence."""
 
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return f"sha256:{digest.hexdigest()}"
-
-
-def _format_exception_message(prefix: str, exc: Exception) -> str:
-    detail = str(exc).strip()
-    if detail:
-        return f"{prefix}: {detail}"
-    return f"{prefix} ({exc.__class__.__name__})"
+    return {
+        "path": str(runtime_manifest_path),
+        "sha256": sha256_file(runtime_manifest_path),
+    }
 
 
 def resolve_matlab_registration_runtime_path(config: ExperimentConfig) -> Path:
     """Resolve the configured MATLAB registration runtime directory."""
 
-    matlab_cfg = config.providers.matlab.registration
-
-    runtime_path = matlab_cfg.runtime_path
-    if not runtime_path.is_absolute():
-        runtime_path = _repo_root() / runtime_path
-    return runtime_path.resolve()
+    return resolve_repo_runtime_path(
+        config.providers.matlab.registration.runtime_path,
+        config_label="providers.matlab.registration.runtime_path",
+        trusted_root=trusted_matlab_runtime_root(),
+    )
 
 
 def load_matlab_registration_runtime_manifest(runtime_dir: Path) -> Dict[str, Any]:
     """Load and validate the MATLAB registration runtime manifest."""
 
-    manifest_path = runtime_dir / MATLAB_REGISTRATION_RUNTIME_MANIFEST_NAME
-    if not manifest_path.exists():
-        raise FileNotFoundError(
-            f"MATLAB registration runtime manifest is missing: {manifest_path}. "
-            "Expected repo-local manifest for matlab_extracted registration backend."
-        )
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError(f"MATLAB registration runtime manifest must be a JSON object: {manifest_path}")
-
-    required_files = manifest.get("required_files")
-    optional_files = manifest.get("optional_files", [])
-    entrypoint = manifest.get("entrypoint")
+    manifest = load_validated_runtime_manifest(
+        runtime_dir,
+        manifest_label="MATLAB registration runtime manifest",
+        missing_hint="Expected repo-local manifest for matlab_extracted registration backend.",
+        manifest_name=MATLAB_REGISTRATION_RUNTIME_MANIFEST_NAME,
+        optional_string_fields=("local_entrypoint",),
+    )
     local_entrypoint = manifest.get("local_entrypoint")
-    if not isinstance(required_files, list) or not required_files:
-        raise ValueError("MATLAB registration runtime manifest must declare a non-empty required_files list")
-    if not isinstance(optional_files, list):
-        raise ValueError("MATLAB registration runtime manifest optional_files must be a list")
-    if not isinstance(entrypoint, str) or not entrypoint.strip():
-        raise ValueError("MATLAB registration runtime manifest must declare a non-empty entrypoint")
-    if local_entrypoint is not None and (not isinstance(local_entrypoint, str) or not local_entrypoint.strip()):
-        raise ValueError("MATLAB registration runtime manifest local_entrypoint must be a non-empty string when present")
-
-    for bucket_name, bucket in (("required_files", required_files), ("optional_files", optional_files)):
-        for item in bucket:
-            if not isinstance(item, dict):
-                raise ValueError(f"MATLAB registration runtime manifest {bucket_name} entries must be JSON objects")
-            for key in ("name", "source_path", "role"):
-                value = item.get(key)
-                if not isinstance(value, str) or not value.strip():
-                    raise ValueError(
-                        f"MATLAB registration runtime manifest entry in {bucket_name} is missing non-empty '{key}'"
-                    )
-
-    declared_filenames = {
-        item["name"]
-        for bucket_name in ("required_files", "optional_files")
-        for item in manifest.get(bucket_name, [])
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
-    if local_entrypoint is not None and f"{local_entrypoint}.m" not in declared_filenames:
-        raise ValueError(
-            "MATLAB registration runtime manifest must declare the configured local_entrypoint file. "
-            f"Missing {local_entrypoint!r}.m in runtime manifest"
+    if local_entrypoint is not None:
+        validate_manifest_declares_entrypoint_file(
+            manifest,
+            str(local_entrypoint),
+            manifest_label="MATLAB registration runtime manifest",
+            expectation_label="configured local_entrypoint file",
         )
 
     return manifest
@@ -257,25 +230,12 @@ def _validate_runtime_entrypoint_contract(
     runtime_manifest: Mapping[str, Any],
     configured_entrypoint: str,
 ) -> None:
-    manifest_entrypoint = runtime_manifest.get("entrypoint")
-    if configured_entrypoint != manifest_entrypoint:
-        raise ValueError(
-            "providers.matlab.registration.entrypoint must match the repo-local MATLAB runtime manifest. "
-            f"Config entrypoint={configured_entrypoint!r}, manifest entrypoint={manifest_entrypoint!r}"
-        )
-
-    declared_filenames = {
-        item["name"]
-        for bucket_name in ("required_files", "optional_files")
-        for item in runtime_manifest.get(bucket_name, [])
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
-    expected_entrypoint_file = f"{configured_entrypoint}.m"
-    if expected_entrypoint_file not in declared_filenames:
-        raise ValueError(
-            "MATLAB registration runtime manifest must declare the configured entrypoint file. "
-            f"Missing {expected_entrypoint_file!r} in runtime manifest"
-        )
+    validate_configured_entrypoint_contract(
+        runtime_manifest,
+        configured_entrypoint,
+        config_label="providers.matlab.registration.entrypoint",
+        manifest_label="MATLAB registration runtime manifest",
+    )
 
 
 def _load_matlab_engine_factory() -> Callable[[], Any]:
@@ -286,13 +246,7 @@ def _load_matlab_engine_factory() -> Callable[[], Any]:
 
 
 def _write_staged_volume_tiff(volume_path: Path, volume: Any) -> None:
-    staged_volume = np.asarray(volume)
-    if staged_volume.ndim != 3:
-        raise ValueError(f"MATLAB registration expects a 3D staged volume, got ndim={staged_volume.ndim}")
-
-    with tifffile.TiffWriter(volume_path) as writer:
-        for plane in staged_volume:
-            writer.write(np.asarray(plane), photometric="minisblack", metadata=None)
+    write_staged_3d_volume_tiff(volume_path, volume, owner_label="MATLAB registration")
 
 
 class MATLABRegistrationBackend:
@@ -310,9 +264,11 @@ class MATLABRegistrationBackend:
         config: ExperimentConfig,
         *,
         engine_factory: Optional[Callable[[], Any]] = None,
+        matlab_session_owner: MatlabSharedSessionOwner | None = None,
     ) -> None:
         self.config = config
         self.engine_factory = engine_factory
+        self.matlab_session_owner = matlab_session_owner
         self.runtime_dir = resolve_matlab_registration_runtime_path(config)
         self.runtime_manifest = load_matlab_registration_runtime_manifest(self.runtime_dir)
         self.entrypoint = config.providers.matlab.registration.entrypoint
@@ -336,6 +292,8 @@ class MATLABRegistrationBackend:
             engine_factory_consumer="registration global/local provider='matlab'",
             startup_failure_prefix="Failed to start MATLAB Engine for registration provider='matlab'",
             addpath_failure_prefix="Failed to add MATLAB registration runtime path",
+            session_owner=matlab_session_owner,
+            runtime_file_validator=self._collect_runtime_file_records,
         )
 
     @property
@@ -374,30 +332,12 @@ class MATLABRegistrationBackend:
         return self._collect_runtime_file_records()
 
     def _collect_runtime_file_records(self) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        for bucket_name, required_default in (("required_files", True), ("optional_files", False)):
-            for item in self.runtime_manifest.get(bucket_name, []):
-                file_path = self.runtime_dir / item["name"]
-                is_required = bool(item.get("required", required_default))
-                is_used = is_required
-                if is_used and not file_path.exists():
-                    raise FileNotFoundError(
-                        f"Required MATLAB registration runtime file is missing: {file_path}. "
-                        "matlab_extracted registration cannot proceed."
-                    )
-
-                record = {
-                    "name": item["name"],
-                    "required": is_required,
-                    "used": is_used,
-                    "role": item["role"],
-                    "source_path": item["source_path"],
-                }
-                if file_path.exists():
-                    record["sha256"] = _sha256_file(file_path)
-                records.append(record)
-
-        return records
+        return _collect_runtime_file_records_from_manifest(
+            self.runtime_manifest,
+            self.runtime_dir,
+            missing_required_prefix="Required MATLAB registration runtime file is missing",
+            missing_required_suffix="matlab_extracted registration cannot proceed.",
+        )
 
     def _normalize_input_volume(self, volume: NDArray[Any]) -> NDArray[Any]:
         if volume.ndim != 3:
@@ -465,20 +405,11 @@ class MATLABRegistrationBackend:
                 f"expected {reference_round}, got {metadata_reference_round!r}"
             )
 
-        steps = metadata.get("steps")
-        if not isinstance(steps, list) or not steps:
-            raise ValueError("MATLAB registration metadata must declare a non-empty steps list")
-        for index, step in enumerate(steps):
-            if not isinstance(step, Mapping):
-                raise ValueError(f"MATLAB registration step #{index} must be a mapping")
-            name = step.get("name")
-            duration_ms = step.get("duration_ms")
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"MATLAB registration step #{index} is missing a non-empty name")
-            if not isinstance(duration_ms, (int, float)) or duration_ms < 0:
-                raise ValueError(
-                    f"MATLAB registration step '{name}' must report a non-negative duration_ms"
-                )
+        validate_runtime_step_metadata(
+            metadata.get("steps"),
+            missing_steps_message="MATLAB registration metadata must declare a non-empty steps list",
+            step_label="MATLAB registration step",
+        )
 
     def _validate_local_response_metadata(
         self,
@@ -568,37 +499,19 @@ class MATLABRegistrationBackend:
                 f"expected {expected_shape_yxz_component}, got {normalized_shape}"
             )
 
-        flow_output_path_value = metadata.get("flow_output_path")
-        if not isinstance(flow_output_path_value, str) or not flow_output_path_value.strip():
-            raise ValueError("MATLAB local-registration metadata must declare a non-empty flow_output_path")
-        flow_output_path = Path(flow_output_path_value)
-        if not flow_output_path.is_absolute():
-            flow_output_path = tmpdir_path / flow_output_path
-        flow_output_path = flow_output_path.resolve()
-        if flow_output_path.parent != tmpdir_path.resolve():
-            raise ValueError(
-                "MATLAB local-registration flow output must stay inside the staged temporary directory: "
-                f"{flow_output_path}"
-            )
-        if not flow_output_path.exists():
-            raise FileNotFoundError(
-                f"MATLAB local-registration reported flow output that does not exist: {flow_output_path}"
-            )
+        flow_output_path = resolve_staged_output_path(
+            metadata.get("flow_output_path"),
+            tmpdir_path=tmpdir_path,
+            missing_output_path_message="MATLAB local-registration metadata must declare a non-empty flow_output_path",
+            outside_tmpdir_prefix="MATLAB local-registration flow output must stay inside the staged temporary directory",
+            missing_output_prefix="MATLAB local-registration reported flow output that does not exist",
+        )
 
-        steps = metadata.get("steps")
-        if not isinstance(steps, list) or not steps:
-            raise ValueError("MATLAB local-registration metadata must declare a non-empty steps list")
-        for index, step in enumerate(steps):
-            if not isinstance(step, Mapping):
-                raise ValueError(f"MATLAB local-registration step #{index} must be a mapping")
-            name = step.get("name")
-            duration_ms = step.get("duration_ms")
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"MATLAB local-registration step #{index} is missing a non-empty name")
-            if not isinstance(duration_ms, (int, float)) or duration_ms < 0:
-                raise ValueError(
-                    f"MATLAB local-registration step '{name}' must report a non-negative duration_ms"
-                )
+        validate_runtime_step_metadata(
+            metadata.get("steps"),
+            missing_steps_message="MATLAB local-registration metadata must declare a non-empty steps list",
+            step_label="MATLAB local-registration step",
+        )
 
         return flow_output_path
 
@@ -622,7 +535,7 @@ class MATLABRegistrationBackend:
         round_id: int,
     ) -> NDArray[np.float32]:
         flow_variable = str(metadata["flow_variable"])
-        mat_payload = loadmat(flow_output_path)
+        mat_payload = loadmat(flow_output_path, variable_names=[flow_variable])
         if flow_variable not in mat_payload:
             raise ValueError(
                 f"MATLAB local-registration output is missing variable {flow_variable!r}: {flow_output_path}"
@@ -916,18 +829,33 @@ class MATLABRegistrationBackend:
 
         ref_volume = self._normalize_input_volume(reference_volume)
         mov_volume = self._normalize_input_volume(moving_volume)
+        reference_volume_shape_zyx = [int(value) for value in ref_volume.shape]
+        moving_volume_shape_zyx = [int(value) for value in mov_volume.shape]
         request_payload = build_matlab_local_registration_plan(
             self.config,
             fov_id=fov_id,
             round_id=round_id,
             reference_round=reference_round,
             scope_descriptor=scope_descriptor,
-            volume_shape_zyx=(int(ref_volume.shape[0]), int(ref_volume.shape[1]), int(ref_volume.shape[2])),
+            volume_shape_zyx=(
+                int(reference_volume_shape_zyx[0]),
+                int(reference_volume_shape_zyx[1]),
+                int(reference_volume_shape_zyx[2]),
+            ),
             compute_tile=compute_tile,
         )
+        request_payload["reference_volume_shape_zyx"] = reference_volume_shape_zyx
+        request_payload["moving_volume_shape_zyx"] = moving_volume_shape_zyx
 
         runtime_validation_started = time.perf_counter()
         runtime_files, runtime_validation_details = self._resolve_runtime_file_records()
+        runtime_manifest_path = self.runtime_dir / MATLAB_REGISTRATION_RUNTIME_MANIFEST_NAME
+        request_payload["runtime"] = {
+            "runtime_path": str(self.runtime_dir),
+            "runtime_manifest": str(runtime_manifest_path),
+            "runtime_manifest_sha256": _runtime_manifest_identity(runtime_manifest_path)["sha256"],
+            "entrypoint": self.local_entrypoint,
+        }
         record_matlab_boundary_phase(
             boundary_trace,
             phase_name="runtime_file_validation",
@@ -1029,11 +957,6 @@ class MATLABRegistrationBackend:
                 tmpdir_path=tmpdir_path,
                 expected_shape_zyx=(int(ref_volume.shape[0]), int(ref_volume.shape[1]), int(ref_volume.shape[2])),
             )
-            flow_3d = self._load_local_flow_zyx(
-                validated_flow_output_path,
-                metadata,
-                round_id=round_id,
-            )
             record_matlab_boundary_phase(
                 boundary_trace,
                 phase_name="result_validation",
@@ -1041,8 +964,20 @@ class MATLABRegistrationBackend:
                 seam_cost_key="result_validation_ms",
                 details={
                     "reported_step_count": len(metadata.get("steps", [])) if isinstance(metadata.get("steps"), list) else 0,
-                    "flow_shape": [int(value) for value in flow_3d.shape],
+                    "validated_flow_output_name": validated_flow_output_path.name,
                 },
+            )
+            mat_output_load_started = time.perf_counter()
+            flow_3d = self._load_local_flow_zyx(
+                validated_flow_output_path,
+                metadata,
+                round_id=round_id,
+            )
+            record_matlab_boundary_phase(
+                boundary_trace,
+                phase_name="mat_output_load",
+                duration_ms=round((time.perf_counter() - mat_output_load_started) * 1000.0, 3),
+                details={"flow_shape": [int(value) for value in flow_3d.shape]},
             )
 
         finalized_boundary_trace = finalize_matlab_boundary_trace(

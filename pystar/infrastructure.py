@@ -1,5 +1,7 @@
 import hashlib
+import re
 import yaml
+from numbers import Integral
 from pathlib import Path
 from typing import List, Dict, Union, Any, Optional, Literal, Tuple
 from pydantic import BaseModel, model_validator, Field, ValidationError, ConfigDict
@@ -221,6 +223,29 @@ class PreprocessingConfig(BaseModel):
     # 这里是关键：我们强制要求 sequence 是一个 PreprocessingStep 的列表
     # Pydantic 会自动遍历列表，验证每一项都符合结构
     sequence: List[PreprocessingStep] = Field(default_factory=list)
+
+    # Native provider FOV-volume scheduler.  The default keeps the historical
+    # serial round/channel loop.  Values greater than one opt into bounded
+    # reference-aware parallel execution for volumes whose calibration
+    # references have already been materialized.
+    native_volume_workers: int = 1
+
+    @model_validator(mode='before')
+    @classmethod
+    def reject_invalid_native_volume_workers(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            raw_workers = data.get("native_volume_workers", 1)
+            if isinstance(raw_workers, bool) or not isinstance(raw_workers, Integral):
+                raise ValueError(
+                    "pipeline.preprocessing.native_volume_workers must be a positive integer"
+                )
+        return data
+
+    @model_validator(mode='after')
+    def validate_native_volume_workers(self) -> 'PreprocessingConfig':
+        if isinstance(self.native_volume_workers, bool) or int(self.native_volume_workers) <= 0:
+            raise ValueError("pipeline.preprocessing.native_volume_workers must be a positive integer")
+        return self
     
     model_config = ConfigDict(frozen=True)
 
@@ -349,6 +374,43 @@ class MatlabExtractionProviderConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra='forbid')
 
 
+class MatlabSharedSessionConfig(BaseModel):
+    """Optional named MATLAB Engine session sharing policy.
+
+    The shared-session feature is opt-in so existing configs keep the historical
+    per-backend MATLAB Engine lifecycle.  When enabled, the batch runner creates
+    one explicit owner with a deterministic name and MATLAB-capable stages borrow
+    that owner instead of independently cold-starting sessions.
+    """
+
+    enabled: bool = False
+    name: Optional[str] = None
+    lifetime: Literal["run", "fov"] = "run"
+    health_check_timeout_s: float = Field(default=30.0, gt=0)
+
+    @model_validator(mode='after')
+    def validate_session_name(self) -> 'MatlabSharedSessionConfig':
+        if self.name is None:
+            return self
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("providers.matlab.shared_session.name must be a non-empty string when provided")
+        name = self.name.strip()
+        if len(name) > 63:
+            raise ValueError(
+                "providers.matlab.shared_session.name must be at most 63 characters for MATLAB "
+                "namelengthmax/shareEngine compatibility"
+            )
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name):
+            raise ValueError(
+                "providers.matlab.shared_session.name must contain only ASCII letters, digits, and underscores, "
+                "and must start with a letter"
+            )
+        object.__setattr__(self, "name", name)
+        return self
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+
 class MatlabProviderConfig(BaseModel):
     """Top-level switch and runtime sections for all MATLAB provider seams.
 
@@ -359,6 +421,7 @@ class MatlabProviderConfig(BaseModel):
     """
 
     enabled: bool = True
+    shared_session: MatlabSharedSessionConfig = Field(default_factory=MatlabSharedSessionConfig)
     preprocessing: MatlabPreprocessingProviderConfig = Field(default_factory=MatlabPreprocessingProviderConfig)
     registration: MatlabRegistrationProviderConfig = Field(default_factory=MatlabRegistrationProviderConfig)
     spot_finding: MatlabSpotFindingProviderConfig = Field(default_factory=MatlabSpotFindingProviderConfig)
@@ -603,6 +666,35 @@ class RegistrationGuardsConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra='forbid')
 
+
+class MatlabLocalParallelConfig(BaseModel):
+    """Opt-in process-level execution for MATLAB local demons tiles.
+
+    This does not change demons parameters or tiling geometry.  It only controls
+    whether already-independent MATLAB local demons tile jobs may be scheduled in
+    separate worker processes.
+    """
+
+    enabled: bool = False
+    workers: int = 2
+    strict_equivalence_audit: bool = True
+
+    @model_validator(mode='before')
+    @classmethod
+    def reject_bool_worker_values(cls, data: Any) -> Any:
+        if isinstance(data, dict) and isinstance(data.get("workers"), bool):
+            raise ValueError("registration.matlab_local_parallel.workers must be an integer, not a boolean")
+        return data
+
+    @model_validator(mode='after')
+    def validate_parallel_workers(self) -> 'MatlabLocalParallelConfig':
+        if self.enabled and (isinstance(self.workers, bool) or int(self.workers) <= 0):
+            raise ValueError("registration.matlab_local_parallel.workers must be a positive integer when enabled")
+        return self
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+
 class RegistrationConfig(BaseModel):
     """Full registration configuration used by `RegistrationEngine`.
 
@@ -618,6 +710,7 @@ class RegistrationConfig(BaseModel):
     global_stage: GlobalRegistrationStageConfig = Field(default_factory=GlobalRegistrationStageConfig, alias="global")
     local: LocalRegistrationStageConfig = Field(default_factory=LocalRegistrationStageConfig)
     guards: RegistrationGuardsConfig = Field(default_factory=RegistrationGuardsConfig)
+    matlab_local_parallel: MatlabLocalParallelConfig = Field(default_factory=MatlabLocalParallelConfig)
 
     # 位移场语义：registration producer 对外声明当前 field 的表示/组合方式
     field_semantics: FieldSemanticsConfig = Field(default_factory=FieldSemanticsConfig)
@@ -688,6 +781,21 @@ class RegistrationConfig(BaseModel):
     def align_guard_defaults(self) -> 'RegistrationConfig':
         if self.min_correlation != self.guards.skip_if_global_corr_below:
             self.min_correlation = self.guards.skip_if_global_corr_below
+        if self.matlab_local_parallel.enabled:
+            if not self.local.enabled:
+                raise ValueError(
+                    "registration.matlab_local_parallel.enabled=true requires registration.local.enabled=true"
+                )
+            if self.local.provider != "matlab" or self.local.method != "demons_3d":
+                raise ValueError(
+                    "registration.matlab_local_parallel.enabled=true requires "
+                    "registration.local.provider='matlab' and registration.local.method='demons_3d'"
+                )
+            if not self.local.params.demons_3d.use_tiling:
+                raise ValueError(
+                    "registration.matlab_local_parallel.enabled=true requires "
+                    "registration.local.params.demons_3d.use_tiling=true"
+                )
         return self
 
     model_config = ConfigDict(extra='ignore', populate_by_name=True)
