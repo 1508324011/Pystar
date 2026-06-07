@@ -291,6 +291,12 @@ pipeline:
     # false 会跳过 clean image 生成；通常只用于已经有缓存 clean_data 的特殊调试。
     enable: true
 
+    # native_volume_workers 控制 native provider 在单个 FOV 内处理 eligible volume 的并行 worker 上限。
+    # 当前默认设为 4：这是 Stage33 FOV1 真实数据验证通过的 opt-in 策略，clean TIFF 输出与串行基线逐像素一致，且显著缩短 preprocessing wall time。
+    # 该参数只改变调度并行度，不改变 histogram_match 参考语义、clean TIFF 文件名或 production provenance schema。
+    # 如需最保守地复现历史串行行为，可改为 1；该值必须是正整数。
+    native_volume_workers: 4
+
     # 有序预处理流水线。程序严格按 sequence 顺序执行，每一步输出作为下一步输入。
     # 每个 step 的通用字段：
     #   method   = 预处理方法名。

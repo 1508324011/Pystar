@@ -64,9 +64,9 @@ MATLAB provider 不做静默 fallback：MATLAB runtime、MATLAB Engine、entrypo
 - `histogram_match` with `scope: intra_round`：round 内 channel 直方图匹配。
 - `morpho_reconstruction_contrast`：形态学重建增强；当前参考参数为 `radius: 6`、`downsample_factor: 0.25`。
 
-默认每步 `provider: native`，对应纯 Python 实现。`native_volume_workers` 是可选的 native FOV-volume 调度开关，省略或设为 `1` 时保持历史串行执行；设为正整数时，只有在 inter-round / intra-round 参考图已经物化后，eligible volume 才会以有界 worker 数并行处理。该开关只改变调度，不改变 `histogram_match` 语义、clean TIFF 文件名或 production provenance schema。
+默认每步 `provider: native`，对应纯 Python 实现。默认 native 示例显式设置 `native_volume_workers: 4`，这是 Stage33 FOV1 真实数据验证通过的 opt-in native FOV-volume 调度策略；如需最保守地复现历史串行行为，可改为 `1`。该值必须是正整数。只有在 inter-round / intra-round 参考图已经物化后，eligible volume 才会以有界 worker 数并行处理。该开关只改变调度，不改变 `histogram_match` 语义、clean TIFF 文件名或 production provenance schema。
 
-`native_volume_workers` 的真实数据验证计划：在声明任何端到端加速前，必须用同一验证目录、同一 config、同一 FOV / round / channel 范围分别运行基线提交 `fec32e7` 和候选提交；报告需记录 PyStar 源路径与 commit hash、验证 config、输出 artifact 路径、clean TIFF 文件 SHA/数组等价性、Stage29 histogram real-match/no-reference attribution，以及 paired wall-time/profile 对比。如果 clean 输出不等价，或只验证了不同数据面，不得宣称速度提升。
+`native_volume_workers: 4` 的证据边界：Stage33 在同一验证目录、同一 config、同一 FOV1 / rounds 1-11 / seq channels 0-2 范围下比较串行基线和 4-worker 候选，clean TIFF 数组逐像素一致（`max_abs_diff: 0`），preprocessing wall time 从约 56.25 min 缩短到约 16.59 min。该结论支持默认 native 示例启用 4-worker 策略，但不是 multi-FOV readiness 或所有硬件环境的通用性能声明；换数据集/机器时仍建议记录 paired wall-time/profile 和输出等价性。
 
 ### `pipeline.registration`
 
