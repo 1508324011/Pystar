@@ -1,4 +1,6 @@
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -18,6 +20,106 @@ from .matlab_engine_bootstrap import (
 from .matlab_spot_finding import MATLABSpotFindingBackend
 from .serialization import write_backend_metadata
 from .visualization import inspect_spots_interactive
+
+
+_SUPPORTED_SPOT_FINDING_PROVIDERS = ("native", "matlab")
+_SUPPORTED_SPOT_FINDING_ALGORITHMS = ("spotiflow", "blob_dog", "peak_local_max")
+_SPOT_FINDING_HANDLER_NAMES: dict[tuple[str, str], str] = {
+    ("native", "spotiflow"): "_run_spotiflow",
+    ("native", "blob_dog"): "_run_blob_dog",
+    ("native", "peak_local_max"): "_run_peak_local_max",
+    ("matlab", "peak_local_max"): "_run_matlab_spot_finding",
+}
+_SPOT_FINDING_FINAL_ALGORITHMS: dict[tuple[str, str], str] = {
+    ("native", "spotiflow"): "spotiflow",
+    ("native", "blob_dog"): "blob_dog",
+    ("native", "peak_local_max"): "peak_local_max",
+    ("matlab", "peak_local_max"): "matlab_peak_local_max",
+}
+_SUPPORTED_SPOT_FINDING_ROUTES = frozenset(_SPOT_FINDING_HANDLER_NAMES)
+
+
+def _expected_values(values: tuple[str, ...]) -> str:
+    return ", ".join(repr(value) for value in values)
+
+
+def _expected_spot_finding_routes() -> str:
+    return ", ".join(
+        f"provider={provider!r}, algorithm={algorithm!r}"
+        for provider, algorithm in sorted(_SUPPORTED_SPOT_FINDING_ROUTES)
+    )
+
+
+def _validate_spot_finding_string(value: object, *, field_name: str, expected: tuple[str, ...]) -> str:
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{field_name} must be a string; expected one of: {_expected_values(expected)}"
+        )
+    if value not in expected:
+        raise ValueError(
+            f"Unsupported {field_name}: {value!r}. Expected one of: {_expected_values(expected)}"
+        )
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class _SpotFindingRoute:
+    """Runtime-only spot-finding provider/algorithm decision."""
+
+    provider: str
+    algorithm: str
+    final_algorithm: str
+    handler_name: str
+
+    @property
+    def is_native(self) -> bool:
+        return self.provider == "native"
+
+    @property
+    def is_matlab(self) -> bool:
+        return self.provider == "matlab"
+
+
+def _build_spot_finding_route(*, provider_value: object, algorithm_value: object) -> _SpotFindingRoute:
+    """Build the private runtime route used by ``SpotFinder`` dispatch."""
+
+    provider = _validate_spot_finding_string(
+        provider_value,
+        field_name="spot_finding provider",
+        expected=_SUPPORTED_SPOT_FINDING_PROVIDERS,
+    )
+    algorithm = _validate_spot_finding_string(
+        algorithm_value,
+        field_name="spot_finding algorithm",
+        expected=_SUPPORTED_SPOT_FINDING_ALGORITHMS,
+    )
+    route_key = (provider, algorithm)
+    try:
+        handler_name = _SPOT_FINDING_HANDLER_NAMES[route_key]
+        final_algorithm = _SPOT_FINDING_FINAL_ALGORITHMS[route_key]
+    except KeyError as exc:
+        message = (
+            f"Unsupported spot_finding route: provider={provider!r}, algorithm={algorithm!r}. "
+            f"Supported routes: {_expected_spot_finding_routes()}"
+        )
+        raise ValueError(message) from exc
+
+    return _SpotFindingRoute(
+        provider=provider,
+        algorithm=algorithm,
+        final_algorithm=final_algorithm,
+        handler_name=handler_name,
+    )
+
+
+def _resolve_spot_finding_route(config: object) -> _SpotFindingRoute:
+    """Resolve spot-finding provider/algorithm values from an experiment config."""
+
+    spot_cfg = getattr(getattr(config, "pipeline", None), "spot_finding", None)
+    return _build_spot_finding_route(
+        provider_value=getattr(spot_cfg, "provider", None),
+        algorithm_value=getattr(spot_cfg, "algorithm", None),
+    )
 
 
 def _empty_spots_dataframe() -> pd.DataFrame:
@@ -149,15 +251,14 @@ class SpotFinder:
         # 获取所有由 'seq' 定义的通道 (通常 0,1,2,3)
         roles = self.cfg.dataset.channel_roles
         channels = sorted([c for c, role in roles.items() if role == 'seq'])
+        route = _resolve_spot_finding_route(self.cfg)
         
         print(f" [SpotFinding] Mining FOV {fov_id} using Clean Data (Ref Round {ref_round})...")
         print(f" [SpotFinding] Target Channels: {channels}")
-        print(f" [SpotFinding] Provider: {self.spot_cfg.provider}")
+        print(f" [SpotFinding] Provider: {route.provider}")
 
         all_spots_dfs = []
         backend_records: list[dict[str, Any]] = []
-        algo = self.spot_cfg.algorithm
-        final_algo = f"matlab_{algo}" if self.spot_cfg.provider == "matlab" else algo
         
         # 用于 QC 可视化的容器 (Channel -> Image)
         qc_images = {}
@@ -186,28 +287,16 @@ class SpotFinder:
             qc_images[c] = vol[z_mid].copy()
 
             # 4. 选择算法
-            if self.spot_cfg.provider == "matlab":
-                result = self._get_matlab_backend().find_spots(
-                    vol,
-                    fov_id=fov_id,
-                    round_id=ref_round,
-                    channel_id=c,
-                )
-                df_c = result["spots"].copy()
-                backend_metadata = result.get("backend_metadata")
-                if isinstance(backend_metadata, dict):
-                    backend_records.append(backend_metadata)
-            else:
-                # 运行具体算法
-                if algo == "spotiflow":
-                    df_c = self._run_spotiflow(vol)
-                elif algo == "blob_dog":
-                    df_c = self._run_blob_dog(vol)
-                elif algo == "peak_local_max":
-                    df_c = self._run_peak_local_max(vol)
-                else:
-                    raise ValueError(f"Unknown algorithm: {algo}")
-            
+            df_c, backend_metadata = self._run_spot_finding_route(
+                route,
+                vol,
+                fov_id=fov_id,
+                round_id=ref_round,
+                channel_id=c,
+            )
+            if isinstance(backend_metadata, dict):
+                backend_records.append(backend_metadata)
+
             # 5.标签注入
             df_c['channel'] = c
             all_spots_dfs.append(df_c)
@@ -226,7 +315,7 @@ class SpotFinder:
                 context="spot save",
             )
             validated_empty_df.to_csv(out_csv, index=False)
-            if self.spot_cfg.provider == "matlab" and backend_records:
+            if route.is_matlab and backend_records:
                 boundary_traces = [
                     trace
                     for record in backend_records
@@ -244,11 +333,11 @@ class SpotFinder:
                 write_backend_metadata(
                     paths["qc"] / f"spot_finding_backend_fov_{fov_id}.json",
                     {
-                        "provider": self.spot_cfg.provider,
+                        "provider": route.provider,
                         "matlab_stage_contract": get_matlab_stage_contract(self.cfg, "spot_finding"),
                         "fov_id": int(fov_id),
                         "reference_round": int(ref_round),
-                        "algorithm": final_algo,
+                        "algorithm": route.final_algorithm,
                         "channel_results": backend_records,
                         "boundary_instrumentation_summary": summarize_matlab_boundary_traces(boundary_traces) if boundary_traces else None,
                         "session_lifecycle_summary": merge_matlab_session_lifecycle_summaries(session_summaries) if session_summaries else None,
@@ -261,7 +350,7 @@ class SpotFinder:
 
         # 注入元数据
         df['fov'] = fov_id
-        df['algo'] = final_algo
+        df['algo'] = route.final_algorithm
         df = validate_spot_table(
             df,
             fov_id=fov_id,
@@ -273,7 +362,7 @@ class SpotFinder:
         out_csv = paths["spots"] / f"spots_fov_{fov_id}.csv"
         persistence_started = time.perf_counter()
         df.to_csv(out_csv, index=False)
-        if self.spot_cfg.provider == "matlab" and backend_records:
+        if route.is_matlab and backend_records:
             boundary_traces = [
                 trace
                 for record in backend_records
@@ -295,11 +384,11 @@ class SpotFinder:
             write_backend_metadata(
                 paths["qc"] / f"spot_finding_backend_fov_{fov_id}.json",
                 {
-                    "provider": self.spot_cfg.provider,
+                    "provider": route.provider,
                     "matlab_stage_contract": get_matlab_stage_contract(self.cfg, "spot_finding"),
                     "fov_id": int(fov_id),
                     "reference_round": int(ref_round),
-                    "algorithm": final_algo,
+                    "algorithm": route.final_algorithm,
                     "channel_results": backend_records,
                     "boundary_instrumentation_summary": boundary_summary,
                     "session_lifecycle_summary": merge_matlab_session_lifecycle_summaries(session_summaries) if session_summaries else None,
@@ -325,6 +414,54 @@ class SpotFinder:
                 )
         
         return df
+
+    def _run_spot_finding_route(
+        self,
+        route: _SpotFindingRoute,
+        vol_3d: NDArray[np.generic],
+        *,
+        fov_id: int,
+        round_id: int,
+        channel_id: int,
+    ) -> tuple[pd.DataFrame, Optional[dict[str, Any]]]:
+        """Run the handler selected by a validated private route."""
+
+        handler = cast(Optional[Callable[..., object]], getattr(self, route.handler_name, None))
+        if not callable(handler):
+            message = (
+                "Spot-finding route resolved to missing handler "
+                f"{route.handler_name!r} for provider={route.provider!r}, algorithm={route.algorithm!r}"
+            )
+            raise ValueError(message)
+        if route.is_matlab:
+            matlab_result = handler(
+                vol_3d,
+                fov_id=fov_id,
+                round_id=round_id,
+                channel_id=channel_id,
+            )
+            return cast(tuple[pd.DataFrame, Optional[dict[str, Any]]], matlab_result)
+
+        native_result = handler(vol_3d)
+        return cast(pd.DataFrame, native_result), None
+
+    def _run_matlab_spot_finding(
+        self,
+        vol_3d: NDArray[np.generic],
+        *,
+        fov_id: int,
+        round_id: int,
+        channel_id: int,
+    ) -> tuple[pd.DataFrame, Optional[dict[str, Any]]]:
+        """Run MATLAB-backed spot finding and normalize the backend result."""
+
+        result = self._get_matlab_backend().find_spots(
+            vol_3d,
+            fov_id=fov_id,
+            round_id=round_id,
+            channel_id=channel_id,
+        )
+        return result["spots"].copy(), result.get("backend_metadata")
 
     def _run_spotiflow(self, vol_3d):
         """Run Spotiflow on one 3D volume and normalize its coordinate table."""
