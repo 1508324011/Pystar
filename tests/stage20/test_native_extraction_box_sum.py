@@ -24,6 +24,7 @@ from pystar.extraction_utils import (
 from pystar.infrastructure import ExperimentConfig
 from pystar.io import get_fov_output_structure
 from pystar.mining import SignalMiner
+from pystar.mining import _resolve_extraction_route
 from pystar.runtime_artifacts import FieldSemantics, Flow3DSidecarDescriptor, ScopeMetadata
 import pystar.extraction_utils as extraction_utils_module
 import pystar.mining as mining_module
@@ -72,7 +73,10 @@ def _loop_oracle(img_vol: ImageArray, coords: FloatArray, box_size: tuple[int, i
     return intensities
 
 
-def _signal_miner(provider: str = 'native') -> SignalMiner:
+def _signal_miner(
+    provider: str = 'native',
+    transform_application_mode: object = 'coordinate_mapping',
+) -> SignalMiner:
     miner = SignalMiner.__new__(SignalMiner)
     field_semantics = SimpleNamespace(
         representation='residual',
@@ -92,7 +96,7 @@ def _signal_miner(provider: str = 'native') -> SignalMiner:
                 pipeline=SimpleNamespace(
                     extraction=SimpleNamespace(
                         provider=provider,
-                        transform_application_mode='coordinate_mapping',
+                        transform_application_mode=transform_application_mode,
                     ),
                     field_semantics=field_semantics,
                 )
@@ -100,6 +104,23 @@ def _signal_miner(provider: str = 'native') -> SignalMiner:
         ),
     )
     return miner
+
+
+def _route_config(provider: object, transform_application_mode: object) -> ExperimentConfig:
+    return cast(
+        ExperimentConfig,
+        cast(
+            object,
+            SimpleNamespace(
+                pipeline=SimpleNamespace(
+                    extraction=SimpleNamespace(
+                        provider=provider,
+                        transform_application_mode=transform_application_mode,
+                    )
+                )
+            ),
+        ),
+    )
 
 
 def _transform_data(*, flow_3d: FloatArray | None = None, global_shift_3d: FloatArray | None = None) -> dict[str, object]:
@@ -145,6 +166,78 @@ def _tile_local_transform_data() -> dict[str, object]:
         'tile_index': 1,
     }
     return payload
+
+
+@pytest.mark.parametrize(
+    ('provider', 'mode', 'uses_native_sampling_plan', 'operation_label'),
+    [
+        ('native', 'coordinate_mapping', True, 'coordinate_mapping extraction'),
+        ('native', 'image_warp', True, 'image_warp extraction'),
+        ('matlab', 'coordinate_mapping', False, 'coordinate_mapping extraction'),
+        ('matlab', 'image_warp', False, 'image_warp extraction'),
+    ],
+)
+def test_resolve_extraction_route_accepts_supported_provider_mode_pairs(
+    provider: str,
+    mode: str,
+    uses_native_sampling_plan: bool,
+    operation_label: str,
+) -> None:
+    route = _resolve_extraction_route(_route_config(provider, mode))
+
+    assert route.provider == provider
+    assert route.transform_application_mode == mode
+    assert route.uses_native_sampling_plan is uses_native_sampling_plan
+    assert route.operation_label == operation_label
+
+
+def test_resolve_extraction_route_rejects_unknown_provider_before_execution() -> None:
+    with pytest.raises(ValueError, match="Unsupported extraction provider.*native.*matlab"):
+        _ = _resolve_extraction_route(_route_config('custom', 'coordinate_mapping'))
+
+
+def test_resolve_extraction_route_rejects_unknown_transform_application_mode_before_execution() -> None:
+    with pytest.raises(ValueError, match="Unsupported transform application mode.*coordinate_mapping.*image_warp"):
+        _ = _resolve_extraction_route(_route_config('native', 'sparse_sampling'))
+
+
+def test_signal_miner_extract_channel_rejects_unsupported_provider_before_backend_dispatch() -> None:
+    miner = _signal_miner(provider='custom')
+    img_vol = np.ones((2, 4, 4), dtype=np.float32)
+    ref_coords = np.asarray([[0.0, 1.0, 1.0]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="Unsupported extraction provider"):
+        _ = miner._extract_intensities_for_channel(
+            img_vol=img_vol,
+            ref_coords=ref_coords,
+            transform_data=_transform_data(),
+            box_size=(1, 3, 3),
+            transform_application_mode='coordinate_mapping',
+            fov_id=7,
+            round_id=2,
+            channel_id=0,
+        )
+
+
+def test_signal_miner_extract_channel_rejects_unsupported_mode_before_backend_dispatch() -> None:
+    miner = _signal_miner(
+        provider='native',
+        transform_application_mode='sparse_sampling',
+    )
+    img_vol = np.ones((2, 4, 4), dtype=np.float32)
+    ref_coords = np.asarray([[0.0, 1.0, 1.0]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="Unsupported transform application mode"):
+        _ = miner._extract_intensities_for_channel(
+            img_vol=img_vol,
+            ref_coords=ref_coords,
+            transform_data=_transform_data(),
+            box_size=(1, 3, 3),
+            transform_application_mode='sparse_sampling',
+            fov_id=7,
+            round_id=2,
+            channel_id=0,
+        )
 
 
 def _image_warp_oracle_values(

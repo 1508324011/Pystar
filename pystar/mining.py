@@ -4,6 +4,7 @@ import time
 from contextlib import contextmanager
 from json import loads
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
@@ -36,7 +37,6 @@ from .extraction_utils import (
     _build_image_warp_sampling_plan,
     build_round_extraction_transform_plan,
     coords_within_transform_scope,
-    extract_signal_volume,
     get_transform_scope,
     map_spot_coordinates,
     require_coords_within_transform_scope,
@@ -72,6 +72,106 @@ _EXTRACTION_PROFILE_BUCKETS = (
     "interpolation_or_sampling",
     "write_outputs",
 )
+
+_SUPPORTED_EXTRACTION_PROVIDERS = ("native", "matlab")
+_SUPPORTED_TRANSFORM_APPLICATION_MODES = ("coordinate_mapping", "image_warp")
+_SUPPORTED_EXTRACTION_ROUTES = frozenset(
+    (provider, mode)
+    for provider in _SUPPORTED_EXTRACTION_PROVIDERS
+    for mode in _SUPPORTED_TRANSFORM_APPLICATION_MODES
+)
+
+
+def _expected_values(values: tuple[str, ...]) -> str:
+    return ", ".join(repr(value) for value in values)
+
+
+def _validate_extraction_string(value: object, *, field_name: str, expected: tuple[str, ...]) -> str:
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{field_name} must be a string; expected one of: {_expected_values(expected)}"
+        )
+    normalized = value
+    if normalized not in expected:
+        raise ValueError(
+            f"Unsupported {field_name}: {value!r}. Expected one of: {_expected_values(expected)}"
+        )
+    return normalized
+
+
+@dataclass(frozen=True)
+class _ExtractionRoute:
+    """Internal provider/mode decision for one signal-extraction run."""
+
+    provider: str
+    transform_application_mode: str
+
+    @property
+    def is_native(self) -> bool:
+        return self.provider == "native"
+
+    @property
+    def is_matlab(self) -> bool:
+        return self.provider == "matlab"
+
+    @property
+    def is_coordinate_mapping(self) -> bool:
+        return self.transform_application_mode == "coordinate_mapping"
+
+    @property
+    def is_image_warp(self) -> bool:
+        return self.transform_application_mode == "image_warp"
+
+    @property
+    def uses_native_sampling_plan(self) -> bool:
+        return self.is_native
+
+    @property
+    def operation_label(self) -> str:
+        if self.is_image_warp:
+            return "image_warp extraction"
+        return "coordinate_mapping extraction"
+
+
+def _resolve_extraction_route(config: ExperimentConfig) -> _ExtractionRoute:
+    """Resolve and validate extraction provider/mode once for SignalMiner."""
+
+    extraction_cfg = getattr(getattr(config, "pipeline", None), "extraction", None)
+    return _build_extraction_route(
+        provider_value=getattr(extraction_cfg, "provider", None),
+        transform_application_mode_value=getattr(extraction_cfg, "transform_application_mode", None),
+    )
+
+
+def _build_extraction_route(
+    *,
+    provider_value: object,
+    transform_application_mode_value: object,
+) -> _ExtractionRoute:
+    """Build a validated internal route from raw provider/mode values."""
+
+    provider = _validate_extraction_string(
+        provider_value,
+        field_name="extraction provider",
+        expected=_SUPPORTED_EXTRACTION_PROVIDERS,
+    )
+    transform_application_mode = _validate_extraction_string(
+        transform_application_mode_value,
+        field_name="transform application mode",
+        expected=_SUPPORTED_TRANSFORM_APPLICATION_MODES,
+    )
+    if (provider, transform_application_mode) not in _SUPPORTED_EXTRACTION_ROUTES:
+        message = (
+            f"Unsupported extraction route: provider={provider!r}, "
+            f"transform_application_mode={transform_application_mode!r}"
+        )
+        raise ValueError(
+            message
+        )
+    return _ExtractionRoute(
+        provider=provider,
+        transform_application_mode=transform_application_mode,
+    )
 
 
 class _ExtractionHotPathProfiler:
@@ -377,85 +477,71 @@ class SignalMiner:
                 f"Round {round_id} is missing flow_3d. image_warp is the Phase 1 RC mainline and does not silently downgrade."
             )
 
-    def _extract_intensities_for_channel(
+    def _extract_native_intensities_for_channel(
         self,
         *,
         img_vol: Any,
         ref_coords: Any,
         transform_data: dict[str, Any] | RoundExtractionTransformPlan,
         box_size: tuple[int, int, int],
-        transform_application_mode: str,
+        route: _ExtractionRoute,
+        round_id: int,
+        channel_id: int,
+        profiler: _ExtractionHotPathProfiler,
+        coordinate_mapping_sampling_plan: _CoordinateMappingSamplingPlan | None,
+        image_warp_sampling_plan: _ImageWarpSamplingPlan | None,
+    ) -> tuple[Any, None]:
+        expected_semantics = self._expected_field_semantics()
+
+        if route.is_coordinate_mapping:
+            if coordinate_mapping_sampling_plan is None:
+                with profiler.record("coordinate_or_warp_preparation", round_id=round_id, channel_id=channel_id):
+                    sampling_plan = _build_coordinate_mapping_sampling_plan(
+                        img_shape=tuple(img_vol.shape),
+                        ref_coords=ref_coords,
+                        transform_data=transform_data,
+                        box_size=box_size,
+                        expected_field_semantics=expected_semantics,
+                    )
+            else:
+                sampling_plan = coordinate_mapping_sampling_plan
+            with profiler.record("interpolation_or_sampling", round_id=round_id, channel_id=channel_id):
+                return sampling_plan.sample(img_vol), None
+
+        if route.is_image_warp:
+            if image_warp_sampling_plan is None:
+                with profiler.record("coordinate_or_warp_preparation", round_id=round_id, channel_id=channel_id):
+                    sampling_plan = _build_image_warp_sampling_plan(
+                        img_shape=tuple(img_vol.shape),
+                        ref_coords=ref_coords,
+                        transform_data=transform_data,
+                        box_size=box_size,
+                        expected_field_semantics=expected_semantics,
+                    )
+            else:
+                sampling_plan = image_warp_sampling_plan
+            with profiler.record("interpolation_or_sampling", round_id=round_id, channel_id=channel_id):
+                return sampling_plan.sample(img_vol), None
+
+        raise ValueError(f'Unsupported transform application mode: {route.transform_application_mode}')
+
+    def _extract_matlab_intensities_for_channel(
+        self,
+        *,
+        img_vol: Any,
+        ref_coords: Any,
+        transform_data: dict[str, Any] | RoundExtractionTransformPlan,
+        box_size: tuple[int, int, int],
+        route: _ExtractionRoute,
         fov_id: int,
         round_id: int,
         channel_id: int,
-        profiler: _ExtractionHotPathProfiler | None = None,
-        coordinate_mapping_sampling_plan: _CoordinateMappingSamplingPlan | None = None,
-        image_warp_sampling_plan: _ImageWarpSamplingPlan | None = None,
+        profiler: _ExtractionHotPathProfiler,
     ) -> tuple[Any, Optional[dict[str, Any]]]:
-        """Extract one `(N_spots,)` intensity vector for one round/channel.
-
-        `img_vol` is a cleaned moving-round volume. `ref_coords` are already
-        filtered to any legal transform scope. The returned metadata is `None`
-        for native extraction and a MATLAB boundary/provenance record for MATLAB
-        extraction.
-        """
         expected_semantics = self._expected_field_semantics()
-        provider = self.cfg.pipeline.extraction.provider
-        profiler = profiler or _ExtractionHotPathProfiler(enabled=False)
-        if transform_application_mode not in {'coordinate_mapping', 'image_warp'}:
-            raise ValueError(f'Unsupported transform application mode: {transform_application_mode}')
-
-        _ = require_coords_within_transform_scope(
-            ref_coords,
-            transform_data,
-            operation='image_warp extraction' if transform_application_mode == 'image_warp' else 'coordinate_mapping extraction',
-        )
-
-        if provider == 'native':
-            if transform_application_mode == 'coordinate_mapping':
-                if coordinate_mapping_sampling_plan is None:
-                    with profiler.record("coordinate_or_warp_preparation", round_id=round_id, channel_id=channel_id):
-                        sampling_plan = _build_coordinate_mapping_sampling_plan(
-                            img_shape=tuple(img_vol.shape),
-                            ref_coords=ref_coords,
-                            transform_data=transform_data,
-                            box_size=box_size,
-                            expected_field_semantics=expected_semantics,
-                        )
-                else:
-                    sampling_plan = coordinate_mapping_sampling_plan
-                with profiler.record("interpolation_or_sampling", round_id=round_id, channel_id=channel_id):
-                    return sampling_plan.sample(img_vol), None
-
-            if transform_application_mode == 'image_warp':
-                if image_warp_sampling_plan is None:
-                    with profiler.record("coordinate_or_warp_preparation", round_id=round_id, channel_id=channel_id):
-                        sampling_plan = _build_image_warp_sampling_plan(
-                            img_shape=tuple(img_vol.shape),
-                            ref_coords=ref_coords,
-                            transform_data=transform_data,
-                            box_size=box_size,
-                            expected_field_semantics=expected_semantics,
-                        )
-                else:
-                    sampling_plan = image_warp_sampling_plan
-                with profiler.record("interpolation_or_sampling", round_id=round_id, channel_id=channel_id):
-                    return sampling_plan.sample(img_vol), None
-
-            return (
-                extract_signal_volume(
-                    img_vol,
-                    ref_coords,
-                    transform_data,
-                    box_size,
-                    transform_application_mode,
-                    expected_field_semantics=expected_semantics,
-                ),
-                None,
-            )
-
         backend = self._get_matlab_backend()
-        if transform_application_mode == 'coordinate_mapping':
+
+        if route.is_coordinate_mapping:
             with profiler.record("coordinate_or_warp_preparation", round_id=round_id, channel_id=channel_id):
                 target_coords = map_spot_coordinates(
                     ref_coords,
@@ -470,27 +556,100 @@ class SignalMiner:
                     round_id=round_id,
                     channel_id=channel_id,
                     box_size=box_size,
-                    transform_application_mode=transform_application_mode,
+                    transform_application_mode=route.transform_application_mode,
                 )
             return result['intensities'], result.get('backend_metadata')
 
-        with profiler.record("coordinate_or_warp_preparation", round_id=round_id, channel_id=channel_id):
-            warped_volume = warp_volume_to_reference(
-                img_vol,
-                transform_data,
-                expected_field_semantics=expected_semantics,
+        if route.is_image_warp:
+            with profiler.record("coordinate_or_warp_preparation", round_id=round_id, channel_id=channel_id):
+                warped_volume = warp_volume_to_reference(
+                    img_vol,
+                    transform_data,
+                    expected_field_semantics=expected_semantics,
+                )
+            with profiler.record("interpolation_or_sampling", round_id=round_id, channel_id=channel_id):
+                result = backend.extract_intensities(
+                    warped_volume,
+                    ref_coords,
+                    fov_id=fov_id,
+                    round_id=round_id,
+                    channel_id=channel_id,
+                    box_size=box_size,
+                    transform_application_mode=route.transform_application_mode,
+                )
+            return result['intensities'], result.get('backend_metadata')
+
+        raise ValueError(f'Unsupported transform application mode: {route.transform_application_mode}')
+
+    def _extract_intensities_for_channel(
+        self,
+        *,
+        img_vol: Any,
+        ref_coords: Any,
+        transform_data: dict[str, Any] | RoundExtractionTransformPlan,
+        box_size: tuple[int, int, int],
+        transform_application_mode: str,
+        fov_id: int,
+        round_id: int,
+        channel_id: int,
+        profiler: _ExtractionHotPathProfiler | None = None,
+        coordinate_mapping_sampling_plan: _CoordinateMappingSamplingPlan | None = None,
+        image_warp_sampling_plan: _ImageWarpSamplingPlan | None = None,
+        route: _ExtractionRoute | None = None,
+    ) -> tuple[Any, Optional[dict[str, Any]]]:
+        """Extract one `(N_spots,)` intensity vector for one round/channel.
+
+        `img_vol` is a cleaned moving-round volume. `ref_coords` are already
+        filtered to any legal transform scope. The returned metadata is `None`
+        for native extraction and a MATLAB boundary/provenance record for MATLAB
+        extraction.
+        """
+        profiler = profiler or _ExtractionHotPathProfiler(enabled=False)
+        resolved_route = route or _resolve_extraction_route(self.cfg)
+        if transform_application_mode != resolved_route.transform_application_mode:
+            message = (
+                "transform_application_mode does not match resolved extraction route: "
+                f"got {transform_application_mode!r}, "
+                f"expected {resolved_route.transform_application_mode!r}"
             )
-        with profiler.record("interpolation_or_sampling", round_id=round_id, channel_id=channel_id):
-            result = backend.extract_intensities(
-                warped_volume,
-                ref_coords,
+            raise ValueError(
+                message
+            )
+
+        _ = require_coords_within_transform_scope(
+            ref_coords,
+            transform_data,
+            operation=resolved_route.operation_label,
+        )
+
+        if resolved_route.is_native:
+            return self._extract_native_intensities_for_channel(
+                img_vol=img_vol,
+                ref_coords=ref_coords,
+                transform_data=transform_data,
+                box_size=box_size,
+                route=resolved_route,
+                round_id=round_id,
+                channel_id=channel_id,
+                profiler=profiler,
+                coordinate_mapping_sampling_plan=coordinate_mapping_sampling_plan,
+                image_warp_sampling_plan=image_warp_sampling_plan,
+            )
+
+        if resolved_route.is_matlab:
+            return self._extract_matlab_intensities_for_channel(
+                img_vol=img_vol,
+                ref_coords=ref_coords,
+                transform_data=transform_data,
+                box_size=box_size,
+                route=resolved_route,
                 fov_id=fov_id,
                 round_id=round_id,
                 channel_id=channel_id,
-                box_size=box_size,
-                transform_application_mode=transform_application_mode,
+                profiler=profiler,
             )
-        return result['intensities'], result.get('backend_metadata')
+
+        raise ValueError(f"Unsupported extraction provider: {resolved_route.provider!r}")
 
     def _require_persisted_spot_row_lineage(
         self,
@@ -526,6 +685,9 @@ class SignalMiner:
         profiler = _ExtractionHotPathProfiler(enabled=_extraction_profile_enabled(self.cfg))
         base_dir = Path(self.cfg.pipeline.output.directory)
         paths = get_fov_output_structure(base_dir, fov_id)
+        extraction_route = _resolve_extraction_route(self.cfg)
+        transform_application_mode = extraction_route.transform_application_mode
+        extraction_provider = extraction_route.provider
         # 1. Load Metadata & Transforms
         spots_path = paths["spots"] / f"spots_fov_{fov_id}.csv"
         spot_expected = SpotTableSchema().expected_description()
@@ -594,8 +756,6 @@ class SignalMiner:
         # Box Size
         box_vals = self.cfg.pipeline.extraction.integration_box
         box_size: tuple[int, int, int] = (int(box_vals[0]), int(box_vals[1]), int(box_vals[2]))
-        transform_application_mode = self.cfg.pipeline.extraction.transform_application_mode
-        extraction_provider = self.cfg.pipeline.extraction.provider
         backend_records: list[dict[str, Any]] = []
         scope_contract = self._validate_scope_contract(fov_id, transforms)
         scope_metadata = self._resolve_scope_metadata(fov_id, round_transform_plans, scope_contract)
@@ -612,7 +772,7 @@ class SignalMiner:
                 f" [Miner] Tile-local scope keeps {in_scope_count}/{n_spots} detected spots inside delivered coverage"
             )
         print(f" [Miner] Extraction provider: {extraction_provider}")
-        if transform_application_mode == 'image_warp':
+        if extraction_route.is_image_warp:
             self._validate_image_warp_contract(fov_id, transforms)
 
         # 2. Main Loop
@@ -650,12 +810,12 @@ class SignalMiner:
                         img_vol = self.loader.load_clean_image(fov_id, r_id, c_id)
                     coordinate_mapping_sampling_plan: _CoordinateMappingSamplingPlan | None = None
                     image_warp_sampling_plan: _ImageWarpSamplingPlan | None = None
-                    if extraction_provider == 'native' and transform_application_mode in {'coordinate_mapping', 'image_warp'}:
+                    if extraction_route.uses_native_sampling_plan:
                         image_shape = tuple(int(dim) for dim in img_vol.shape)
                         if len(image_shape) != 3:
                             raise ValueError(f"img_vol must be 3D, got shape {img_vol.shape}")
                         plan_key = (image_shape[0], image_shape[1], image_shape[2])
-                        if transform_application_mode == 'coordinate_mapping':
+                        if extraction_route.is_coordinate_mapping:
                             coordinate_mapping_sampling_plan = coordinate_mapping_sampling_plans.get(plan_key)
                             if coordinate_mapping_sampling_plan is None:
                                 with profiler.record("coordinate_or_warp_preparation", round_id=r_id, channel_id=c_id):
@@ -667,7 +827,7 @@ class SignalMiner:
                                         expected_field_semantics=self._expected_field_semantics(),
                                     )
                                 coordinate_mapping_sampling_plans[plan_key] = coordinate_mapping_sampling_plan
-                        else:
+                        elif extraction_route.is_image_warp:
                             image_warp_sampling_plan = image_warp_sampling_plans.get(plan_key)
                             if image_warp_sampling_plan is None:
                                 with profiler.record("coordinate_or_warp_preparation", round_id=r_id, channel_id=c_id):
@@ -692,6 +852,7 @@ class SignalMiner:
                         profiler=profiler,
                         coordinate_mapping_sampling_plan=coordinate_mapping_sampling_plan,
                         image_warp_sampling_plan=image_warp_sampling_plan,
+                        route=extraction_route,
                     )
                     if isinstance(backend_metadata, dict):
                         backend_records.append(backend_metadata)
@@ -790,7 +951,7 @@ class SignalMiner:
             path=out_name,
             context="mining save against metadata sidecar",
         )
-        if extraction_provider == 'matlab' and backend_records:
+        if extraction_route.is_matlab and backend_records:
             boundary_traces = [
                 trace
                 for record in backend_records
