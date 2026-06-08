@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
 import numpy.typing as npt
+import pandas as pd
 import pytest
 
 from pystar.extraction_utils import (
     RoundExtractionTransformPlan,
+    _build_coordinate_mapping_sampling_plan,
     _build_image_warp_sampling_plan,
     build_round_extraction_transform_plan,
     get_transform_scope,
@@ -19,6 +22,7 @@ from pystar.extraction_utils import (
     warp_volume_to_reference,
 )
 from pystar.infrastructure import ExperimentConfig
+from pystar.io import get_fov_output_structure
 from pystar.mining import SignalMiner
 from pystar.runtime_artifacts import FieldSemantics, Flow3DSidecarDescriptor, ScopeMetadata
 import pystar.extraction_utils as extraction_utils_module
@@ -386,6 +390,49 @@ def test_extract_signal_volume_native_coordinate_mapping_uses_same_kernel() -> N
     np.testing.assert_array_equal(got, expected)
 
 
+def test_coordinate_mapping_sampling_plan_matches_existing_coordinate_mapping_oracle() -> None:
+    img_vol = np.arange(2 * 4 * 4, dtype=np.float32).reshape(2, 4, 4)
+    ref_coords = np.asarray([[0.2, 1.8, 2.1], [1.0, 2.0, 3.0]], dtype=np.float32)
+    transform_data = _transform_data(
+        global_shift_3d=np.asarray([0.0, 0.25, -0.5], dtype=np.float32),
+        flow_3d=np.zeros((3, *img_vol.shape), dtype=np.float32),
+    )
+    box_size = (1, 3, 3)
+
+    plan = _build_coordinate_mapping_sampling_plan(
+        img_shape=tuple(img_vol.shape),
+        ref_coords=ref_coords,
+        transform_data=transform_data,
+        box_size=box_size,
+        expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+    )
+
+    expected_coords = map_spot_coordinates(
+        ref_coords,
+        transform_data,
+        expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+    )
+    expected = extract_box_sum_integer(img_vol, expected_coords, box_size=box_size)
+
+    np.testing.assert_array_equal(plan.target_coords, expected_coords)
+    np.testing.assert_array_equal(plan.sample(img_vol), expected)
+
+
+def test_coordinate_mapping_sampling_plan_rejects_image_shape_mismatch() -> None:
+    img_vol = np.arange(2 * 4 * 4, dtype=np.float32).reshape(2, 4, 4)
+    ref_coords = np.asarray([[0.2, 1.8, 2.1]], dtype=np.float32)
+    plan = _build_coordinate_mapping_sampling_plan(
+        img_shape=tuple(img_vol.shape),
+        ref_coords=ref_coords,
+        transform_data=_transform_data(),
+        box_size=(1, 3, 3),
+        expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+    )
+
+    with pytest.raises(ValueError, match='coordinate_mapping sampling plan image shape'):
+        _ = plan.sample(np.ones((3, 4, 4), dtype=np.float32))
+
+
 def test_extract_signal_volume_native_image_warp_uses_same_kernel() -> None:
     img_vol = np.arange(2 * 4 * 4, dtype=np.float32).reshape(2, 4, 4)
     ref_coords = np.asarray([[0.0, 1.0, 2.0], [1.0, 2.0, 3.0]], dtype=np.float32)
@@ -544,7 +591,7 @@ def test_image_warp_sampling_plan_preserves_map_coordinates_parameters(monkeypat
         'full_volume_shape_zyx': list(img_vol.shape),
     }
     calls: list[dict[str, object]] = []
-    original_map_coordinates = extraction_utils_module.map_coordinates
+    original_map_coordinates = cast(Any, extraction_utils_module.map_coordinates)
 
     def recording_map_coordinates(*args: object, **kwargs: object) -> object:
         calls.append(dict(kwargs))
@@ -799,6 +846,105 @@ def test_signal_miner_native_bridge_uses_optimized_kernel_for_coordinate_mapping
     vals = cast(FloatArray, vals_obj)
     assert metadata is None
     np.testing.assert_array_equal(vals, expected)
+
+
+def test_signal_miner_mine_fov_reuses_coordinate_mapping_plan_per_round_image_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    miner = _signal_miner(provider='native')
+    field_semantics = miner.cfg.pipeline.field_semantics
+    miner.cfg = cast(
+        ExperimentConfig,
+        cast(
+            object,
+            SimpleNamespace(
+                dataset=SimpleNamespace(
+                    channel_roles={0: 'seq', 1: 'seq'},
+                    round_structure={1: [0, 1]},
+                ),
+                pipeline=SimpleNamespace(
+                    output=SimpleNamespace(directory=str(tmp_path)),
+                    extraction=SimpleNamespace(
+                        provider='native',
+                        transform_application_mode='coordinate_mapping',
+                        integration_box=[1, 3, 3],
+                    ),
+                    field_semantics=field_semantics,
+                    qc_images_enabled=lambda: False,
+                ),
+            ),
+        ),
+    )
+    paths = get_fov_output_structure(tmp_path, 7)
+    spots_df = pd.DataFrame(
+        {
+            'z': [0.0, 1.0],
+            'y': [1.0, 2.0],
+            'x': [2.0, 3.0],
+            'intensity': [10.0, 20.0],
+        }
+    )
+    spots_df.to_csv(paths['spots'] / 'spots_fov_7.csv', index=False)
+
+    img_ch0 = np.arange(2 * 4 * 4, dtype=np.float32).reshape(2, 4, 4)
+    img_ch1 = img_ch0 + np.float32(100.0)
+    loaded_images = {(1, 0): img_ch0, (1, 1): img_ch1}
+    miner.loader = cast(
+        Any,
+        SimpleNamespace(load_clean_image=lambda fov_id, round_id, channel_id: loaded_images[(round_id, channel_id)].copy()),
+    )
+
+    transform_data = _transform_data()
+    miner._load_transforms = lambda fov_id: {1: dict(transform_data)}  # type: ignore[method-assign]
+
+    def fake_materialize_round_transform(
+        fov_id: int,
+        round_id: int,
+        transform_data: Mapping[str, Any],
+        *,
+        hydrate_flow_3d: bool = True,
+    ) -> dict[str, Any]:
+        return dict(transform_data)
+
+    miner._materialize_round_transform = fake_materialize_round_transform  # type: ignore[method-assign]
+    miner._validate_scope_contract = (  # type: ignore[method-assign]
+        lambda fov_id, transforms: {'delivered_coverage': 'full_fov'}
+    )
+
+    map_call_count = 0
+    original_map_spot_coordinates = extraction_utils_module.map_spot_coordinates
+
+    def counting_map_spot_coordinates(
+        ref_coords: FloatArray,
+        transform_data: Any,
+        expected_field_semantics: Mapping[str, str] | None = None,
+    ) -> FloatArray:
+        nonlocal map_call_count
+        map_call_count += 1
+        return original_map_spot_coordinates(
+            ref_coords,
+            transform_data,
+            expected_field_semantics=expected_field_semantics,
+        )
+
+    monkeypatch.setattr(extraction_utils_module, 'map_spot_coordinates', counting_map_spot_coordinates)
+
+    miner.mine_fov(7)
+
+    ref_coords = cast(FloatArray, spots_df[['z', 'y', 'x']].to_numpy(dtype=np.float32))
+    expected_coords = original_map_spot_coordinates(
+        ref_coords,
+        transform_data,
+        expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+    )
+    expected = np.zeros((2, 1, 2), dtype=np.float32)
+    expected[:, 0, 0] = extract_box_sum_integer(img_ch0, expected_coords, box_size=(1, 3, 3))
+    expected[:, 0, 1] = extract_box_sum_integer(img_ch1, expected_coords, box_size=(1, 3, 3))
+    got = np.load(paths['extraction'] / 'intensity_matrix_fov_7.npy')
+
+    assert map_call_count == 1
+    np.testing.assert_array_equal(got, expected)
 
 
 def test_signal_miner_native_bridge_uses_optimized_kernel_for_image_warp() -> None:

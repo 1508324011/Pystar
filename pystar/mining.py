@@ -30,11 +30,12 @@ from ._artifact_schemas import (
 from .infrastructure import ExperimentConfig
 from .extraction_utils import (
     RoundExtractionTransformPlan,
+    _CoordinateMappingSamplingPlan,
     _ImageWarpSamplingPlan,
+    _build_coordinate_mapping_sampling_plan,
     _build_image_warp_sampling_plan,
     build_round_extraction_transform_plan,
     coords_within_transform_scope,
-    extract_box_sum_integer,
     extract_signal_volume,
     get_transform_scope,
     map_spot_coordinates,
@@ -388,6 +389,7 @@ class SignalMiner:
         round_id: int,
         channel_id: int,
         profiler: _ExtractionHotPathProfiler | None = None,
+        coordinate_mapping_sampling_plan: _CoordinateMappingSamplingPlan | None = None,
         image_warp_sampling_plan: _ImageWarpSamplingPlan | None = None,
     ) -> tuple[Any, Optional[dict[str, Any]]]:
         """Extract one `(N_spots,)` intensity vector for one round/channel.
@@ -411,14 +413,19 @@ class SignalMiner:
 
         if provider == 'native':
             if transform_application_mode == 'coordinate_mapping':
-                with profiler.record("coordinate_or_warp_preparation", round_id=round_id, channel_id=channel_id):
-                    target_coords = map_spot_coordinates(
-                        ref_coords,
-                        transform_data,
-                        expected_field_semantics=expected_semantics,
-                    )
+                if coordinate_mapping_sampling_plan is None:
+                    with profiler.record("coordinate_or_warp_preparation", round_id=round_id, channel_id=channel_id):
+                        sampling_plan = _build_coordinate_mapping_sampling_plan(
+                            img_shape=tuple(img_vol.shape),
+                            ref_coords=ref_coords,
+                            transform_data=transform_data,
+                            box_size=box_size,
+                            expected_field_semantics=expected_semantics,
+                        )
+                else:
+                    sampling_plan = coordinate_mapping_sampling_plan
                 with profiler.record("interpolation_or_sampling", round_id=round_id, channel_id=channel_id):
-                    return extract_box_sum_integer(img_vol, target_coords, box_size), None
+                    return sampling_plan.sample(img_vol), None
 
             if transform_application_mode == 'image_warp':
                 if image_warp_sampling_plan is None:
@@ -627,6 +634,7 @@ class SignalMiner:
                     profiler=profiler,
                 )
                 self._validate_round_transform_for_mode(r_id, round_plan, transform_application_mode)
+                coordinate_mapping_sampling_plans: dict[tuple[int, int, int], _CoordinateMappingSamplingPlan] = {}
                 image_warp_sampling_plans: dict[tuple[int, int, int], _ImageWarpSamplingPlan] = {}
 
                 current_round_channels = self.cfg.dataset.round_structure[r_id]
@@ -640,23 +648,37 @@ class SignalMiner:
                     # 确保是 clean data
                     with profiler.record("image_read", round_id=r_id, channel_id=c_id):
                         img_vol = self.loader.load_clean_image(fov_id, r_id, c_id)
+                    coordinate_mapping_sampling_plan: _CoordinateMappingSamplingPlan | None = None
                     image_warp_sampling_plan: _ImageWarpSamplingPlan | None = None
-                    if extraction_provider == 'native' and transform_application_mode == 'image_warp':
+                    if extraction_provider == 'native' and transform_application_mode in {'coordinate_mapping', 'image_warp'}:
                         image_shape = tuple(int(dim) for dim in img_vol.shape)
                         if len(image_shape) != 3:
                             raise ValueError(f"img_vol must be 3D, got shape {img_vol.shape}")
                         plan_key = (image_shape[0], image_shape[1], image_shape[2])
-                        image_warp_sampling_plan = image_warp_sampling_plans.get(plan_key)
-                        if image_warp_sampling_plan is None:
-                            with profiler.record("coordinate_or_warp_preparation", round_id=r_id, channel_id=c_id):
-                                image_warp_sampling_plan = _build_image_warp_sampling_plan(
-                                    img_shape=plan_key,
-                                    ref_coords=in_scope_coords,
-                                    transform_data=round_plan,
-                                    box_size=box_size,
-                                    expected_field_semantics=self._expected_field_semantics(),
-                                )
-                            image_warp_sampling_plans[plan_key] = image_warp_sampling_plan
+                        if transform_application_mode == 'coordinate_mapping':
+                            coordinate_mapping_sampling_plan = coordinate_mapping_sampling_plans.get(plan_key)
+                            if coordinate_mapping_sampling_plan is None:
+                                with profiler.record("coordinate_or_warp_preparation", round_id=r_id, channel_id=c_id):
+                                    coordinate_mapping_sampling_plan = _build_coordinate_mapping_sampling_plan(
+                                        img_shape=plan_key,
+                                        ref_coords=in_scope_coords,
+                                        transform_data=round_plan,
+                                        box_size=box_size,
+                                        expected_field_semantics=self._expected_field_semantics(),
+                                    )
+                                coordinate_mapping_sampling_plans[plan_key] = coordinate_mapping_sampling_plan
+                        else:
+                            image_warp_sampling_plan = image_warp_sampling_plans.get(plan_key)
+                            if image_warp_sampling_plan is None:
+                                with profiler.record("coordinate_or_warp_preparation", round_id=r_id, channel_id=c_id):
+                                    image_warp_sampling_plan = _build_image_warp_sampling_plan(
+                                        img_shape=plan_key,
+                                        ref_coords=in_scope_coords,
+                                        transform_data=round_plan,
+                                        box_size=box_size,
+                                        expected_field_semantics=self._expected_field_semantics(),
+                                    )
+                                image_warp_sampling_plans[plan_key] = image_warp_sampling_plan
 
                     vals, backend_metadata = self._extract_intensities_for_channel(
                         img_vol=img_vol,
@@ -668,6 +690,7 @@ class SignalMiner:
                         round_id=r_id,
                         channel_id=c_id,
                         profiler=profiler,
+                        coordinate_mapping_sampling_plan=coordinate_mapping_sampling_plan,
                         image_warp_sampling_plan=image_warp_sampling_plan,
                     )
                     if isinstance(backend_metadata, dict):

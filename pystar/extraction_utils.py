@@ -453,6 +453,63 @@ class _IntegerBoxSumPlan:
 
 
 @dataclass(frozen=True)
+class _CoordinateMappingSamplingPlan:
+    """Runtime-only plan for native ``coordinate_mapping`` extraction reuse.
+
+    Coordinate replay and integer box geometry are invariant for every channel
+    image sharing a round transform and image shape.  The plan captures those
+    facts once and keeps sampling on the existing integer box-sum path.
+    """
+
+    image_shape: tuple[int, int, int]
+    target_coords: FloatArray
+    box_size: tuple[int, int, int]
+    _box_sum_plan: _IntegerBoxSumPlan
+
+    def sample(self, img_vol: FloatArray) -> FloatArray:
+        img_shape = _shape_3d(tuple(img_vol.shape), field_name='img_vol')
+        if img_shape != self.image_shape:
+            raise ValueError(
+                f"coordinate_mapping sampling plan image shape {self.image_shape} does not match img_vol shape {img_shape}"
+            )
+        return self._box_sum_plan.sample(img_vol)
+
+
+def _build_coordinate_mapping_sampling_plan(
+    *,
+    img_shape: tuple[int, ...],
+    ref_coords: FloatArray,
+    transform_data: TransformData,
+    box_size: tuple[int, int, int] = (1, 3, 3),
+    expected_field_semantics: Mapping[str, str] | None = None,
+) -> _CoordinateMappingSamplingPlan:
+    """Build a private/runtime-only native coordinate-mapping sampling plan."""
+
+    image_shape = _shape_3d(tuple(img_shape), field_name='img_shape')
+    _ = require_coords_within_transform_scope(
+        ref_coords,
+        transform_data,
+        operation='coordinate_mapping extraction',
+    )
+    target_coords = map_spot_coordinates(
+        ref_coords,
+        transform_data,
+        expected_field_semantics=expected_field_semantics,
+    )
+    box_plan = _IntegerBoxSumPlan.from_coords(
+        image_shape=image_shape,
+        coords=target_coords,
+        box_size=box_size,
+    )
+    return _CoordinateMappingSamplingPlan(
+        image_shape=image_shape,
+        target_coords=np.asarray(target_coords, dtype=np.float32),
+        box_size=box_size,
+        _box_sum_plan=box_plan,
+    )
+
+
+@dataclass(frozen=True)
 class _ImageWarpSamplingPlan:
     """Runtime-only plan for native ``image_warp`` extraction reuse.
 
