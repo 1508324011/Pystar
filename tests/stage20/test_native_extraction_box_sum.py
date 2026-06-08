@@ -10,15 +10,18 @@ import pytest
 
 from pystar.extraction_utils import (
     RoundExtractionTransformPlan,
+    _build_image_warp_sampling_plan,
     build_round_extraction_transform_plan,
     get_transform_scope,
     extract_box_sum_integer,
     extract_signal_volume,
     map_spot_coordinates,
+    warp_volume_to_reference,
 )
 from pystar.infrastructure import ExperimentConfig
 from pystar.mining import SignalMiner
 from pystar.runtime_artifacts import FieldSemantics, Flow3DSidecarDescriptor, ScopeMetadata
+import pystar.extraction_utils as extraction_utils_module
 import pystar.mining as mining_module
 
 
@@ -95,12 +98,15 @@ def _signal_miner(provider: str = 'native') -> SignalMiner:
     return miner
 
 
-def _transform_data(*, flow_3d: FloatArray | None = None) -> dict[str, object]:
+def _transform_data(*, flow_3d: FloatArray | None = None, global_shift_3d: FloatArray | None = None) -> dict[str, object]:
     return {
-        'global_shift_3d': np.zeros(3, dtype=np.float32),
+        'global_shift_3d': np.zeros(3, dtype=np.float32) if global_shift_3d is None else np.asarray(global_shift_3d, dtype=np.float32),
         'flow_2d': None,
         'flow_3d': flow_3d,
-        'is_reference_round': flow_3d is None,
+        'is_reference_round': flow_3d is None and bool(np.allclose(
+            np.zeros(3, dtype=np.float32) if global_shift_3d is None else np.asarray(global_shift_3d, dtype=np.float32),
+            0.0,
+        )),
         '_semantics': {
             'representation': 'residual',
             'composition': 'sequential_global_then_local',
@@ -131,10 +137,24 @@ def _tile_local_transform_data() -> dict[str, object]:
         'region_origin_zyx': [0, 0, 0],
         'region_shape_zyx': [1, 1, 1],
         'full_volume_shape_zyx': [2, 4, 4],
-        'tile_grid_shape_yx': [1, 1],
+        'tile_grid_shape_yx': [2, 2],
         'tile_index': 1,
     }
     return payload
+
+
+def _image_warp_oracle_values(
+    img_vol: FloatArray,
+    ref_coords: FloatArray,
+    transform_data: dict[str, object] | RoundExtractionTransformPlan,
+    box_size: tuple[int, int, int],
+) -> FloatArray:
+    warped = warp_volume_to_reference(
+        img_vol,
+        transform_data,
+        expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+    )
+    return extract_box_sum_integer(warped, ref_coords, box_size=box_size)
 
 
 def test_round_extraction_transform_plan_exposes_models_and_preserves_legacy_payload() -> None:
@@ -383,6 +403,370 @@ def test_extract_signal_volume_native_image_warp_uses_same_kernel() -> None:
 
     warped = extract_box_sum_integer(img_vol, ref_coords, box_size=(1, 3, 3))
     np.testing.assert_array_equal(got, warped)
+
+
+def test_image_warp_sampling_plan_reference_round_preserves_direct_box_sum() -> None:
+    img_vol = (np.arange(3 * 5 * 6, dtype=np.float32).reshape(3, 5, 6) / np.float32(7.0))
+    ref_coords = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.2, 2.6, 3.4],
+            [2.0, 4.0, 5.0],
+        ],
+        dtype=np.float32,
+    )
+    transform_data = _transform_data()
+    transform_data['_scope'] = {
+        'coverage_mode': 'full_fov',
+        'region_origin_zyx': [0, 0, 0],
+        'region_shape_zyx': list(img_vol.shape),
+        'full_volume_shape_zyx': list(img_vol.shape),
+    }
+    box_size = (1, 3, 3)
+
+    plan = _build_image_warp_sampling_plan(
+        img_shape=tuple(img_vol.shape),
+        ref_coords=ref_coords,
+        transform_data=transform_data,
+        box_size=box_size,
+        expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+    )
+
+    got = plan.sample(img_vol)
+    expected = extract_box_sum_integer(img_vol, ref_coords, box_size=box_size)
+
+    assert got.dtype == np.float32
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_image_warp_sampling_plan_matches_global_shift_oracle() -> None:
+    img_vol = np.arange(4 * 6 * 7, dtype=np.float32).reshape(4, 6, 7)
+    ref_coords = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 2.0, 3.0],
+            [2.1, 4.2, 5.3],
+            [3.0, 5.0, 6.0],
+        ],
+        dtype=np.float32,
+    )
+    transform_data = _transform_data(
+        global_shift_3d=np.asarray([0.35, -0.45, 0.7], dtype=np.float32),
+        flow_3d=np.zeros((3, *img_vol.shape), dtype=np.float32),
+    )
+    transform_data['_scope'] = {
+        'coverage_mode': 'full_fov',
+        'region_origin_zyx': [0, 0, 0],
+        'region_shape_zyx': list(img_vol.shape),
+        'full_volume_shape_zyx': list(img_vol.shape),
+    }
+    box_size = (2, 2, 2)
+
+    plan = _build_image_warp_sampling_plan(
+        img_shape=tuple(img_vol.shape),
+        ref_coords=ref_coords,
+        transform_data=transform_data,
+        box_size=box_size,
+        expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+    )
+
+    got = plan.sample(img_vol)
+    expected = _image_warp_oracle_values(img_vol, ref_coords, transform_data, box_size)
+
+    assert got.dtype == np.float32
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_image_warp_sampling_plan_matches_full_fov_flow_oracle_and_preserves_input() -> None:
+    img_vol = np.linspace(-2.5, 3.5, num=4 * 5 * 6, dtype=np.float32).reshape(4, 5, 6)
+    img_before = img_vol.copy()
+    zz = np.linspace(-0.2, 0.2, num=4, dtype=np.float32)[:, None, None]
+    yy = np.linspace(0.15, -0.15, num=5, dtype=np.float32)[None, :, None]
+    xx = np.linspace(-0.1, 0.1, num=6, dtype=np.float32)[None, None, :]
+    flow_3d = np.empty((3, *img_vol.shape), dtype=np.float32)
+    flow_3d[0] = zz + np.zeros(img_vol.shape, dtype=np.float32)
+    flow_3d[1] = yy + np.zeros(img_vol.shape, dtype=np.float32)
+    flow_3d[2] = xx + np.zeros(img_vol.shape, dtype=np.float32)
+    flow_before = flow_3d.copy()
+    ref_coords = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [2.4, 3.2, 4.7],
+            [3.0, 4.0, 5.0],
+        ],
+        dtype=np.float32,
+    )
+    transform_data = _transform_data(
+        global_shift_3d=np.asarray([0.25, -0.25, 0.5], dtype=np.float32),
+        flow_3d=flow_3d,
+    )
+    transform_data['_scope'] = {
+        'coverage_mode': 'full_fov',
+        'region_origin_zyx': [0, 0, 0],
+        'region_shape_zyx': list(img_vol.shape),
+        'full_volume_shape_zyx': list(img_vol.shape),
+    }
+    box_size = (3, 3, 1)
+
+    plan = _build_image_warp_sampling_plan(
+        img_shape=tuple(img_vol.shape),
+        ref_coords=ref_coords,
+        transform_data=transform_data,
+        box_size=box_size,
+        expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+    )
+
+    got = plan.sample(img_vol)
+    expected = _image_warp_oracle_values(img_vol, ref_coords, transform_data, box_size)
+
+    assert got.dtype == np.float32
+    np.testing.assert_array_equal(got, expected)
+    np.testing.assert_array_equal(img_vol, img_before)
+    np.testing.assert_array_equal(flow_3d, flow_before)
+
+
+def test_image_warp_sampling_plan_preserves_map_coordinates_parameters(monkeypatch: pytest.MonkeyPatch) -> None:
+    img_vol = np.linspace(0.0, 1.0, num=3 * 4 * 5, dtype=np.float32).reshape(3, 4, 5)
+    flow_3d = np.zeros((3, *img_vol.shape), dtype=np.float32)
+    flow_3d[0] = np.float32(0.1)
+    flow_3d[1] = np.float32(-0.2)
+    flow_3d[2] = np.float32(0.3)
+    ref_coords = np.asarray([[0.0, 0.0, 0.0], [1.3, 2.2, 3.1]], dtype=np.float32)
+    transform_data = _transform_data(
+        global_shift_3d=np.asarray([0.25, -0.5, 0.75], dtype=np.float32),
+        flow_3d=flow_3d,
+    )
+    transform_data['_scope'] = {
+        'coverage_mode': 'full_fov',
+        'region_origin_zyx': [0, 0, 0],
+        'region_shape_zyx': list(img_vol.shape),
+        'full_volume_shape_zyx': list(img_vol.shape),
+    }
+    calls: list[dict[str, object]] = []
+    original_map_coordinates = extraction_utils_module.map_coordinates
+
+    def recording_map_coordinates(*args: object, **kwargs: object) -> object:
+        calls.append(dict(kwargs))
+        return original_map_coordinates(*args, **kwargs)
+
+    monkeypatch.setattr(extraction_utils_module, 'map_coordinates', recording_map_coordinates)
+
+    plan = _build_image_warp_sampling_plan(
+        img_shape=tuple(img_vol.shape),
+        ref_coords=ref_coords,
+        transform_data=transform_data,
+        box_size=(1, 3, 3),
+        expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+    )
+    _ = plan.sample(img_vol)
+
+    assert len(calls) == 2
+    for call in calls:
+        assert call == {
+            'order': 1,
+            'mode': 'constant',
+            'cval': 0.0,
+            'prefilter': False,
+        }
+
+
+def test_image_warp_sampling_plan_matches_tile_local_flow_oracle() -> None:
+    img_vol = np.arange(4 * 6 * 7, dtype=np.float32).reshape(4, 6, 7)
+    flow_3d = np.zeros((3, 2, 3, 4), dtype=np.float32)
+    flow_3d[0] = np.float32(0.15)
+    flow_3d[1] = np.linspace(-0.2, 0.2, num=3, dtype=np.float32)[None, :, None]
+    flow_3d[2] = np.linspace(0.25, -0.25, num=4, dtype=np.float32)[None, None, :]
+    ref_coords = np.asarray(
+        [
+            [1.0, 2.0, 2.0],
+            [1.4, 3.2, 4.1],
+            [2.0, 4.0, 5.0],
+        ],
+        dtype=np.float32,
+    )
+    transform_data = _transform_data(
+        global_shift_3d=np.asarray([0.4, 0.1, -0.3], dtype=np.float32),
+        flow_3d=flow_3d,
+    )
+    transform_data['_scope'] = {
+        'coverage_mode': 'tile_local',
+        'region_origin_zyx': [1, 2, 2],
+        'region_shape_zyx': [2, 3, 4],
+        'full_volume_shape_zyx': list(img_vol.shape),
+        'tile_grid_shape_yx': [2, 2],
+        'tile_index': 3,
+    }
+    box_size = (1, 3, 3)
+
+    plan = _build_image_warp_sampling_plan(
+        img_shape=tuple(img_vol.shape),
+        ref_coords=ref_coords,
+        transform_data=transform_data,
+        box_size=box_size,
+        expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+    )
+
+    got = plan.sample(img_vol)
+    expected = _image_warp_oracle_values(img_vol, ref_coords, transform_data, box_size)
+
+    assert got.dtype == np.float32
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_image_warp_sampling_plan_tile_local_scope_exclusion_fails_loudly() -> None:
+    img_vol = np.arange(4 * 6 * 7, dtype=np.float32).reshape(4, 6, 7)
+    transform_data = _transform_data(flow_3d=np.zeros((3, 2, 3, 4), dtype=np.float32))
+    transform_data['_scope'] = {
+        'coverage_mode': 'tile_local',
+        'region_origin_zyx': [1, 2, 2],
+        'region_shape_zyx': [2, 3, 4],
+        'full_volume_shape_zyx': list(img_vol.shape),
+        'tile_grid_shape_yx': [2, 2],
+        'tile_index': 3,
+    }
+    ref_coords = np.asarray([[0.0, 0.0, 0.0], [1.0, 2.0, 2.0]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match='outside tile_local coverage'):
+        _ = _build_image_warp_sampling_plan(
+            img_shape=tuple(img_vol.shape),
+            ref_coords=ref_coords,
+            transform_data=transform_data,
+            box_size=(1, 3, 3),
+            expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+        )
+
+
+def test_image_warp_sampling_plan_rejects_unsupported_flow_2d() -> None:
+    img_vol = np.ones((3, 4, 5), dtype=np.float32)
+    transform_data = _transform_data(flow_3d=np.zeros((3, *img_vol.shape), dtype=np.float32))
+    transform_data['flow_2d'] = np.zeros((2, img_vol.shape[1], img_vol.shape[2]), dtype=np.float32)
+    transform_data['_scope'] = {
+        'coverage_mode': 'full_fov',
+        'region_origin_zyx': [0, 0, 0],
+        'region_shape_zyx': list(img_vol.shape),
+        'full_volume_shape_zyx': list(img_vol.shape),
+    }
+
+    with pytest.raises(ValueError, match='does not support 2D flow'):
+        _ = _build_image_warp_sampling_plan(
+            img_shape=tuple(img_vol.shape),
+            ref_coords=np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32),
+            transform_data=transform_data,
+            expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+        )
+
+
+def test_image_warp_sampling_plan_rejects_missing_non_reference_flow_3d() -> None:
+    img_vol = np.ones((3, 4, 5), dtype=np.float32)
+    transform_data = _transform_data(
+        global_shift_3d=np.asarray([0.25, 0.0, 0.0], dtype=np.float32),
+        flow_3d=None,
+    )
+    transform_data['_scope'] = {
+        'coverage_mode': 'full_fov',
+        'region_origin_zyx': [0, 0, 0],
+        'region_shape_zyx': list(img_vol.shape),
+        'full_volume_shape_zyx': list(img_vol.shape),
+    }
+
+    with pytest.raises(ValueError, match='requires materialized flow_3d'):
+        _ = _build_image_warp_sampling_plan(
+            img_shape=tuple(img_vol.shape),
+            ref_coords=np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32),
+            transform_data=transform_data,
+            expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+        )
+
+
+def test_image_warp_sampling_plan_rejects_unresolved_flow_3d_descriptor() -> None:
+    img_vol = np.ones((3, 4, 5), dtype=np.float32)
+    transform_data = _transform_data(
+        global_shift_3d=np.asarray([0.25, 0.0, 0.0], dtype=np.float32),
+        flow_3d=None,
+    )
+    transform_data['flow_3d'] = _flow_descriptor_payload()
+    transform_data['_scope'] = {
+        'coverage_mode': 'full_fov',
+        'region_origin_zyx': [0, 0, 0],
+        'region_shape_zyx': list(img_vol.shape),
+        'full_volume_shape_zyx': list(img_vol.shape),
+    }
+
+    with pytest.raises(ValueError, match='unresolved manifest metadata'):
+        _ = _build_image_warp_sampling_plan(
+            img_shape=tuple(img_vol.shape),
+            ref_coords=np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32),
+            transform_data=transform_data,
+            expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+        )
+
+
+def test_image_warp_sampling_plan_rejects_full_fov_flow_shape_mismatch() -> None:
+    img_vol = np.ones((3, 4, 5), dtype=np.float32)
+    transform_data = _transform_data(flow_3d=np.zeros((3, 2, 4, 5), dtype=np.float32))
+    transform_data['_scope'] = {
+        'coverage_mode': 'full_fov',
+        'region_origin_zyx': [0, 0, 0],
+        'region_shape_zyx': list(img_vol.shape),
+        'full_volume_shape_zyx': list(img_vol.shape),
+    }
+
+    with pytest.raises(ValueError, match='does not match image volume'):
+        _ = _build_image_warp_sampling_plan(
+            img_shape=tuple(img_vol.shape),
+            ref_coords=np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32),
+            transform_data=transform_data,
+            expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+        )
+
+
+def test_image_warp_sampling_plan_handles_empty_spot_matrix_like_oracle() -> None:
+    img_vol = np.arange(3 * 4 * 5, dtype=np.float32).reshape(3, 4, 5)
+    ref_coords = np.zeros((0, 3), dtype=np.float32)
+    transform_data = _transform_data(flow_3d=np.zeros((3, *img_vol.shape), dtype=np.float32))
+    transform_data['_scope'] = {
+        'coverage_mode': 'full_fov',
+        'region_origin_zyx': [0, 0, 0],
+        'region_shape_zyx': list(img_vol.shape),
+        'full_volume_shape_zyx': list(img_vol.shape),
+    }
+
+    plan = _build_image_warp_sampling_plan(
+        img_shape=tuple(img_vol.shape),
+        ref_coords=ref_coords,
+        transform_data=transform_data,
+        box_size=(1, 3, 3),
+        expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+    )
+
+    got = plan.sample(img_vol)
+    expected = _image_warp_oracle_values(img_vol, ref_coords, transform_data, (1, 3, 3))
+
+    assert got.dtype == np.float32
+    assert got.shape == (0,)
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_image_warp_sampling_plan_preserves_invalid_empty_coordinate_shape_error() -> None:
+    img_vol = np.ones((2, 3, 4), dtype=np.float32)
+    coords = np.asarray([], dtype=np.float32)
+    transform_data = _transform_data(flow_3d=np.zeros((3, *img_vol.shape), dtype=np.float32))
+    transform_data['_scope'] = {
+        'coverage_mode': 'full_fov',
+        'region_origin_zyx': [0, 0, 0],
+        'region_shape_zyx': list(img_vol.shape),
+        'full_volume_shape_zyx': list(img_vol.shape),
+    }
+
+    with pytest.raises(IndexError):
+        _ = _build_image_warp_sampling_plan(
+            img_shape=tuple(img_vol.shape),
+            ref_coords=coords,
+            transform_data=transform_data,
+            box_size=(1, 3, 3),
+            expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+        )
 
 
 def test_signal_miner_native_bridge_uses_optimized_kernel_for_coordinate_mapping() -> None:

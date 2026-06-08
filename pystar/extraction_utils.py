@@ -332,6 +332,207 @@ def _shape_3d(shape: tuple[int, ...], *, field_name: str) -> tuple[int, int, int
     return (int(shape[0]), int(shape[1]), int(shape[2]))
 
 
+@dataclass(frozen=True)
+class _IntegerBoxSumPlan:
+    """Runtime-only integer box-sum geometry for one image shape/spot set."""
+
+    image_shape: tuple[int, int, int]
+    box_size: tuple[int, int, int]
+    n_spots: int
+    interior_idx: npt.NDArray[np.int64]
+    edge_idx: npt.NDArray[np.int64]
+    interior_base: npt.NDArray[np.intp]
+    edge_z: npt.NDArray[np.int32]
+    edge_y: npt.NDArray[np.int32]
+    edge_x: npt.NDArray[np.int32]
+    flat_offsets: tuple[int, ...]
+    z_offsets: tuple[int, ...]
+    y_offsets: tuple[int, ...]
+    x_offsets: tuple[int, ...]
+
+    @classmethod
+    def from_coords(
+        cls,
+        *,
+        image_shape: tuple[int, int, int],
+        coords: FloatArray,
+        box_size: tuple[int, int, int],
+    ) -> "_IntegerBoxSumPlan":
+        d, h, w = image_shape
+        bz, by, bx = box_size
+        rz, ry, rx = bz // 2, by // 2, bx // 2
+        z_offsets = tuple(range(-rz, rz + 1))
+        y_offsets = tuple(range(-ry, ry + 1))
+        x_offsets = tuple(range(-rx, rx + 1))
+        plane_stride = h * w
+        flat_offsets = tuple(
+            dz * plane_stride + dy * w + dx
+            for dz in z_offsets
+            for dy in y_offsets
+            for dx in x_offsets
+        )
+
+        n_spots = len(coords)
+        coords_int = np.rint(coords).astype(np.int32)
+        # Keep the historical shape contract: a one-dimensional empty coordinate
+        # array raises IndexError here rather than being silently reshaped.
+        ic_z = coords_int[:, 0]
+        ic_y = coords_int[:, 1]
+        ic_x = coords_int[:, 2]
+
+        interior_mask = (
+            (ic_z - rz >= 0) & (ic_z + rz < d) &
+            (ic_y - ry >= 0) & (ic_y + ry < h) &
+            (ic_x - rx >= 0) & (ic_x + rx < w)
+        )
+        interior_idx = np.flatnonzero(interior_mask)
+        edge_idx = np.flatnonzero(~interior_mask)
+        interior_base = (
+            ic_z[interior_idx].astype(np.intp, copy=False) * plane_stride
+            + ic_y[interior_idx].astype(np.intp, copy=False) * w
+            + ic_x[interior_idx].astype(np.intp, copy=False)
+        )
+
+        return cls(
+            image_shape=image_shape,
+            box_size=box_size,
+            n_spots=int(n_spots),
+            interior_idx=cast(npt.NDArray[np.int64], interior_idx),
+            edge_idx=cast(npt.NDArray[np.int64], edge_idx),
+            interior_base=cast(npt.NDArray[np.intp], interior_base),
+            edge_z=cast(npt.NDArray[np.int32], ic_z[edge_idx]),
+            edge_y=cast(npt.NDArray[np.int32], ic_y[edge_idx]),
+            edge_x=cast(npt.NDArray[np.int32], ic_x[edge_idx]),
+            flat_offsets=flat_offsets,
+            z_offsets=z_offsets,
+            y_offsets=y_offsets,
+            x_offsets=x_offsets,
+        )
+
+    def sample(self, img_vol: FloatArray) -> FloatArray:
+        img_shape = _shape_3d(tuple(img_vol.shape), field_name='img_vol')
+        if img_shape != self.image_shape:
+            raise ValueError(
+                f"box-sum plan image shape {self.image_shape} does not match img_vol shape {img_shape}"
+            )
+
+        d, h, w = self.image_shape
+        intensities = np.zeros(self.n_spots, dtype=np.float32)
+        if self.n_spots == 0:
+            return intensities
+
+        flat_img = np.ravel(img_vol, order='C')
+        if self.interior_idx.size:
+            interior_values = np.zeros(self.interior_idx.size, dtype=np.float32)
+            for flat_offset in self.flat_offsets:
+                interior_values += flat_img[self.interior_base + flat_offset]
+            intensities[self.interior_idx] = interior_values
+
+        if self.edge_idx.size:
+            edge_values = np.zeros(self.edge_idx.size, dtype=np.float32)
+            for dz in self.z_offsets:
+                cur_z = self.edge_z + dz
+                for dy in self.y_offsets:
+                    cur_y = self.edge_y + dy
+                    for dx in self.x_offsets:
+                        cur_x = self.edge_x + dx
+                        valid_mask = (
+                            (cur_z >= 0) & (cur_z < d) &
+                            (cur_y >= 0) & (cur_y < h) &
+                            (cur_x >= 0) & (cur_x < w)
+                        )
+                        if np.any(valid_mask):
+                            edge_values[valid_mask] += img_vol[
+                                cur_z[valid_mask],
+                                cur_y[valid_mask],
+                                cur_x[valid_mask],
+                            ]
+            intensities[self.edge_idx] = edge_values
+
+        return intensities
+
+
+@dataclass(frozen=True)
+class _ImageWarpSamplingPlan:
+    """Runtime-only plan for native ``image_warp`` extraction reuse.
+
+    The plan captures image-shape, transform, scope, semantics, and integer
+    box-sum geometry that are identical for every sequencing channel in a round.
+    It deliberately keeps the current full-volume warp oracle as the numerical
+    path: sampling still means ``warp_volume_to_reference(...)`` followed by the
+    same integer box-sum semantics, only with reusable validation/box geometry.
+    """
+
+    transform_data: TransformData
+    image_shape: tuple[int, int, int]
+    ref_coords: FloatArray
+    box_size: tuple[int, int, int]
+    expected_field_semantics: Mapping[str, str] | None
+    _box_sum_plan: _IntegerBoxSumPlan
+
+    def sample(self, img_vol: FloatArray) -> FloatArray:
+        img_shape = _shape_3d(tuple(img_vol.shape), field_name='img_vol')
+        if img_shape != self.image_shape:
+            raise ValueError(
+                f"image_warp sampling plan image shape {self.image_shape} does not match img_vol shape {img_shape}"
+            )
+
+        warped = warp_volume_to_reference(
+            img_vol,
+            self.transform_data,
+            expected_field_semantics=self.expected_field_semantics,
+        )
+        return self._box_sum_plan.sample(warped)
+
+
+def _build_image_warp_sampling_plan(
+    *,
+    img_shape: tuple[int, ...],
+    ref_coords: FloatArray,
+    transform_data: TransformData,
+    box_size: tuple[int, int, int] = (1, 3, 3),
+    expected_field_semantics: Mapping[str, str] | None = None,
+) -> _ImageWarpSamplingPlan:
+    """Build a private/runtime-only native image-warp sampling plan.
+
+    Construction performs the same scope/semantics/flow legality checks as the
+    old native image-warp path, but uses only shape and transform metadata.  The
+    returned object is not a persisted artifact and does not expose a new public
+    manifest/API shape.
+    """
+
+    image_shape = _shape_3d(tuple(img_shape), field_name='img_shape')
+    data: TransformData
+    if isinstance(transform_data, RoundExtractionTransformPlan):
+        data = transform_data
+    else:
+        data = {} if transform_data is None else dict(transform_data)
+
+    _ = require_coords_within_transform_scope(
+        ref_coords,
+        data,
+        operation='image_warp extraction',
+    )
+    _validate_image_warp_transform_for_shape(
+        image_shape,
+        data,
+        expected_field_semantics=expected_field_semantics,
+    )
+    box_plan = _IntegerBoxSumPlan.from_coords(
+        image_shape=image_shape,
+        coords=ref_coords,
+        box_size=box_size,
+    )
+    return _ImageWarpSamplingPlan(
+        transform_data=data,
+        image_shape=image_shape,
+        ref_coords=np.asarray(ref_coords, dtype=np.float32),
+        box_size=box_size,
+        expected_field_semantics=expected_field_semantics,
+        _box_sum_plan=box_plan,
+    )
+
+
 def get_transform_scope(transform_data: TransformData) -> dict[str, object] | None:
     """Return normalized spatial coverage metadata for a transform.
 
@@ -435,6 +636,69 @@ def _is_reference_round_transform(transform_data: Mapping[str, object], global_s
     if isinstance(marker, bool):
         return marker
     return bool(np.allclose(global_shift, 0.0) and transform_data.get('flow_2d') is None and transform_data.get('flow_3d') is None)
+
+
+def _prepare_image_warp_transform(
+    transform_data: TransformData,
+    expected_field_semantics: Mapping[str, str] | None,
+) -> tuple[dict[str, object], FloatArray, object]:
+    if isinstance(transform_data, RoundExtractionTransformPlan):
+        data = transform_data.legacy_transform_data()
+        semantics_source: TransformData = transform_data
+    else:
+        data = {} if transform_data is None else dict(transform_data)
+        semantics_source = data
+
+    _raise_if_field_semantics_mismatch(
+        semantics_source,
+        expected_field_semantics,
+        operation='image_warp extraction',
+    )
+
+    global_shift = np.asarray(data.get('global_shift_3d', np.zeros(3, dtype=np.float32)), dtype=np.float32)
+    flow_3d = data.get('flow_3d')
+    flow_2d = data.get('flow_2d')
+    _require_materialized_flow(flow_2d, 'flow_2d')
+    _require_materialized_flow(flow_3d, 'flow_3d')
+    if flow_2d is not None:
+        raise ValueError('image_warp mode does not support 2D flow yet')
+    if flow_3d is None and not _is_reference_round_transform(data, global_shift):
+        raise ValueError(
+            'image_warp mode requires materialized flow_3d for non-reference rounds; '
+            'coordinate_mapping is the legacy diagnostic path for non-3D transforms'
+        )
+
+    return data, cast(FloatArray, global_shift), flow_3d
+
+
+def _validate_image_warp_transform_for_shape(
+    image_shape: tuple[int, int, int],
+    transform_data: TransformData,
+    *,
+    expected_field_semantics: Mapping[str, str] | None = None,
+) -> None:
+    data, _, flow_3d = _prepare_image_warp_transform(transform_data, expected_field_semantics)
+    if not isinstance(flow_3d, np.ndarray):
+        return
+
+    scope = get_transform_scope(transform_data if isinstance(transform_data, RoundExtractionTransformPlan) else data)
+    if scope is not None and scope.get('coverage_mode') == 'tile_local':
+        origin = scope['region_origin_zyx']
+        region_shape = scope['region_shape_zyx']
+        if not isinstance(origin, tuple) or not isinstance(region_shape, tuple):
+            raise ValueError('transform _scope is malformed for tile_local image_warp extraction')
+        dz, dy, dx = region_shape
+        if flow_3d.shape[1:] != (dz, dy, dx):
+            raise ValueError(
+                f"tile_local flow_3d shape {flow_3d.shape[1:]} does not match persisted scope region {(dz, dy, dx)}"
+            )
+        return
+
+    if flow_3d.shape[1:] != image_shape:
+        raise ValueError(
+            f"image_warp flow_3d shape {flow_3d.shape[1:]} does not match image volume {image_shape}; "
+            'persist explicit _scope metadata for tile_local artifacts'
+        )
 
 
 def map_spot_coordinates(
@@ -571,63 +835,12 @@ def extract_box_sum_integer(img_vol: FloatArray, coords: FloatArray, box_size: t
     zero; they are not renormalized by the number of in-bounds voxels. This
     matches the fail-simple box-sum semantics used by the pipeline miners.
     """
-    d, h, w = img_vol.shape
-    bz, by, bx = box_size
-    rz, ry, rx = bz // 2, by // 2, bx // 2
-
-    n_spots = len(coords)
-    intensities = np.zeros(n_spots, dtype=np.float32)
-
-    coords_int = np.rint(coords).astype(np.int32)
-    ic_z = coords_int[:, 0]
-    ic_y = coords_int[:, 1]
-    ic_x = coords_int[:, 2]
-    if n_spots == 0:
-        return intensities
-
-    interior_mask = (
-        (ic_z - rz >= 0) & (ic_z + rz < d) &
-        (ic_y - ry >= 0) & (ic_y + ry < h) &
-        (ic_x - rx >= 0) & (ic_x + rx < w)
-    )
-    interior_idx = np.flatnonzero(interior_mask)
-    edge_idx = np.flatnonzero(~interior_mask)
-
-    plane_stride = h * w
-    flat_img = np.ravel(img_vol, order='C')
-
-    if interior_idx.size:
-        base = ic_z[interior_idx] * plane_stride + ic_y[interior_idx] * w + ic_x[interior_idx]
-        interior_values = np.zeros(interior_idx.size, dtype=np.float32)
-        for dz in range(-rz, rz + 1):
-            dz_offset = dz * plane_stride
-            for dy in range(-ry, ry + 1):
-                row_offset = dz_offset + dy * w
-                for dx in range(-rx, rx + 1):
-                    interior_values += flat_img[base + row_offset + dx]
-        intensities[interior_idx] = interior_values
-
-    if edge_idx.size:
-        edge_values = np.zeros(edge_idx.size, dtype=np.float32)
-        edge_z = ic_z[edge_idx]
-        edge_y = ic_y[edge_idx]
-        edge_x = ic_x[edge_idx]
-        for dz in range(-rz, rz + 1):
-            cur_z = edge_z + dz
-            for dy in range(-ry, ry + 1):
-                cur_y = edge_y + dy
-                for dx in range(-rx, rx + 1):
-                    cur_x = edge_x + dx
-                    valid_mask = (
-                        (cur_z >= 0) & (cur_z < d) &
-                        (cur_y >= 0) & (cur_y < h) &
-                        (cur_x >= 0) & (cur_x < w)
-                    )
-                    if np.any(valid_mask):
-                        edge_values[valid_mask] += img_vol[cur_z[valid_mask], cur_y[valid_mask], cur_x[valid_mask]]
-        intensities[edge_idx] = edge_values
-
-    return intensities
+    image_shape = _shape_3d(tuple(img_vol.shape), field_name='img_vol')
+    return _IntegerBoxSumPlan.from_coords(
+        image_shape=image_shape,
+        coords=coords,
+        box_size=box_size,
+    ).sample(img_vol)
 
 
 def warp_volume_to_reference(
@@ -649,32 +862,7 @@ def warp_volume_to_reference(
     the covered subvolume. In that mode only the scoped region is locally
     deformed and stitched back into the full warped volume.
     """
-    data: dict[str, object]
-    if isinstance(transform_data, RoundExtractionTransformPlan):
-        data = transform_data.legacy_transform_data()
-        semantics_source: TransformData = transform_data
-    else:
-        data = {} if transform_data is None else dict(transform_data)
-        semantics_source = data
-    _raise_if_field_semantics_mismatch(
-        semantics_source,
-        expected_field_semantics,
-        operation='image_warp extraction',
-    )
-
-    global_shift = np.asarray(data.get('global_shift_3d', np.zeros(3, dtype=np.float32)), dtype=np.float32)
-    flow_3d = data.get('flow_3d')
-    flow_2d = data.get('flow_2d')
-    _require_materialized_flow(flow_2d, 'flow_2d')
-    _require_materialized_flow(flow_3d, 'flow_3d')
-    if flow_2d is not None:
-        raise ValueError('image_warp mode does not support 2D flow yet')
-    if flow_3d is None and not _is_reference_round_transform(data, global_shift):
-        raise ValueError(
-            'image_warp mode requires materialized flow_3d for non-reference rounds; '
-            'coordinate_mapping is the legacy diagnostic path for non-3D transforms'
-        )
-
+    data, global_shift, flow_3d = _prepare_image_warp_transform(transform_data, expected_field_semantics)
     img_shape = _shape_3d(img_vol.shape, field_name='img_vol')
     z_coords, y_coords, x_coords = _sparse_coordinate_bases_3d(img_shape)
     warped = _map_coordinates_float32(
@@ -788,11 +976,12 @@ def extract_signal_volume(
         return extract_box_sum_integer(img_vol, target_coords, box_size)
 
     if transform_application_mode == 'image_warp':
-        warped = warp_volume_to_reference(
-            img_vol,
-            data,
+        return _build_image_warp_sampling_plan(
+            img_shape=tuple(img_vol.shape),
+            ref_coords=ref_coords,
+            transform_data=data,
+            box_size=box_size,
             expected_field_semantics=expected_field_semantics,
-        )
-        return extract_box_sum_integer(warped, ref_coords, box_size)
+        ).sample(img_vol)
 
     raise ValueError(f'Unsupported transform application mode: {transform_application_mode}')
