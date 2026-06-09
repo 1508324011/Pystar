@@ -11,8 +11,11 @@ from pystar._registration_performance import (
     REGISTRATION_PERFORMANCE_SCHEMA_NAME,
     REGISTRATION_PERFORMANCE_SCHEMA_VERSION,
     RegistrationPerformanceRecorder,
+    array_diagnostics_descriptor,
+    array_shape_diagnostics_descriptor,
     get_registration_performance_path,
     load_registration_performance_diagnostics,
+    memory_delta_diagnostics,
     timing_record,
     validate_registration_performance_payload,
 )
@@ -132,6 +135,47 @@ def test_native_style_registration_diagnostics_round_trip_and_manifest_timings(t
     recorder.start_round(1, is_reference_round=True)
     recorder.complete_round(1)
     recorder.start_round(2, is_reference_round=False)
+    ref_volume = np.zeros((2, 4, 5), dtype=np.float32)
+    mov_volume = np.ones((2, 4, 5), dtype=np.float32)
+    recorder.record_registration_work_plan(
+        2,
+        {
+            "round_id": 2,
+            "reference_round": 1,
+            "global_provider": "native",
+            "global_method": "phase_corr_3d",
+            "local_provider": "native",
+            "local_method": "demons_3d",
+            "local_enabled": True,
+            "local_execution_mode": "full_volume_native_demons_3d",
+            "selection_reason": "synthetic test plan",
+            "scope_descriptor": {
+                "coverage_mode": "full_fov",
+                "region_origin_zyx": [0, 0, 0],
+                "region_shape_zyx": [2, 4, 5],
+                "full_volume_shape_zyx": [2, 4, 5],
+            },
+            "scope_coverage_mode": "full_fov",
+            "scope_region_origin_zyx": [0, 0, 0],
+            "scope_region_shape_zyx": [2, 4, 5],
+            "reference_volume": array_diagnostics_descriptor(ref_volume, role="reference_scope_3d"),
+            "moving_volume": array_diagnostics_descriptor(mov_volume, role="moving_scope_3d"),
+            "expected_local_flow": array_shape_diagnostics_descriptor((3, 2, 4, 5), role="expected_flow_3d"),
+            "expected_flow_3d": array_shape_diagnostics_descriptor((3, 2, 4, 5), role="expected_flow_3d"),
+            "flow_3d_persisted": False,
+            "flow_3d_sidecar_path": None,
+            "flow_3d_sidecar_size_bytes": None,
+        },
+    )
+    recorder.record_memory_telemetry(
+        2,
+        memory_delta_diagnostics(
+            "native_demons_registration_compute",
+            {"source": "procfs", "rss_bytes": 1000, "available_memory_bytes": 8000},
+            {"source": "procfs", "rss_bytes": 1256, "available_memory_bytes": 7600},
+            details={"local_execution_mode": "full_volume_native_demons_3d"},
+        ),
+    )
     recorder.record_round_timing(2, "moving_clean_volume_load", 4.0)
     recorder.record_round_timing(2, "moving_scope_crop", 5.0)
     recorder.record_global_registration(
@@ -165,6 +209,17 @@ def test_native_style_registration_diagnostics_round_trip_and_manifest_timings(t
     assert payload["stage_id"] == "registration"
     assert payload["source_stage_elapsed_wall_ms"] == 100.0
     assert payload["summary"]["moving_round_count"] == 1
+    assert payload["summary"]["registration_work_plan_status"] == "present"
+    assert payload["summary"]["registration_work_plan_count"] == 1
+    assert payload["summary"]["registration_local_execution_mode_counts"] == {"full_volume_native_demons_3d": 1}
+    assert payload["summary"]["registration_reference_volume_total_nbytes"] == ref_volume.nbytes
+    assert payload["summary"]["registration_moving_volume_total_nbytes"] == mov_volume.nbytes
+    assert payload["summary"]["registration_expected_flow_total_nbytes"] == 3 * ref_volume.nbytes
+    assert payload["summary"]["registration_memory_telemetry_status"] == "present"
+    assert payload["summary"]["registration_memory_telemetry_sample_count"] == 1
+    assert payload["summary"]["registration_rss_delta_max_bytes"] == 256
+    assert payload["rounds"][1]["work_plan"]["reference_volume"]["nbytes"] == ref_volume.nbytes
+    assert payload["rounds"][1]["memory_telemetry"][0]["rss_delta_bytes"] == 256
     assert payload["summary"]["matlab_boundary_call_count"] == 0
     assert payload["manifest"]["save_transform_manifest"]["elapsed_wall_ms"] == 11.0
     assert payload["manifest"]["load_transform_manifest"]["elapsed_wall_ms"] == 12.0
@@ -915,6 +970,59 @@ def test_elapsed_timing_validation_rejects_negative_nan_and_infinite_values() ->
             _ = timing_record("bad_phase", bad_value)
 
 
+def test_malformed_work_plan_and_memory_telemetry_fail_payload_validation() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers())
+    recorder.start_round(2, is_reference_round=False)
+    recorder.record_registration_work_plan(
+        2,
+        {
+            "round_id": 2,
+            "reference_round": 1,
+            "local_execution_mode": "full_volume_native_demons_3d",
+            "reference_volume": array_shape_diagnostics_descriptor((2, 4, 5), role="reference_scope_3d"),
+            "moving_volume": array_shape_diagnostics_descriptor((2, 4, 5), role="moving_scope_3d"),
+            "expected_local_flow": array_shape_diagnostics_descriptor((3, 2, 4, 5), role="expected_flow_3d"),
+        },
+    )
+    recorder.record_memory_telemetry(
+        2,
+        memory_delta_diagnostics(
+            "local_registration_dispatch",
+            {"source": "procfs", "rss_bytes": 1000, "available_memory_bytes": None},
+            {"source": "procfs", "rss_bytes": 900, "available_memory_bytes": None},
+        ),
+    )
+    payload = recorder.build_payload()
+
+    malformed_work_plan = cast(dict[str, Any], dict(payload))
+    malformed_work_plan["rounds"] = [dict(round_entry) for round_entry in cast(list[dict[str, Any]], payload["rounds"])]
+    bad_plan = dict(cast(dict[str, Any], malformed_work_plan["rounds"][0]["work_plan"]))
+    bad_reference_volume = dict(cast(dict[str, Any], bad_plan["reference_volume"]))
+    bad_reference_volume["nbytes"] = bad_reference_volume["nbytes"] + 1
+    bad_plan["reference_volume"] = bad_reference_volume
+    malformed_work_plan["rounds"][0]["work_plan"] = bad_plan
+    with pytest.raises(ValueError, match="work_plan.*reference_volume.*nbytes"):
+        validate_registration_performance_payload(malformed_work_plan, expected_fov_id=FOV_ID)
+
+    malformed_sidecar_path = cast(dict[str, Any], dict(payload))
+    malformed_sidecar_path["rounds"] = [
+        dict(round_entry) for round_entry in cast(list[dict[str, Any]], payload["rounds"])
+    ]
+    bad_sidecar_plan = dict(cast(dict[str, Any], malformed_sidecar_path["rounds"][0]["work_plan"]))
+    bad_sidecar_plan["flow_3d_sidecar_path"] = 123
+    malformed_sidecar_path["rounds"][0]["work_plan"] = bad_sidecar_plan
+    with pytest.raises(ValueError, match="work_plan.*flow_3d_sidecar_path"):
+        validate_registration_performance_payload(malformed_sidecar_path, expected_fov_id=FOV_ID)
+
+    malformed_memory = cast(dict[str, Any], dict(payload))
+    malformed_memory["rounds"] = [dict(round_entry) for round_entry in cast(list[dict[str, Any]], payload["rounds"])]
+    memory_records = [dict(record) for record in cast(list[dict[str, Any]], malformed_memory["rounds"][0]["memory_telemetry"])]
+    memory_records[0]["rss_delta_bytes"] = 12345
+    malformed_memory["rounds"][0]["memory_telemetry"] = memory_records
+    with pytest.raises(ValueError, match="memory_telemetry.*rss_delta_bytes"):
+        validate_registration_performance_payload(malformed_memory, expected_fov_id=FOV_ID)
+
+
 def test_flow_sidecar_persistence_summary_records_descriptor_path_shape_dtype_and_size(tmp_path: Path) -> None:
     paths = get_fov_output_structure(tmp_path, FOV_ID)
     sidecar_path = paths["transforms"] / f"transforms_fov_{FOV_ID}_round_2_flow_3d.npy"
@@ -928,11 +1036,32 @@ def test_flow_sidecar_persistence_summary_records_descriptor_path_shape_dtype_an
     }
     recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers())
     recorder.start_round(2, is_reference_round=False)
+    recorder.record_registration_work_plan(
+        2,
+        {
+            "round_id": 2,
+            "reference_round": 1,
+            "global_provider": "native",
+            "global_method": "phase_corr_3d",
+            "local_provider": "native",
+            "local_method": "demons_3d",
+            "local_execution_mode": "full_volume_native_demons_3d",
+            "selection_reason": "synthetic sidecar test",
+            "reference_volume": array_shape_diagnostics_descriptor((2, 4, 5), role="reference_scope_3d"),
+            "moving_volume": array_shape_diagnostics_descriptor((2, 4, 5), role="moving_scope_3d"),
+            "expected_local_flow": array_shape_diagnostics_descriptor(flow.shape, role="expected_flow_3d"),
+            "expected_flow_3d": array_shape_diagnostics_descriptor(flow.shape, role="expected_flow_3d"),
+            "flow_3d_persisted": False,
+            "flow_3d_sidecar_path": None,
+            "flow_3d_sidecar_size_bytes": None,
+        },
+    )
     recorder.record_flow_sidecar_persistence(
         2,
         elapsed_wall_ms=13.0,
         descriptor=descriptor,
         sidecar_path=sidecar_path,
+        in_memory_flow=flow,
     )
 
     payload = recorder.build_payload()
@@ -947,6 +1076,11 @@ def test_flow_sidecar_persistence_summary_records_descriptor_path_shape_dtype_an
     assert flow_summary["size_bytes"] == sidecar_path.stat().st_size
     assert round_record["details"]["descriptor"]["shape"] == [3, 2, 4, 5]
     assert round_record["details"]["descriptor"]["dtype"] == "float32"
+    assert round_record["details"]["in_memory_flow"]["nbytes"] == flow.nbytes
+    assert payload["rounds"][0]["work_plan"]["flow_3d_persisted"] is True
+    assert payload["rounds"][0]["work_plan"]["flow_3d_sidecar_path"] == str(sidecar_path)
+    assert payload["rounds"][0]["work_plan"]["flow_3d_sidecar_size_bytes"] == sidecar_path.stat().st_size
+    assert payload["rounds"][0]["work_plan"]["produced_flow_3d"]["nbytes"] == flow.nbytes
 
 
 def test_load_diagnostics_rejects_malformed_schema_and_fov_mismatch(tmp_path: Path) -> None:
