@@ -408,6 +408,26 @@ def test_actual_matlab_local_plan_carries_stage18a_request_identity() -> None:
     assert report.passed is True
 
 
+def test_matlab_local_plan_still_forwards_configured_pyramid_levels() -> None:
+    tile = _layout().tiles[0]
+    cfg = _matlab_plan_config()
+    cfg.pipeline.registration.demons_3d.pyramid_levels = 4
+
+    request = build_matlab_local_registration_plan(
+        cfg,
+        fov_id=FOV_ID,
+        round_id=ROUND_ID,
+        reference_round=REFERENCE_ROUND,
+        scope_descriptor=_scope_descriptor(),
+        volume_shape_zyx=tile.region_shape_zyx,
+        compute_tile=tile.as_dict(),
+    )
+
+    assert request["provider"] == "matlab"
+    assert request["method"] == "demons_3d"
+    assert request["pyramid_levels"] == 4
+
+
 def test_parallel_results_are_restored_by_tile_index_before_stitching() -> None:
     layout = _layout()
     out_of_order = tuple(_result(tile) for tile in reversed(layout.tiles))
