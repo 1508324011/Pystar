@@ -6,6 +6,7 @@ from typing import Any, cast
 
 import numpy as np
 import pytest
+from numpy.typing import NDArray
 
 from pystar._registration_performance import (
     REGISTRATION_PERFORMANCE_SCHEMA_NAME,
@@ -20,9 +21,12 @@ from pystar._registration_performance import (
     validate_registration_performance_payload,
 )
 from pystar.io import get_fov_output_structure
+from pystar.registration import _run_tiled_native_demons_registration
+from pystar.tiling import build_yx_tile_layout, extract_tile, stitch_tiles
 
 
 FOV_ID = 5
+FloatArray = NDArray[np.float32]
 
 
 def _boundary_trace(
@@ -349,6 +353,160 @@ def test_tiled_matlab_local_diagnostics_preserve_tile_identity_and_boundary_mapp
     assert payload["summary"]["tile_count"] == 1
     assert payload["summary"]["matlab_local_boundary_call_count"] == 1
     assert payload["summary"]["slowest_tiles"][0]["tile_index"] == 3
+
+
+def test_tiled_native_local_diagnostics_preserve_array_descriptors_without_matlab_boundary() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers())
+    recorder.start_round(2, is_reference_round=False)
+    recorder.record_tiled_local_tile(
+        2,
+        tile_identity={
+            "tile_index": 1,
+            "grid_position_yx": [0, 0],
+            "grid_shape_yx": [1, 2],
+            "region_origin_zyx": [0, 0, 0],
+            "region_shape_zyx": [2, 4, 5],
+            "write_origin_zyx": [0, 0, 0],
+            "write_shape_zyx": [2, 4, 5],
+            "write_offset_zyx": [0, 0, 0],
+            "full_volume_shape_zyx": [2, 4, 10],
+        },
+        total_elapsed_wall_ms=30.0,
+        extraction_elapsed_wall_ms=4.0,
+        backend_call_elapsed_wall_ms=21.0,
+        flow_validation_elapsed_wall_ms=5.0,
+        normalized_result={
+            "provider": "native",
+            "method": "demons_3d",
+            "flow_3d_shape": [3, 2, 4, 5],
+            "flow_3d_dtype": "float32",
+            "flow_3d_nbytes": 3 * 2 * 4 * 5 * 4,
+            "flow_3d_descriptor": array_shape_diagnostics_descriptor(
+                (3, 2, 4, 5),
+                dtype=np.float32,
+                role="native_tiled_flow_3d",
+            ),
+            "mean_abs_displacement": 0.25,
+        },
+    )
+    recorder.record_tiled_local_summary(
+        2,
+        layout_summary={"enabled": True, "grid_shape_yx": [1, 2], "tile_count": 2},
+        stitch_elapsed_wall_ms=3.0,
+    )
+
+    payload = recorder.build_payload()
+    tile = payload["rounds"][0]["tiled_local"]["tiles"][0]
+
+    assert tile["normalized_result"]["provider"] == "native"
+    assert tile["normalized_result"]["method"] == "demons_3d"
+    assert tile["normalized_result"]["flow_3d_shape"] == [3, 2, 4, 5]
+    assert tile["normalized_result"]["flow_3d_dtype"] == "float32"
+    assert tile["normalized_result"]["flow_3d_nbytes"] == 480
+    assert tile["normalized_result"]["flow_3d_descriptor"]["nbytes"] == 480
+    assert tile["normalized_result"]["mean_abs_displacement"] == 0.25
+    assert tile["timings"]["tile_extraction"]["elapsed_wall_ms"] == 4.0
+    assert tile["timings"]["backend_call"]["elapsed_wall_ms"] == 21.0
+    assert tile["timings"]["flow_validation"]["elapsed_wall_ms"] == 5.0
+    assert payload["summary"]["tile_count"] == 1
+    assert payload["summary"]["matlab_local_boundary_call_count"] == 0
+    assert payload["summary"]["nested_phase_totals_ms"]["backend_call"] == 21.0
+    assert payload["summary"]["slowest_tiles"][0]["tile_index"] == 1
+
+
+def test_native_tiled_demons_runtime_records_per_tile_diagnostics(monkeypatch: pytest.MonkeyPatch) -> None:
+    import pystar.registration as registration_module
+
+    ref = np.arange(2 * 4 * 4, dtype=np.float32).reshape((2, 4, 4))
+    mov = ref + np.float32(1.0)
+    layout = build_yx_tile_layout(
+        (2, 4, 4),
+        grid_shape_yx=(2, 2),
+        overlap_yx=(0, 0),
+        grid_source="stage16_native_fixture",
+    )
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers())
+    recorder.start_round(2, is_reference_round=False)
+
+    def fake_native_demons(ref_tile: FloatArray, mov_tile: FloatArray, config_obj: object) -> FloatArray:
+        del mov_tile, config_obj
+        return np.full((3, *ref_tile.shape), float(ref_tile.mean()), dtype=np.float32)
+
+    monkeypatch.setattr(registration_module, "register_local_demons_3d", fake_native_demons)
+
+    stitched, summary = _run_tiled_native_demons_registration(
+        ref,
+        mov,
+        object(),
+        layout,
+        round_id=2,
+        diagnostics=recorder,
+    )
+    assert stitched is not None
+
+    expected_tiles = []
+    for tile in layout.tiles:
+        expected_tile_value = float(np.asarray(extract_tile(ref, tile), dtype=np.float32).mean())
+        expected_tiles.append(
+            (
+                tile,
+                np.full((3, *tile.region_shape_zyx), expected_tile_value, dtype=np.float32),
+            )
+        )
+    expected = stitch_tiles(expected_tiles, full_shape_zyx=(2, 4, 4))
+    np.testing.assert_array_equal(stitched, expected)
+    assert summary["tiles"][0]["provider"] == "native"
+
+    payload = recorder.build_payload()
+    tiled = payload["rounds"][0]["tiled_local"]
+    assert tiled["layout"]["tile_count"] == 4
+    assert len(tiled["tiles"]) == 4
+    first_tile = tiled["tiles"][0]
+    assert first_tile["timings"]["tile_extraction"]["elapsed_wall_ms"] >= 0.0
+    assert first_tile["timings"]["backend_call"]["elapsed_wall_ms"] >= 0.0
+    assert first_tile["timings"]["flow_validation"]["elapsed_wall_ms"] >= 0.0
+    assert first_tile["normalized_result"]["provider"] == "native"
+    assert first_tile["normalized_result"]["method"] == "demons_3d"
+    assert first_tile["normalized_result"]["flow_3d_shape"] == [3, 2, 2, 2]
+    assert first_tile["normalized_result"]["flow_3d_dtype"] == "float32"
+    assert first_tile["normalized_result"]["flow_3d_descriptor"]["role"] == "native_tiled_flow_3d"
+    assert first_tile["normalized_result"]["flow_3d_nbytes"] == 3 * 2 * 2 * 2 * 4
+    expected_first_mean = float(np.asarray(extract_tile(ref, layout.tiles[0]), dtype=np.float32).mean())
+    assert first_tile["normalized_result"]["mean_abs_displacement"] == pytest.approx(expected_first_mean)
+    assert payload["summary"]["tile_count"] == 4
+    assert payload["summary"]["nested_phase_totals_ms"]["tiled_local_stitch"] >= 0.0
+    assert payload["summary"]["matlab_local_boundary_call_count"] == 0
+    assert payload["summary"]["slowest_tiles"][0]["tile_index"] in {1, 2, 3, 4}
+
+
+def test_native_tiled_demons_bad_tile_flow_shape_fails_loudly(monkeypatch: pytest.MonkeyPatch) -> None:
+    import pystar.registration as registration_module
+
+    ref = np.zeros((2, 4, 4), dtype=np.float32)
+    mov = np.ones((2, 4, 4), dtype=np.float32)
+    layout = build_yx_tile_layout(
+        (2, 4, 4),
+        grid_shape_yx=(2, 2),
+        overlap_yx=(0, 0),
+        grid_source="stage16_native_fixture",
+    )
+
+    def fake_bad_native_demons(ref_tile: FloatArray, mov_tile: FloatArray, config_obj: object) -> FloatArray:
+        del mov_tile, config_obj
+        return np.zeros((3, ref_tile.shape[0], ref_tile.shape[1], ref_tile.shape[2] + 1), dtype=np.float32)
+
+    monkeypatch.setattr(registration_module, "register_local_demons_3d", fake_bad_native_demons)
+
+    with pytest.raises(
+        ValueError,
+        match="Native tiled demons_3d returned flow_3d with incompatible tile shape",
+    ):
+        _ = _run_tiled_native_demons_registration(
+            ref,
+            mov,
+            object(),
+            layout,
+        )
 
 
 def test_matlab_local_internal_steps_normalize_and_aggregate_without_matlab() -> None:

@@ -513,6 +513,8 @@ def register_local_demons_3d(
     -------
     displacement_field : np.ndarray (3, Z, Y, X) -> [dz, dy, dx]
     """
+
+    pyramid_levels = _validate_native_demons_pyramid_levels(config_obj)
     
     # 1. 转换为 SimpleITK 格式
     fixed_sitk = sitk.GetImageFromArray(ref_3d.astype(np.float32))
@@ -528,21 +530,17 @@ def register_local_demons_3d(
     # 参数对应 MATLAB 的设置
     demons.SetNumberOfIterations(getattr(config_obj, 'num_iter', 50))
     demons.SetStandardDeviations(getattr(config_obj, 'smoothing_sigma', 1.0))
-    
-    # 4. 多分辨率策略（对应 MATLAB 的 PyramidLevels）
-    # MATLAB: pyd_level = floor(log2(obj.dimZ))
-    pyd_level = int(np.floor(np.log2(ref_3d.shape[0])))
-    if pyd_level == 0:
-        pyd_level = 1
-    
-    # 使用 MultiResolution 包装器
-    registration_method = sitk.ImageRegistrationMethod()
-    registration_method.SetShrinkFactorsPerLevel([2**i for i in range(pyd_level, 0, -1)])
-    registration_method.SetSmoothingSigmasPerLevel([2.0*i for i in range(pyd_level, 0, -1)])
+
+    pyramid_status = (
+        "pyramid_levels=1 (single native level; no SimpleITK pyramid)"
+        if pyramid_levels == 1
+        else "pyramid_levels unset (native SimpleITK DemonsRegistrationFilter has no pyramid)"
+    )
     
     try:
-        # 5. 执行配准
-        print(f"  [Demons 3D] Starting registration (pyramid levels: {pyd_level})...")
+        # 4. 执行配准。Do not configure ImageRegistrationMethod pyramid here:
+        # those settings do not affect this direct DemonsRegistrationFilter.Execute call.
+        print(f"  [Demons 3D] Starting registration ({pyramid_status})...")
         displacement_field_sitk = demons.Execute(fixed_sitk, moving_sitk)
         
         # 6. 转换为 numpy 格式
@@ -562,6 +560,47 @@ def register_local_demons_3d(
     except Exception as e:
         warnings.warn(f"Demons 3D registration failed: {e}")
         return None
+
+
+def _validate_native_demons_pyramid_levels(config_obj: Any) -> Optional[int]:
+    """Validate native SimpleITK demons pyramid semantics.
+
+    PyStar's native 3D demons implementation calls ``DemonsRegistrationFilter``
+    directly.  SimpleITK ``ImageRegistrationMethod`` multi-resolution settings
+    are not consumed by that direct filter call, so accepting a multi-level
+    native ``pyramid_levels`` value would be a placebo knob.  MATLAB provider
+    plan construction remains separate and still forwards ``pyramid_levels``.
+    """
+
+    raw_levels = getattr(config_obj, 'pyramid_levels', None)
+    if raw_levels is None:
+        return None
+    if isinstance(raw_levels, bool):
+        raise ValueError(
+            "registration.local.params.demons_3d.pyramid_levels must be a positive integer "
+            "when provided; booleans are not valid pyramid levels"
+        )
+    if not isinstance(raw_levels, (int, np.integer)):
+        raise ValueError(
+            "registration.local.params.demons_3d.pyramid_levels must be a positive integer "
+            f"when provided, got {raw_levels!r}"
+        )
+    levels = int(raw_levels)
+    if levels <= 0:
+        raise ValueError(
+            "registration.local.params.demons_3d.pyramid_levels must be positive when provided"
+        )
+    if levels > 1:
+        raise ValueError(
+            "registration.local.params.demons_3d.pyramid_levels is not supported for native "
+            "demons_3d when greater than 1: PyStar's native path calls SimpleITK "
+            "DemonsRegistrationFilter.Execute(...) directly, and ImageRegistrationMethod "
+            "pyramid settings do not affect that filter. Set pyramid_levels to None/1 "
+            "for native demons_3d, or use registration.local.provider='matlab' for "
+            "MATLAB PyramidLevels semantics."
+        )
+    return levels
+
 
 def apply_warp_field_2d(img_2d: FloatArray, flow: FloatArray) -> FloatArray:
     """
@@ -779,6 +818,9 @@ def _run_tiled_native_demons_registration(
     mov_volume_zyx: FloatArray,
     config_obj: Any,
     layout: TileLayout,
+    *,
+    round_id: Optional[int] = None,
+    diagnostics: Optional[RegistrationPerformanceRecorder] = None,
 ) -> Tuple[Optional[FloatArray], Dict[str, Any]]:
     print(
         "     [Tiling] Native demons_3d on "
@@ -788,34 +830,79 @@ def _run_tiled_native_demons_registration(
     tile_outputs: list[tuple[TileSpec, FloatArray]] = []
     tile_summaries: list[Dict[str, Any]] = []
     for tile in layout.tiles:
+        tile_total_started = diagnostics_timer_start()
         tile_label = f"tile {tile.tile_index}/{layout.tile_count}"
         print(
             f"       [Tiling] {tile_label} | origin={tile.region_origin_zyx} shape={tile.region_shape_zyx}"
         )
+        tile_extract_started = diagnostics_timer_start()
         ref_tile = np.asarray(extract_tile(ref_volume_zyx, tile), dtype=np.float32)
         mov_tile = np.asarray(extract_tile(mov_volume_zyx, tile), dtype=np.float32)
+        tile_extract_ms = elapsed_ms_since(tile_extract_started)
+        native_call_started = diagnostics_timer_start()
         flow_tile = register_local_demons_3d(ref_tile, mov_tile, config_obj)
+        native_call_ms = elapsed_ms_since(native_call_started)
         if flow_tile is None:
             raise RuntimeError(
                 "Tiled native demons_3d returned no flow for "
                 f"{tile_label}; refusing to silently degrade local registration."
             )
 
-        tile_outputs.append((tile, np.asarray(flow_tile, dtype=np.float32)))
+        flow_validation_started = diagnostics_timer_start()
+        flow_tile = np.asarray(flow_tile, dtype=np.float32)
+        expected_shape = (3, *tile.region_shape_zyx)
+        if flow_tile.shape != expected_shape:
+            raise ValueError(
+                "Native tiled demons_3d returned flow_3d with incompatible tile shape: "
+                f"expected {expected_shape}, got {flow_tile.shape} for tile {tile.tile_index}"
+            )
+        mean_abs_displacement = float(np.abs(flow_tile).mean())
+        flow_validation_ms = elapsed_ms_since(flow_validation_started)
+
+        tile_outputs.append((tile, flow_tile))
         tile_summaries.append(
             {
                 **tile.as_dict(),
                 "provider": "native",
                 "status": "completed",
-                "mean_abs_displacement": float(np.abs(flow_tile).mean()),
+                "mean_abs_displacement": mean_abs_displacement,
             }
         )
 
+        if diagnostics is not None and round_id is not None and int(round_id) >= 0:
+            flow_descriptor = array_diagnostics_descriptor(flow_tile, role="native_tiled_flow_3d")
+            diagnostics.record_tiled_local_tile(
+                int(round_id),
+                tile_identity=tile.as_dict(),
+                total_elapsed_wall_ms=elapsed_ms_since(tile_total_started),
+                extraction_elapsed_wall_ms=tile_extract_ms,
+                backend_call_elapsed_wall_ms=native_call_ms,
+                flow_validation_elapsed_wall_ms=flow_validation_ms,
+                normalized_result={
+                    "provider": "native",
+                    "method": "demons_3d",
+                    "flow_3d_shape": [int(value) for value in flow_tile.shape],
+                    "flow_3d_dtype": str(flow_tile.dtype),
+                    "flow_3d_nbytes": int(flow_tile.nbytes),
+                    "flow_3d_descriptor": flow_descriptor,
+                    "mean_abs_displacement": mean_abs_displacement,
+                },
+            )
+
+    stitch_started = diagnostics_timer_start()
     stitched = np.asarray(
         stitch_tiles(tile_outputs, full_shape_zyx=layout.full_volume_shape_zyx),
         dtype=np.float32,
     )
-    return stitched, _build_tiling_summary(layout, tile_summaries)
+    stitch_ms = elapsed_ms_since(stitch_started)
+    tiling_summary = _build_tiling_summary(layout, tile_summaries)
+    if diagnostics is not None and round_id is not None and int(round_id) >= 0:
+        diagnostics.record_tiled_local_summary(
+            int(round_id),
+            layout_summary=tiling_summary,
+            stitch_elapsed_wall_ms=stitch_ms,
+        )
+    return stitched, tiling_summary
 
 
 def _run_tiled_matlab_demons_registration(
@@ -1833,6 +1920,8 @@ class RegistrationEngine:
                 mov_shifted_3d,
                 self.cfg.pipeline.registration.demons_3d,
                 tiling_layout,
+                round_id=int(context.round_id),
+                diagnostics=self._registration_diagnostics,
             )
         native_memory_after = sample_process_memory() if native_memory_before is not None else None
         if self._registration_diagnostics is not None and context.round_id >= 0:
