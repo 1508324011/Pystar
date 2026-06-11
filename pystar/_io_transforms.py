@@ -180,7 +180,7 @@ def _load_flow_3d_sidecar_array(
     round_key: Any,
     sidecar_path: Path,
 ) -> NDArray[Any]:
-    flow_3d_arr = np.load(sidecar_path, allow_pickle=False)
+    flow_3d_arr = np.load(sidecar_path, allow_pickle=False, mmap_mode="r")
     if flow_3d_arr.ndim != 4:
         raise ValueError(f"flow_3d sidecar for round {round_key} must be 4D, got shape {flow_3d_arr.shape}")
     if flow_3d_arr.shape[0] != 3:

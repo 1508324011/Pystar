@@ -438,6 +438,14 @@ def test_transform_manifest_public_io_preserves_legacy_shape_and_eager_lazy_flow
     assert lazy_round_two["_scope"] == _full_fov_scope()
     assert lazy_round_two["_semantics"] == _settled_semantics()
     assert lazy_round_two["user_metadata"] == {"round_label": "round-2"}
+    eager_flow_3d = eager_round_two["flow_3d"]
+    materialized_flow_3d = cast(object, materialized["flow_3d"])
+    assert isinstance(eager_flow_3d, np.memmap)
+    assert eager_flow_3d.mode == "r"
+    assert eager_flow_3d.flags.writeable is False
+    assert isinstance(materialized_flow_3d, np.memmap)
+    assert materialized_flow_3d.mode == "r"
+    assert materialized_flow_3d.flags.writeable is False
     np.testing.assert_array_equal(cast(FloatArray, eager_round_two["flow_3d"]), flow_3d)
     np.testing.assert_array_equal(cast(FloatArray, materialized["flow_3d"]), flow_3d)
     assert materialized["round_note"] == "keep-round-2"
