@@ -749,9 +749,23 @@ class SignalMiner:
             rounds=rounds,
             channels=channels,
         )
-        
-        # Pre-allocate
-        intensity_matrix = np.zeros((n_spots, len(rounds), len(channels)), dtype=np.float32)
+        out_name = paths["extraction"] / f"intensity_matrix_fov_{fov_id}.npy"
+        staged_out_name = out_name.with_name(f"{out_name.name}.tmp")
+        if staged_out_name.exists():
+            staged_out_name.unlink()
+
+        # Let a staged .npy memmap own the full intensity tensor during
+        # extraction, then atomically publish the canonical artifact only
+        # after validation. This preserves the public path/format contract
+        # while avoiding a long-lived eager RAM allocation for large FOVs.
+        intensity_matrix = np.lib.format.open_memmap(
+            staged_out_name,
+            mode="w+",
+            dtype=np.float32,
+            shape=matrix_spec.expected_shape,
+        )
+        intensity_matrix[...] = np.float32(0.0)
+        intensity_matrix.flush()
         
         # Box Size
         box_vals = self.cfg.pipeline.extraction.integration_box
@@ -866,9 +880,9 @@ class SignalMiner:
                 del round_plan
 
         # 4. Save
-        out_name = paths["extraction"] / f"intensity_matrix_fov_{fov_id}.npy"
         metadata_path = intensity_matrix_metadata_path(out_name)
         persistence_started = time.perf_counter()
+        intensity_matrix.flush()
         intensity_matrix = validate_intensity_matrix(
             intensity_matrix,
             matrix_spec,
@@ -904,7 +918,13 @@ class SignalMiner:
             spot_path=spots_path,
         )
         with profiler.record("write_outputs", artifact="intensity_matrix"):
-            np.save(out_name, intensity_matrix)
+            if isinstance(intensity_matrix, np.memmap):
+                intensity_matrix.flush()
+                mmap_handle = getattr(intensity_matrix, "_mmap", None)
+                if mmap_handle is not None:
+                    mmap_handle.close()
+            os.replace(staged_out_name, out_name)
+            intensity_matrix = np.load(out_name, allow_pickle=False, mmap_mode="r")
             write_backend_metadata(metadata_path, metadata_payload)
         metadata_expected = intensity_matrix_metadata_expected_description()
         try:

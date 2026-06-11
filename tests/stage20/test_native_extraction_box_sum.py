@@ -953,7 +953,7 @@ def test_signal_miner_mine_fov_reuses_coordinate_mapping_plan_per_round_image_sh
             object,
             SimpleNamespace(
                 dataset=SimpleNamespace(
-                    channel_roles={0: 'seq', 1: 'seq'},
+                    channel_roles={0: 'seq', 1: 'seq', 2: 'seq'},
                     round_structure={1: [0, 1]},
                 ),
                 pipeline=SimpleNamespace(
@@ -1031,13 +1031,145 @@ def test_signal_miner_mine_fov_reuses_coordinate_mapping_plan_per_round_image_sh
         transform_data,
         expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
     )
-    expected = np.zeros((2, 1, 2), dtype=np.float32)
+    expected = np.zeros((2, 1, 3), dtype=np.float32)
     expected[:, 0, 0] = extract_box_sum_integer(img_ch0, expected_coords, box_size=(1, 3, 3))
     expected[:, 0, 1] = extract_box_sum_integer(img_ch1, expected_coords, box_size=(1, 3, 3))
-    got = np.load(paths['extraction'] / 'intensity_matrix_fov_7.npy')
+    matrix_path = paths['extraction'] / 'intensity_matrix_fov_7.npy'
+    staged_matrix_path = matrix_path.with_name(f"{matrix_path.name}.tmp")
+    assert matrix_path.exists()
+    assert not staged_matrix_path.exists()
+    got = np.load(matrix_path, allow_pickle=False)
+    got_mmap = np.load(matrix_path, allow_pickle=False, mmap_mode='r')
 
     assert map_call_count == 1
+    assert isinstance(got_mmap, np.memmap)
+    assert got_mmap.mode == 'r'
+    assert got.dtype == np.float32
+    assert got_mmap.dtype == np.float32
+    assert got.shape == expected.shape
+    assert got_mmap.shape == expected.shape
+    np.testing.assert_array_equal(got[:, :, 2], np.zeros((2, 1), dtype=np.float32))
     np.testing.assert_array_equal(got, expected)
+    np.testing.assert_array_equal(got_mmap, expected)
+
+
+def test_signal_miner_mine_fov_writes_memmap_npy_and_zero_fills_missing_channels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    miner = _signal_miner(provider='native')
+    field_semantics = miner.cfg.pipeline.field_semantics
+    miner.cfg = cast(
+        ExperimentConfig,
+        cast(
+            object,
+            SimpleNamespace(
+                dataset=SimpleNamespace(
+                    channel_roles={0: 'seq', 1: 'seq'},
+                    round_structure={1: [0], 2: [1]},
+                ),
+                pipeline=SimpleNamespace(
+                    output=SimpleNamespace(directory=str(tmp_path)),
+                    extraction=SimpleNamespace(
+                        provider='native',
+                        transform_application_mode='coordinate_mapping',
+                        integration_box=[1, 3, 3],
+                    ),
+                    field_semantics=field_semantics,
+                    qc_images_enabled=lambda: False,
+                ),
+            ),
+        ),
+    )
+    paths = get_fov_output_structure(tmp_path, 7)
+    spots_df = pd.DataFrame(
+        {
+            'z': [0.0, 1.0],
+            'y': [1.0, 2.0],
+            'x': [2.0, 3.0],
+            'intensity': [10.0, 20.0],
+        }
+    )
+    spots_df.to_csv(paths['spots'] / 'spots_fov_7.csv', index=False)
+
+    img_ch0 = np.arange(2 * 4 * 4, dtype=np.float32).reshape(2, 4, 4)
+    img_ch1 = img_ch0 + np.float32(100.0)
+    loaded_images = {(1, 0): img_ch0, (2, 1): img_ch1}
+    miner.loader = cast(
+        Any,
+        SimpleNamespace(load_clean_image=lambda fov_id, round_id, channel_id: loaded_images[(round_id, channel_id)].copy()),
+    )
+
+    transform_data = _transform_data()
+    miner._load_transforms = lambda fov_id: {1: dict(transform_data), 2: dict(transform_data)}  # type: ignore[method-assign]
+
+    def fake_materialize_round_transform(
+        fov_id: int,
+        round_id: int,
+        transform_data: Mapping[str, Any],
+        *,
+        hydrate_flow_3d: bool = True,
+    ) -> dict[str, Any]:
+        return dict(transform_data)
+
+    miner._materialize_round_transform = fake_materialize_round_transform  # type: ignore[method-assign]
+    miner._validate_scope_contract = (  # type: ignore[method-assign]
+        lambda fov_id, transforms: {'delivered_coverage': 'full_fov'}
+    )
+
+    open_memmap_calls: list[dict[str, object]] = []
+    original_open_memmap = mining_module.np.lib.format.open_memmap
+
+    def recording_open_memmap(filename: str | Path, *args: object, **kwargs: object) -> object:
+        open_memmap_calls.append(
+            {
+                'filename': Path(filename),
+                'mode': kwargs.get('mode'),
+                'dtype': kwargs.get('dtype'),
+                'shape': kwargs.get('shape'),
+            }
+        )
+        return original_open_memmap(filename, *args, **kwargs)
+
+    monkeypatch.setattr(mining_module.np.lib.format, 'open_memmap', recording_open_memmap)
+    monkeypatch.setattr(
+        mining_module.np,
+        'save',
+        lambda *args, **kwargs: pytest.fail('mine_fov must not call np.save for intensity matrix output'),
+    )
+
+    miner.mine_fov(7)
+
+    matrix_path = paths['extraction'] / 'intensity_matrix_fov_7.npy'
+    staged_matrix_path = matrix_path.with_name(f"{matrix_path.name}.tmp")
+    write_memmap_calls = [call for call in open_memmap_calls if call['mode'] == 'w+']
+    assert write_memmap_calls == [
+        {'filename': staged_matrix_path, 'mode': 'w+', 'dtype': np.float32, 'shape': (2, 2, 2)}
+    ]
+    readonly_memmap_calls = [call for call in open_memmap_calls if call['mode'] == 'r']
+    assert any(call['filename'] == matrix_path for call in readonly_memmap_calls)
+
+    ref_coords = cast(FloatArray, spots_df[['z', 'y', 'x']].to_numpy(dtype=np.float32))
+    expected_coords = map_spot_coordinates(
+        ref_coords,
+        transform_data,
+        expected_field_semantics=EXPECTED_FIELD_SEMANTICS,
+    )
+    expected = np.zeros((2, 2, 2), dtype=np.float32)
+    expected[:, 0, 0] = extract_box_sum_integer(img_ch0, expected_coords, box_size=(1, 3, 3))
+    expected[:, 1, 1] = extract_box_sum_integer(img_ch1, expected_coords, box_size=(1, 3, 3))
+
+    assert matrix_path.exists()
+    assert not staged_matrix_path.exists()
+    got = np.load(matrix_path, allow_pickle=False)
+    assert got.dtype == np.float32
+    np.testing.assert_array_equal(got, expected)
+
+    mmap_loaded = np.load(matrix_path, allow_pickle=False, mmap_mode='r')
+    assert isinstance(mmap_loaded, np.memmap)
+    assert mmap_loaded.mode == 'r'
+    assert mmap_loaded.dtype == np.float32
+    np.testing.assert_array_equal(mmap_loaded, expected)
 
 
 def test_signal_miner_native_bridge_uses_optimized_kernel_for_image_warp() -> None:
