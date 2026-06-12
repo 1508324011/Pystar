@@ -23,7 +23,12 @@ from pystar._registration_performance import (
     validate_registration_performance_payload,
 )
 from pystar.io import get_flow_3d_sidecar_filename, get_fov_output_structure, load_transform_manifest
-from pystar.registration import RegistrationEngine, _run_tiled_native_demons_registration
+from pystar.registration import (
+    RegistrationEngine,
+    _compute_warped_mip_3d_bounded,
+    _run_tiled_native_demons_registration,
+    apply_warp_field_3d,
+)
 from pystar.tiling import build_yx_tile_layout, extract_tile, stitch_tiles
 
 
@@ -130,6 +135,48 @@ def _providers(provider_mode: str = "native_only") -> dict[str, Any]:
         "enable_local": True,
         "reference_round": 1,
     }
+
+
+def test_bounded_final_qc_warp_mip_matches_full_volume_oracle() -> None:
+    rng = np.random.default_rng(123)
+    image = rng.normal(loc=4.0, scale=2.0, size=(5, 6, 7)).astype(np.float32)
+    flow = rng.normal(loc=0.0, scale=0.2, size=(3, 5, 6, 7)).astype(np.float32)
+
+    expected = apply_warp_field_3d(image, flow).max(axis=0)
+    result = _compute_warped_mip_3d_bounded(image, flow, z_slab_depth=2)
+
+    np.testing.assert_allclose(result.mip, expected, rtol=1e-6, atol=1e-6)
+    assert result.diagnostics["helper_mode"] == "bounded_z_slab_mip"
+    assert result.diagnostics["z_slab_depth"] == 2
+    assert result.diagnostics["slab_count"] == 3
+    assert result.diagnostics["max_slab_shape_zyx"] == [2, 6, 7]
+    assert result.diagnostics["output_mip"]["shape"] == [6, 7]
+
+
+@pytest.mark.parametrize(
+    ("image", "flow", "match"),
+    [
+        (np.zeros((4, 4), dtype=np.float32), np.zeros((3, 2, 4, 4), dtype=np.float32), "expected 3D image"),
+        (np.zeros((2, 4, 4), dtype=np.float32), np.zeros((2, 4, 4), dtype=np.float32), "expected flow_3d shape"),
+        (np.zeros((2, 4, 4), dtype=np.float32), np.zeros((2, 2, 4, 4), dtype=np.float32), "first dimension"),
+        (np.zeros((2, 4, 4), dtype=np.float32), np.zeros((3, 3, 4, 4), dtype=np.float32), "shape mismatch"),
+    ],
+)
+def test_bounded_final_qc_warp_mip_rejects_invalid_shapes(
+    image: FloatArray,
+    flow: FloatArray,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _ = _compute_warped_mip_3d_bounded(image, flow)
+
+
+def test_bounded_final_qc_warp_mip_rejects_invalid_slab_depth() -> None:
+    image = np.zeros((2, 4, 4), dtype=np.float32)
+    flow = np.zeros((3, 2, 4, 4), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="z_slab_depth"):
+        _ = _compute_warped_mip_3d_bounded(image, flow, z_slab_depth=0)
 
 
 def test_native_style_registration_diagnostics_round_trip_and_manifest_timings(tmp_path: Path) -> None:
@@ -654,6 +701,8 @@ def test_native_demons_work_plan_records_shifted_volume_descriptor(monkeypatch: 
 
     payload = recorder.build_payload()
     shifted_descriptor = payload["rounds"][0]["work_plan"]["moving_shifted_volume"]
+    final_qc_details = payload["rounds"][0]["final_qc"]["details"]
+    memory_phases = [record["phase_id"] for record in payload["rounds"][0]["memory_telemetry"]]
 
     assert shifted_descriptor == {
         "shape": [2, 4, 4],
@@ -662,6 +711,112 @@ def test_native_demons_work_plan_records_shifted_volume_descriptor(monkeypatch: 
         "ndim": 3,
         "role": "moving_shifted_scope_3d",
     }
+    assert final_qc_details["helper_mode"] == "bounded_z_slab_mip"
+    assert final_qc_details["slab_count"] == 1
+    assert final_qc_details["image"]["shape"] == [2, 4, 4]
+    assert final_qc_details["flow_3d"]["shape"] == [3, 2, 4, 4]
+    assert final_qc_details["output_mip"]["shape"] == [4, 4]
+    assert "final_qc_bounded_warp_mip" in memory_phases
+
+
+def test_matlab_local_demons_records_bounded_final_qc_without_matlab() -> None:
+    registration_cfg = SimpleNamespace(
+        demons_3d=SimpleNamespace(use_tiling=False),
+        guards=SimpleNamespace(reject_if_correlation_worse=True),
+    )
+    cfg = cast(Any, SimpleNamespace(pipeline=SimpleNamespace(registration=registration_cfg)))
+    engine = RegistrationEngine(cfg)
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers("matlab_only"))
+    engine._registration_diagnostics = recorder
+    recorder.start_round(2, is_reference_round=False)
+
+    ref_volume = np.arange(2 * 4 * 4, dtype=np.float32).reshape((2, 4, 4))
+    mov_volume = np.array(ref_volume, copy=True)
+    ref_mip = np.asarray(ref_volume.max(axis=0), dtype=np.float32)
+    mov_mip = np.asarray(mov_volume.max(axis=0), dtype=np.float32)
+    global_shift = np.zeros(3, dtype=np.float32)
+    shift_2d = np.zeros(2, dtype=np.float32)
+    scope_descriptor = {
+        "coverage_mode": "full_fov",
+        "region_origin_zyx": [0, 0, 0],
+        "region_shape_zyx": [2, 4, 4],
+        "full_volume_shape_zyx": [2, 4, 4],
+    }
+    recorder.record_registration_work_plan(
+        2,
+        {
+            "round_id": 2,
+            "reference_round": 1,
+            "global_provider": "matlab",
+            "global_method": "phase_corr_3d",
+            "local_provider": "matlab",
+            "local_method": "demons_3d",
+            "local_enabled": True,
+            "local_execution_mode": "matlab_demons_3d",
+            "selection_reason": "synthetic MATLAB shifted-volume work-plan test",
+            "scope_descriptor": scope_descriptor,
+            "scope_coverage_mode": "full_fov",
+            "scope_region_origin_zyx": [0, 0, 0],
+            "scope_region_shape_zyx": [2, 4, 4],
+            "reference_volume": array_diagnostics_descriptor(ref_volume, role="reference_scope_3d"),
+            "moving_volume": array_diagnostics_descriptor(mov_volume, role="moving_scope_3d"),
+            "expected_local_flow": array_shape_diagnostics_descriptor((3, 2, 4, 4), role="expected_flow_3d"),
+            "expected_flow_3d": array_shape_diagnostics_descriptor((3, 2, 4, 4), role="expected_flow_3d"),
+            "flow_3d_persisted": False,
+            "flow_3d_sidecar_path": None,
+            "flow_3d_sidecar_size_bytes": None,
+        },
+    )
+
+    class FakeMatlabBackend:
+        def compute_local_flow(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            del args, kwargs
+            return {
+                "flow_3d": np.zeros((3, 2, 4, 4), dtype=np.float32),
+                "backend_metadata": {
+                    "provider": "matlab",
+                    "mode": "experimental_local_kernel_swap",
+                    "matlab_metadata": {
+                        "flow_storage_format": "synthetic",
+                    },
+                },
+            }
+
+    fake_backend = FakeMatlabBackend()
+    engine._get_matlab_backend = MethodType(lambda self: fake_backend, engine)  # type: ignore[method-assign]
+
+    context = engine._build_local_registration_context(
+        fov_id=FOV_ID,
+        round_id=2,
+        ref_round=1,
+        ref_scope_3d=ref_volume,
+        ref_mip_clean=ref_mip,
+        mov_scope_3d=mov_volume,
+        mov_mip_clean=mov_mip,
+        mov_mip_shifted=mov_mip,
+        shift_2d=shift_2d,
+        global_shift_3d=global_shift,
+        corr_after_global=0.9,
+        scope_descriptor=scope_descriptor,
+        backend_metadata=None,
+        local_provider="matlab",
+        local_method="demons_3d",
+        local_handler_name="_run_local_matlab_demons_3d",
+    )
+
+    outcome = engine._run_local_matlab_demons_3d(context)
+    assert outcome.flow_3d is not None
+
+    payload = recorder.build_payload()
+    final_qc_details = payload["rounds"][0]["final_qc"]["details"]
+    memory_phases = [record["phase_id"] for record in payload["rounds"][0]["memory_telemetry"]]
+
+    assert final_qc_details["helper_mode"] == "bounded_z_slab_mip"
+    assert final_qc_details["slab_count"] == 1
+    assert final_qc_details["image"]["shape"] == [2, 4, 4]
+    assert final_qc_details["flow_3d"]["shape"] == [3, 2, 4, 4]
+    assert final_qc_details["output_mip"]["shape"] == [4, 4]
+    assert "final_qc_bounded_warp_mip" in memory_phases
 
 
 def test_native_tiled_demons_bad_tile_flow_shape_fails_loudly(monkeypatch: pytest.MonkeyPatch) -> None:

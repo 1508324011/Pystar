@@ -91,6 +91,12 @@ class _LocalRegistrationOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class _BoundedWarpMIPResult:
+    mip: FloatArray
+    diagnostics: Dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
 class _RoundRegistrationStrategy:
     global_provider: str
     local_provider: str
@@ -120,6 +126,9 @@ _LOCAL_PROVIDER_DEFAULT_MODES: Dict[str, str] = {
     'native': 'native_local_registration',
     'matlab': 'experimental_local_kernel_swap',
 }
+
+
+_FINAL_QC_WARP_Z_SLAB_DEPTH = 4
 
 
 def _ensure_supported_matlab_local_method(local_method: str) -> None:
@@ -707,6 +716,102 @@ def apply_warp_field_3d(img_3d: FloatArray, flow_3d: FloatArray) -> FloatArray:
     )
     
     return warped.astype(img_3d.dtype)
+
+
+def _compute_warped_mip_3d_bounded(
+    img_3d: FloatArray,
+    flow_3d: FloatArray,
+    *,
+    z_slab_depth: int = _FINAL_QC_WARP_Z_SLAB_DEPTH,
+) -> _BoundedWarpMIPResult:
+    """Compute ``apply_warp_field_3d(...).max(axis=0)`` with bounded slabs."""
+
+    image = np.asarray(img_3d)
+    flow = np.asarray(flow_3d)
+    if image.ndim != 3:
+        raise ValueError(f"final QC bounded warp MIP expected 3D image (Z, Y, X), got shape {image.shape}")
+    if flow.ndim != 4:
+        raise ValueError(f"final QC bounded warp MIP expected flow_3d shape (3, Z, Y, X), got {flow.shape}")
+    if flow.shape[0] != 3:
+        raise ValueError(
+            "final QC bounded warp MIP expected flow_3d first dimension to contain "
+            f"(dz, dy, dx), got shape {flow.shape}"
+        )
+    if tuple(int(value) for value in flow.shape[1:]) != tuple(int(value) for value in image.shape):
+        raise ValueError(
+            "final QC bounded warp MIP flow_3d/image shape mismatch: "
+            f"flow_3d spatial shape {flow.shape[1:]}, image shape {image.shape}"
+        )
+    if not np.issubdtype(image.dtype, np.number):
+        raise ValueError(f"final QC bounded warp MIP image dtype must be numeric, got {image.dtype}")
+    if not np.issubdtype(flow.dtype, np.number):
+        raise ValueError(f"final QC bounded warp MIP flow_3d dtype must be numeric, got {flow.dtype}")
+    if isinstance(z_slab_depth, bool) or not isinstance(z_slab_depth, (int, np.integer)):
+        raise ValueError(f"final QC bounded warp MIP z_slab_depth must be a positive integer, got {z_slab_depth!r}")
+    slab_depth = int(z_slab_depth)
+    if slab_depth <= 0:
+        raise ValueError(f"final QC bounded warp MIP z_slab_depth must be positive, got {slab_depth}")
+
+    z_dim, y_dim, x_dim = (int(value) for value in image.shape)
+    if z_dim <= 0 or y_dim <= 0 or x_dim <= 0:
+        raise ValueError(f"final QC bounded warp MIP image dimensions must be positive, got {image.shape}")
+
+    output_mip: FloatArray | None = None
+    slab_count = 0
+    max_slab_depth = min(slab_depth, z_dim)
+    for z_start in range(0, z_dim, slab_depth):
+        z_stop = min(z_start + slab_depth, z_dim)
+        z_coords, y_coords, x_coords = np.meshgrid(
+            np.arange(z_start, z_stop, dtype=np.float32),
+            np.arange(y_dim, dtype=np.float32),
+            np.arange(x_dim, dtype=np.float32),
+            indexing='ij',
+        )
+        coordinates = np.array(
+            [
+                z_coords + flow[0, z_start:z_stop, :, :],
+                y_coords + flow[1, z_start:z_stop, :, :],
+                x_coords + flow[2, z_start:z_stop, :, :],
+            ],
+            dtype=np.float32,
+        )
+        warped_slab = map_coordinates(
+            image,
+            coordinates,
+            order=1,
+            mode='constant',
+            cval=0,
+            prefilter=False,
+        )
+        slab_mip = np.asarray(warped_slab, dtype=image.dtype).max(axis=0)
+        if output_mip is None:
+            output_mip = np.array(slab_mip, dtype=image.dtype, copy=True)
+        else:
+            np.maximum(output_mip, slab_mip, out=output_mip)
+        slab_count += 1
+
+    if output_mip is None:
+        raise ValueError("final QC bounded warp MIP did not process any z slabs")
+    diagnostics: Dict[str, Any] = {
+        "helper_mode": "bounded_z_slab_mip",
+        "z_slab_depth": slab_depth,
+        "slab_count": int(slab_count),
+        "max_slab_shape_zyx": [int(max_slab_depth), int(y_dim), int(x_dim)],
+        "image": array_diagnostics_descriptor(image, role="final_qc_moving_shifted_3d"),
+        "flow_3d": array_diagnostics_descriptor(flow, role="final_qc_flow_3d"),
+        "output_mip": array_diagnostics_descriptor(output_mip, role="final_qc_warped_mip"),
+        "coordinate_working_set": array_shape_diagnostics_descriptor(
+            (3, max_slab_depth, y_dim, x_dim),
+            dtype=np.float32,
+            role="final_qc_coordinate_slab",
+        ),
+        "avoided_full_warp_volume": array_shape_diagnostics_descriptor(
+            image.shape,
+            dtype=image.dtype,
+            role="avoided_full_warp_volume",
+        ),
+    }
+    return _BoundedWarpMIPResult(mip=cast(FloatArray, output_mip), diagnostics=diagnostics)
 
 # ==============================================================================
 # SECTION D: Quality Metrics
@@ -1981,13 +2086,31 @@ class RegistrationEngine:
             )
 
         final_qc_started = diagnostics_timer_start()
-        final_img_qc_clean = apply_warp_field_3d(mov_shifted_3d, flow_3d).max(axis=0)
+        final_qc_memory_before = (
+            sample_process_memory()
+            if self._registration_diagnostics is not None and context.round_id >= 0
+            else None
+        )
+        bounded_qc = _compute_warped_mip_3d_bounded(mov_shifted_3d, flow_3d)
+        final_img_qc_clean = bounded_qc.mip
+        final_qc_memory_after = sample_process_memory() if final_qc_memory_before is not None else None
         rec_corr = simple_correlation(context.ref_mip_clean, final_img_qc_clean)
         if self._registration_diagnostics is not None and context.round_id >= 0:
+            if final_qc_memory_before is not None and final_qc_memory_after is not None:
+                self._registration_diagnostics.record_memory_telemetry(
+                    context.round_id,
+                    memory_delta_diagnostics(
+                        "final_qc_bounded_warp_mip",
+                        final_qc_memory_before,
+                        final_qc_memory_after,
+                        details=bounded_qc.diagnostics,
+                    ),
+                )
             self._registration_diagnostics.record_final_qc(
                 context.round_id,
                 elapsed_wall_ms=elapsed_ms_since(final_qc_started),
                 final_corr=float(rec_corr),
+                details=bounded_qc.diagnostics,
             )
         status = 'accepted'
         if rec_corr < context.corr_after_global:
@@ -2291,13 +2414,31 @@ class RegistrationEngine:
             )
 
         final_qc_started = diagnostics_timer_start()
-        final_img_qc_clean = apply_warp_field_3d(mov_shifted_3d, flow_3d).max(axis=0)
+        final_qc_memory_before = (
+            sample_process_memory()
+            if self._registration_diagnostics is not None and context.round_id >= 0
+            else None
+        )
+        bounded_qc = _compute_warped_mip_3d_bounded(mov_shifted_3d, flow_3d)
+        final_img_qc_clean = bounded_qc.mip
+        final_qc_memory_after = sample_process_memory() if final_qc_memory_before is not None else None
         rec_corr = simple_correlation(context.ref_mip_clean, final_img_qc_clean)
         if self._registration_diagnostics is not None and context.round_id >= 0:
+            if final_qc_memory_before is not None and final_qc_memory_after is not None:
+                self._registration_diagnostics.record_memory_telemetry(
+                    context.round_id,
+                    memory_delta_diagnostics(
+                        "final_qc_bounded_warp_mip",
+                        final_qc_memory_before,
+                        final_qc_memory_after,
+                        details=bounded_qc.diagnostics,
+                    ),
+                )
             self._registration_diagnostics.record_final_qc(
                 context.round_id,
                 elapsed_wall_ms=elapsed_ms_since(final_qc_started),
                 final_corr=float(rec_corr),
+                details=bounded_qc.diagnostics,
             )
         local_backend_metadata = (
             dict(cast(Dict[str, Any], local_result['backend_metadata']))

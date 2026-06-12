@@ -1398,11 +1398,14 @@ class RegistrationPerformanceRecorder:
         *,
         elapsed_wall_ms: float,
         final_corr: float,
+        details: Mapping[str, Any] | None = None,
     ) -> None:
+        final_qc_details = dict(details) if details is not None else {}
+        final_qc_details["final_corr"] = float(final_corr)
         self._round(round_id)["final_qc"] = timing_record(
             "final_qc",
             elapsed_wall_ms,
-            details={"final_corr": float(final_corr)},
+            details=final_qc_details,
         )
 
     def record_flow_sidecar_persistence(
