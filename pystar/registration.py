@@ -2828,11 +2828,16 @@ class RegistrationEngine:
             )
 
             load_started = diagnostics_timer_start()
-            materialized_manifest = load_transform_manifest(base_dir, fov_id, load_provenance=False)
+            materialized_manifest = load_transform_manifest(
+                base_dir,
+                fov_id,
+                load_provenance=False,
+                hydrate_flow_3d=False,
+            )
             diagnostics.record_manifest_timing(
                 "load_transform_manifest",
                 elapsed_ms_since(load_started),
-                details={"load_provenance": False, "hydrate_flow_3d": True},
+                details={"load_provenance": False, "hydrate_flow_3d": False},
             )
 
             source_stage_elapsed_wall_ms = elapsed_ms_since(registration_started)

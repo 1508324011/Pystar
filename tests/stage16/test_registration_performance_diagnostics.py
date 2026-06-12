@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import MethodType, SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
 import pytest
+import xarray as xr
 from numpy.typing import NDArray
 
 from pystar._registration_performance import (
@@ -20,8 +22,8 @@ from pystar._registration_performance import (
     timing_record,
     validate_registration_performance_payload,
 )
-from pystar.io import get_fov_output_structure
-from pystar.registration import _run_tiled_native_demons_registration
+from pystar.io import get_flow_3d_sidecar_filename, get_fov_output_structure, load_transform_manifest
+from pystar.registration import RegistrationEngine, _run_tiled_native_demons_registration
 from pystar.tiling import build_yx_tile_layout, extract_tile, stitch_tiles
 
 
@@ -202,7 +204,11 @@ def test_native_style_registration_diagnostics_round_trip_and_manifest_timings(t
     recorder.record_final_qc(2, elapsed_wall_ms=9.0, final_corr=0.93)
     recorder.record_manifest_timing("provenance_build", 10.0)
     recorder.record_manifest_timing("save_transform_manifest", 11.0)
-    recorder.record_manifest_timing("load_transform_manifest", 12.0)
+    recorder.record_manifest_timing(
+        "load_transform_manifest",
+        12.0,
+        details={"load_provenance": False, "hydrate_flow_3d": False},
+    )
 
     output_path = recorder.write(tmp_path, source_stage_elapsed_wall_ms=100.0)
 
@@ -227,7 +233,96 @@ def test_native_style_registration_diagnostics_round_trip_and_manifest_timings(t
     assert payload["summary"]["matlab_boundary_call_count"] == 0
     assert payload["manifest"]["save_transform_manifest"]["elapsed_wall_ms"] == 11.0
     assert payload["manifest"]["load_transform_manifest"]["elapsed_wall_ms"] == 12.0
+    assert payload["manifest"]["load_transform_manifest"]["details"] == {
+        "load_provenance": False,
+        "hydrate_flow_3d": False,
+    }
     assert "save_transform_manifest" not in payload["rounds"][1]
+
+
+def test_register_fov_returns_lazy_sidecar_manifest_and_records_lazy_reload(tmp_path: Path) -> None:
+    field_semantics = SimpleNamespace(
+        as_dict=lambda: {
+            "representation": "residual",
+            "composition": "sequential_global_then_local",
+            "status": "settled",
+        }
+    )
+    registration = SimpleNamespace(
+        reference_round=1,
+        field_semantics=field_semantics,
+        global_provider="native",
+        local_provider="native",
+        local_method="demons_3d",
+        enable_local=True,
+        global_stage=SimpleNamespace(method="phase_corr_3d"),
+    )
+    pipeline = SimpleNamespace(
+        output=SimpleNamespace(directory=str(tmp_path)),
+        registration=registration,
+        scope_mode="full_fov",
+        registration_provider_mode=lambda: "native_only",
+        qc_images_enabled=lambda: False,
+    )
+    cfg = cast(Any, SimpleNamespace(pipeline=pipeline))
+    engine = RegistrationEngine(cfg)
+
+    flow_3d = np.arange(3 * 2 * 4 * 4, dtype=np.float32).reshape(3, 2, 4, 4)
+
+    def fake_load_volume(self: RegistrationEngine, fov_id: int, round_id: int) -> FloatArray:
+        return np.full((2, 4, 4), float(round_id), dtype=np.float32)
+
+    def fake_register_round(self: RegistrationEngine, **kwargs: Any) -> tuple[dict[str, Any], FloatArray, dict[str, Any]]:
+        return (
+            {
+                "global_shift_3d": np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+                "global_corr": 0.95,
+                "flow_2d": None,
+                "flow_3d": flow_3d,
+                "final_corr": 0.96,
+                "is_reference_round": False,
+            },
+            np.zeros((4, 4), dtype=np.float32),
+            {"backend": "synthetic"},
+        )
+
+    def no_provenance(self: RegistrationEngine, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    engine._load_combined_clean_volume = MethodType(fake_load_volume, engine)  # type: ignore[method-assign]
+    engine._register_round = MethodType(fake_register_round, engine)  # type: ignore[method-assign]
+    engine._build_provenance = MethodType(no_provenance, engine)  # type: ignore[method-assign]
+
+    data = xr.DataArray(
+        np.zeros((2,), dtype=np.float32),
+        dims=("round",),
+        coords={"round": [1, 2]},
+    )
+
+    returned_manifest = engine.register_fov(data, FOV_ID)
+    round_two = cast(dict[str, Any], returned_manifest[2])
+    returned_flow = cast(dict[str, Any], round_two["flow_3d"])
+
+    assert returned_flow == {
+        "storage": "round_level_sidecar_npy",
+        "path": get_flow_3d_sidecar_filename(FOV_ID, 2),
+        "shape": [3, 2, 4, 4],
+        "dtype": "float32",
+    }
+
+    default_loaded = load_transform_manifest(tmp_path, FOV_ID)
+    default_flow = cast(dict[int, dict[str, Any]], default_loaded)[2]["flow_3d"]
+    assert isinstance(default_flow, np.memmap)
+    assert default_flow.mode == "r"
+    assert default_flow.flags.writeable is False
+    np.testing.assert_array_equal(cast(FloatArray, default_flow), flow_3d)
+
+    diagnostics_path = get_registration_performance_path(tmp_path, FOV_ID)
+    payload = load_registration_performance_diagnostics(diagnostics_path, expected_fov_id=FOV_ID)
+    assert payload["manifest"]["load_transform_manifest"]["details"] == {
+        "load_provenance": False,
+        "hydrate_flow_3d": False,
+    }
 
 
 def test_matlab_boundary_instrumentation_is_aggregated_without_matlab() -> None:
