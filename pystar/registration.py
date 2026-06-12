@@ -1890,6 +1890,10 @@ class RegistrationEngine:
                     "selection_reason": "registration.local.params.demons_3d.use_tiling=false"
                     if tiling_layout is None
                     else "registration.local.params.demons_3d.use_tiling=true",
+                    "moving_shifted_volume": array_diagnostics_descriptor(
+                        mov_shifted_3d,
+                        role="moving_shifted_scope_3d",
+                    ),
                     "tiling_enabled": tiling_layout is not None,
                     "tiling_layout": None
                     if tiling_layout is None
@@ -2186,6 +2190,30 @@ class RegistrationEngine:
                 "local_tiling_layout_resolution",
                 elapsed_ms_since(tiling_started),
                 details={"tiling_enabled": tiling_layout is not None},
+            )
+            self._registration_diagnostics.update_registration_work_plan(
+                context.round_id,
+                {
+                    "local_execution_mode": "full_volume_matlab_demons_3d"
+                    if tiling_layout is None
+                    else "tiled_matlab_demons_3d",
+                    "selection_reason": "registration.local.params.demons_3d.use_tiling=false"
+                    if tiling_layout is None
+                    else "registration.local.params.demons_3d.use_tiling=true",
+                    "moving_shifted_volume": array_diagnostics_descriptor(
+                        mov_shifted_3d,
+                        role="moving_shifted_scope_3d",
+                    ),
+                    "tiling_enabled": tiling_layout is not None,
+                    "tiling_layout": None
+                    if tiling_layout is None
+                    else {
+                        "grid_shape_yx": [int(value) for value in tiling_layout.grid_shape_yx],
+                        "overlap_yx": [int(value) for value in tiling_layout.overlap_yx],
+                        "grid_source": tiling_layout.grid_source,
+                        "tile_count": int(tiling_layout.tile_count),
+                    },
+                },
             )
         tiling_summary: Optional[Dict[str, Any]] = None
         local_result: Optional[Dict[str, Any]] = None

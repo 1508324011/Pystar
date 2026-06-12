@@ -574,6 +574,96 @@ def test_native_tiled_demons_runtime_records_per_tile_diagnostics(monkeypatch: p
     assert payload["summary"]["slowest_tiles"][0]["tile_index"] in {1, 2, 3, 4}
 
 
+def test_native_demons_work_plan_records_shifted_volume_descriptor(monkeypatch: pytest.MonkeyPatch) -> None:
+    import pystar.registration as registration_module
+
+    registration_cfg = SimpleNamespace(
+        demons_3d=SimpleNamespace(use_tiling=False),
+        guards=SimpleNamespace(reject_if_correlation_worse=True),
+    )
+    cfg = cast(Any, SimpleNamespace(pipeline=SimpleNamespace(registration=registration_cfg)))
+    engine = RegistrationEngine(cfg)
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers())
+    engine._registration_diagnostics = recorder
+    recorder.start_round(2, is_reference_round=False)
+
+    ref_volume = np.arange(2 * 4 * 4, dtype=np.float32).reshape((2, 4, 4))
+    mov_volume = np.array(ref_volume, copy=True)
+    ref_mip = np.asarray(ref_volume.max(axis=0), dtype=np.float32)
+    mov_mip = np.asarray(mov_volume.max(axis=0), dtype=np.float32)
+    global_shift = np.zeros(3, dtype=np.float32)
+    shift_2d = np.zeros(2, dtype=np.float32)
+    scope_descriptor = {
+        "coverage_mode": "full_fov",
+        "region_origin_zyx": [0, 0, 0],
+        "region_shape_zyx": [2, 4, 4],
+        "full_volume_shape_zyx": [2, 4, 4],
+    }
+    recorder.record_registration_work_plan(
+        2,
+        {
+            "round_id": 2,
+            "reference_round": 1,
+            "global_provider": "native",
+            "global_method": "phase_corr_3d",
+            "local_provider": "native",
+            "local_method": "demons_3d",
+            "local_enabled": True,
+            "local_execution_mode": "native_demons_3d",
+            "selection_reason": "synthetic shifted-volume work-plan test",
+            "scope_descriptor": scope_descriptor,
+            "scope_coverage_mode": "full_fov",
+            "scope_region_origin_zyx": [0, 0, 0],
+            "scope_region_shape_zyx": [2, 4, 4],
+            "reference_volume": array_diagnostics_descriptor(ref_volume, role="reference_scope_3d"),
+            "moving_volume": array_diagnostics_descriptor(mov_volume, role="moving_scope_3d"),
+            "expected_local_flow": array_shape_diagnostics_descriptor((3, 2, 4, 4), role="expected_flow_3d"),
+            "expected_flow_3d": array_shape_diagnostics_descriptor((3, 2, 4, 4), role="expected_flow_3d"),
+            "flow_3d_persisted": False,
+            "flow_3d_sidecar_path": None,
+            "flow_3d_sidecar_size_bytes": None,
+        },
+    )
+
+    def fake_native_demons(ref_tile: FloatArray, mov_tile: FloatArray, config_obj: object) -> FloatArray:
+        del ref_tile, mov_tile, config_obj
+        return np.zeros((3, 2, 4, 4), dtype=np.float32)
+
+    monkeypatch.setattr(registration_module, "register_local_demons_3d", fake_native_demons)
+    context = engine._build_local_registration_context(
+        fov_id=FOV_ID,
+        round_id=2,
+        ref_round=1,
+        ref_scope_3d=ref_volume,
+        ref_mip_clean=ref_mip,
+        mov_scope_3d=mov_volume,
+        mov_mip_clean=mov_mip,
+        mov_mip_shifted=mov_mip,
+        shift_2d=shift_2d,
+        global_shift_3d=global_shift,
+        corr_after_global=0.9,
+        scope_descriptor=scope_descriptor,
+        backend_metadata=None,
+        local_provider="native",
+        local_method="demons_3d",
+        local_handler_name="_run_local_native_demons_3d",
+    )
+
+    outcome = engine._run_local_native_demons_3d(context)
+    assert outcome.flow_3d is not None
+
+    payload = recorder.build_payload()
+    shifted_descriptor = payload["rounds"][0]["work_plan"]["moving_shifted_volume"]
+
+    assert shifted_descriptor == {
+        "shape": [2, 4, 4],
+        "dtype": "float32",
+        "nbytes": int(mov_volume.nbytes),
+        "ndim": 3,
+        "role": "moving_shifted_scope_3d",
+    }
+
+
 def test_native_tiled_demons_bad_tile_flow_shape_fails_loudly(monkeypatch: pytest.MonkeyPatch) -> None:
     import pystar.registration as registration_module
 
