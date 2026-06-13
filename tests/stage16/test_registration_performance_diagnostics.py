@@ -213,6 +213,7 @@ def test_native_style_registration_diagnostics_round_trip_and_manifest_timings(t
             "scope_region_shape_zyx": [2, 4, 5],
             "reference_volume": array_diagnostics_descriptor(ref_volume, role="reference_scope_3d"),
             "moving_volume": array_diagnostics_descriptor(mov_volume, role="moving_scope_3d"),
+            "moving_shifted_volume": array_diagnostics_descriptor(mov_volume, role="moving_shifted_scope_3d"),
             "expected_local_flow": array_shape_diagnostics_descriptor((3, 2, 4, 5), role="expected_flow_3d"),
             "expected_flow_3d": array_shape_diagnostics_descriptor((3, 2, 4, 5), role="expected_flow_3d"),
             "flow_3d_persisted": False,
@@ -272,6 +273,12 @@ def test_native_style_registration_diagnostics_round_trip_and_manifest_timings(t
     assert payload["summary"]["registration_reference_volume_total_nbytes"] == ref_volume.nbytes
     assert payload["summary"]["registration_moving_volume_total_nbytes"] == mov_volume.nbytes
     assert payload["summary"]["registration_expected_flow_total_nbytes"] == 3 * ref_volume.nbytes
+    lifecycle = payload["summary"]["native_demons_flow_lifecycle"]
+    assert lifecycle["status"] == "present"
+    assert lifecycle["round_count"] == 1
+    assert lifecycle["execution_mode_counts"] == {"full_volume_native_demons_3d": 1}
+    assert lifecycle["array_owner_total_nbytes"]["moving_shifted_volume"] == mov_volume.nbytes
+    assert lifecycle["memory_telemetry"]["phase_ids"] == ["native_demons_registration_compute"]
     assert payload["summary"]["registration_memory_telemetry_status"] == "present"
     assert payload["summary"]["registration_memory_telemetry_sample_count"] == 1
     assert payload["summary"]["registration_rss_delta_max_bytes"] == 256
@@ -716,7 +723,18 @@ def test_native_demons_work_plan_records_shifted_volume_descriptor(monkeypatch: 
     assert final_qc_details["image"]["shape"] == [2, 4, 4]
     assert final_qc_details["flow_3d"]["shape"] == [3, 2, 4, 4]
     assert final_qc_details["output_mip"]["shape"] == [4, 4]
+    assert "local_rigid_shift_preparation" in memory_phases
     assert "final_qc_bounded_warp_mip" in memory_phases
+    lifecycle = payload["summary"]["native_demons_flow_lifecycle"]
+    assert lifecycle["status"] == "present"
+    assert lifecycle["round_count"] == 1
+    assert lifecycle["array_owner_total_nbytes"]["moving_shifted_volume"] == mov_volume.nbytes
+    assert lifecycle["array_owner_total_nbytes"]["produced_flow_3d"] == 3 * mov_volume.nbytes
+    assert lifecycle["array_owner_peak_nbytes"]["final_qc_coordinate_working_set"] == 3 * mov_volume.nbytes
+    lifecycle_round = lifecycle["rounds"][0]
+    assert lifecycle_round["moving_shifted_volume"] == shifted_descriptor
+    assert lifecycle_round["produced_flow_3d"]["shape"] == [3, 2, 4, 4]
+    assert lifecycle_round["final_qc_bounded_mip"]["helper_mode"] == "bounded_z_slab_mip"
 
 
 def test_matlab_local_demons_records_bounded_final_qc_without_matlab() -> None:
@@ -1579,6 +1597,46 @@ def test_flow_sidecar_persistence_summary_records_descriptor_path_shape_dtype_an
     assert payload["rounds"][0]["work_plan"]["flow_3d_sidecar_path"] == str(sidecar_path)
     assert payload["rounds"][0]["work_plan"]["flow_3d_sidecar_size_bytes"] == sidecar_path.stat().st_size
     assert payload["rounds"][0]["work_plan"]["produced_flow_3d"]["nbytes"] == flow.nbytes
+    lifecycle = payload["summary"]["native_demons_flow_lifecycle"]
+    assert lifecycle["sidecar_persistence"] == {
+        "count": 1,
+        "total_bytes": sidecar_path.stat().st_size,
+        "total_elapsed_wall_ms": 13.0,
+    }
+    assert lifecycle["rounds"][0]["flow_sidecar_persistence"]["path"] == str(sidecar_path)
+
+
+def test_native_demons_lifecycle_profile_schema_fails_loudly() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers())
+    recorder.start_round(2, is_reference_round=False)
+    recorder.record_registration_work_plan(
+        2,
+        {
+            "round_id": 2,
+            "reference_round": 1,
+            "global_provider": "native",
+            "global_method": "phase_corr_3d",
+            "local_provider": "native",
+            "local_method": "demons_3d",
+            "local_execution_mode": "full_volume_native_demons_3d",
+            "selection_reason": "synthetic lifecycle validation test",
+            "moving_shifted_volume": array_shape_diagnostics_descriptor((2, 4, 5), role="moving_shifted_scope_3d"),
+            "expected_local_flow": array_shape_diagnostics_descriptor((3, 2, 4, 5), role="expected_flow_3d"),
+            "flow_3d_persisted": False,
+            "flow_3d_sidecar_path": None,
+            "flow_3d_sidecar_size_bytes": None,
+        },
+    )
+    payload = recorder.build_payload()
+    malformed = cast(dict[str, Any], dict(payload))
+    malformed_summary = cast(dict[str, Any], dict(cast(dict[str, Any], payload["summary"])))
+    malformed_lifecycle = cast(dict[str, Any], dict(cast(dict[str, Any], malformed_summary["native_demons_flow_lifecycle"])))
+    malformed_lifecycle["round_count"] = malformed_lifecycle["round_count"] + 1
+    malformed_summary["native_demons_flow_lifecycle"] = malformed_lifecycle
+    malformed["summary"] = malformed_summary
+
+    with pytest.raises(ValueError, match="native_demons_flow_lifecycle.*round_count"):
+        validate_registration_performance_payload(malformed, expected_fov_id=FOV_ID)
 
 
 def test_load_diagnostics_rejects_malformed_schema_and_fov_mismatch(tmp_path: Path) -> None:

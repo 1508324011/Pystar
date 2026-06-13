@@ -1605,21 +1605,40 @@ class RegistrationEngine:
             return
 
         base_dir = Path(self.cfg.pipeline.output.directory)
+        diagnostics = self._registration_diagnostics
+        persist_memory_before = sample_process_memory() if diagnostics is not None else None
         persist_started = diagnostics_timer_start()
         descriptor = persist_flow_3d_sidecar(base_dir, fov_id, int(round_id), np.asarray(flow_3d))
         elapsed_ms = elapsed_ms_since(persist_started)
+        persist_memory_after = sample_process_memory() if persist_memory_before is not None else None
         round_transform['flow_3d'] = descriptor
-        if self._registration_diagnostics is not None:
+        if diagnostics is not None:
             paths = get_fov_output_structure(base_dir, fov_id)
             descriptor_path = descriptor.get("path") if isinstance(descriptor, dict) else None
             sidecar_path = paths["transforms"] / str(descriptor_path) if isinstance(descriptor_path, str) else None
-            self._registration_diagnostics.record_flow_sidecar_persistence(
+            diagnostics.record_flow_sidecar_persistence(
                 round_id,
                 elapsed_wall_ms=elapsed_ms,
                 descriptor=descriptor,
                 sidecar_path=sidecar_path,
                 in_memory_flow=flow_3d,
             )
+            if persist_memory_before is not None and persist_memory_after is not None:
+                diagnostics.record_memory_telemetry(
+                    round_id,
+                    memory_delta_diagnostics(
+                        "flow_sidecar_persistence",
+                        persist_memory_before,
+                        persist_memory_after,
+                        details={
+                            "flow_3d": array_diagnostics_descriptor(
+                                flow_3d,
+                                role="flow_3d_in_memory_before_sidecar",
+                            ),
+                            "sidecar_path": None if sidecar_path is None else str(sidecar_path),
+                        },
+                    ),
+                )
 
     def _annotate_transform_semantics(self, transforms: Dict[int, Dict[str, Any]]) -> None:
         """Attach declared field-composition metadata to every round transform."""
@@ -1956,14 +1975,47 @@ class RegistrationEngine:
         return handler(context)
 
     def _run_local_native_demons_3d(self, context: _LocalRegistrationContext) -> _LocalRegistrationOutcome:
+        rigid_memory_before = (
+            sample_process_memory()
+            if self._registration_diagnostics is not None and context.round_id >= 0
+            else None
+        )
         rigid_started = diagnostics_timer_start()
         mov_shifted_3d = apply_rigid_shift_3d(context.mov_scope_3d, context.global_shift_3d)
+        rigid_elapsed_ms = elapsed_ms_since(rigid_started)
+        rigid_memory_after = sample_process_memory() if rigid_memory_before is not None else None
         if self._registration_diagnostics is not None and context.round_id >= 0:
             self._registration_diagnostics.record_local_internal_phase(
                 context.round_id,
                 "local_rigid_shift_preparation",
-                elapsed_ms_since(rigid_started),
+                rigid_elapsed_ms,
             )
+            if rigid_memory_before is not None and rigid_memory_after is not None:
+                self._registration_diagnostics.record_memory_telemetry(
+                    context.round_id,
+                    memory_delta_diagnostics(
+                        "local_rigid_shift_preparation",
+                        rigid_memory_before,
+                        rigid_memory_after,
+                        details={
+                            "moving_volume": array_diagnostics_descriptor(
+                                context.mov_scope_3d,
+                                role="moving_scope_3d",
+                            ),
+                            "moving_shifted_volume": array_diagnostics_descriptor(
+                                mov_shifted_3d,
+                                role="moving_shifted_scope_3d",
+                            ),
+                            "global_shift_3d": [
+                                float(value)
+                                for value in np.asarray(
+                                    context.global_shift_3d,
+                                    dtype=np.float32,
+                                ).reshape(-1)
+                            ],
+                        },
+                    ),
+                )
         tiling_started = diagnostics_timer_start()
         tiling_layout = _resolve_demons_tiling_layout(
             cast(Tuple[int, int, int], tuple(int(value) for value in mov_shifted_3d.shape)),

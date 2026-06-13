@@ -1711,6 +1711,338 @@ def _memory_telemetry_summary(rounds: Sequence[Mapping[str, Any]]) -> dict[str, 
     }
 
 
+_NATIVE_DEMONS_LIFECYCLE_ARRAY_OWNERS = (
+    "moving_shifted_volume",
+    "produced_flow_3d",
+    "final_qc_coordinate_working_set",
+    "final_qc_avoided_full_warp_volume",
+    "final_qc_output_mip",
+)
+
+
+def _validated_array_descriptor_or_none(value: Any, *, field_name: str) -> dict[str, Any] | None:
+    if value is None or not isinstance(value, Mapping):
+        return None
+    descriptor = dict(value)
+    _validate_array_descriptor(descriptor, field_name=field_name)
+    return descriptor
+
+
+def _round_memory_records(round_entry: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    telemetry = round_entry.get("memory_telemetry")
+    if not isinstance(telemetry, Sequence) or isinstance(telemetry, (str, bytes)):
+        return []
+    records: list[Mapping[str, Any]] = []
+    for record in telemetry:
+        if isinstance(record, Mapping):
+            _validate_memory_delta_record(record, field_name="native_demons_flow_lifecycle.memory_telemetry")
+            records.append(record)
+    return records
+
+
+def _memory_rss_peak(records: Sequence[Mapping[str, Any]]) -> int | None:
+    values: list[int] = []
+    for record in records:
+        for key in ("rss_before_bytes", "rss_after_bytes"):
+            value = record.get(key)
+            if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+                values.append(int(value))
+    return max(values) if values else None
+
+
+def _is_native_demons_lifecycle_round(round_entry: Mapping[str, Any]) -> bool:
+    work_plan = round_entry.get("work_plan")
+    if not isinstance(work_plan, Mapping):
+        return False
+    mode = work_plan.get("local_execution_mode")
+    if isinstance(mode, str) and "native_demons_3d" in mode:
+        return True
+    return work_plan.get("local_provider") == "native" and work_plan.get("local_method") == "demons_3d"
+
+
+def _flow_sidecar_lifecycle_record(round_entry: Mapping[str, Any]) -> dict[str, Any]:
+    record = round_entry.get("flow_sidecar_persistence")
+    elapsed = _timing_elapsed(record)
+    details = record.get("details") if isinstance(record, Mapping) else None
+    descriptor = details.get("descriptor") if isinstance(details, Mapping) else None
+    sidecar_size = details.get("size_bytes") if isinstance(details, Mapping) else None
+    normalized_size = (
+        int(sidecar_size)
+        if isinstance(sidecar_size, (int, np.integer)) and not isinstance(sidecar_size, bool) and int(sidecar_size) >= 0
+        else None
+    )
+    return {
+        "status": "present" if isinstance(descriptor, Mapping) else "absent",
+        "elapsed_wall_ms": elapsed,
+        "path": details.get("path") if isinstance(details, Mapping) else None,
+        "exists": details.get("exists") if isinstance(details, Mapping) else None,
+        "size_bytes": normalized_size,
+    }
+
+
+def _final_qc_lifecycle_record(round_entry: Mapping[str, Any]) -> dict[str, Any]:
+    record = round_entry.get("final_qc")
+    elapsed = _timing_elapsed(record)
+    details = record.get("details") if isinstance(record, Mapping) else None
+    helper_mode = details.get("helper_mode") if isinstance(details, Mapping) else None
+    return {
+        "status": "present" if helper_mode == "bounded_z_slab_mip" else "absent",
+        "elapsed_wall_ms": elapsed,
+        "helper_mode": helper_mode,
+        "image": _validated_array_descriptor_or_none(
+            details.get("image") if isinstance(details, Mapping) else None,
+            field_name="native_demons_flow_lifecycle.final_qc.image",
+        ),
+        "flow_3d": _validated_array_descriptor_or_none(
+            details.get("flow_3d") if isinstance(details, Mapping) else None,
+            field_name="native_demons_flow_lifecycle.final_qc.flow_3d",
+        ),
+        "output_mip": _validated_array_descriptor_or_none(
+            details.get("output_mip") if isinstance(details, Mapping) else None,
+            field_name="native_demons_flow_lifecycle.final_qc.output_mip",
+        ),
+        "coordinate_working_set": _validated_array_descriptor_or_none(
+            details.get("coordinate_working_set") if isinstance(details, Mapping) else None,
+            field_name="native_demons_flow_lifecycle.final_qc.coordinate_working_set",
+        ),
+        "avoided_full_warp_volume": _validated_array_descriptor_or_none(
+            details.get("avoided_full_warp_volume") if isinstance(details, Mapping) else None,
+            field_name="native_demons_flow_lifecycle.final_qc.avoided_full_warp_volume",
+        ),
+    }
+
+
+def _native_demons_flow_lifecycle_profile(rounds: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    execution_mode_counts: dict[str, int] = {}
+    owner_counts = {key: 0 for key in _NATIVE_DEMONS_LIFECYCLE_ARRAY_OWNERS}
+    owner_totals = {key: 0 for key in _NATIVE_DEMONS_LIFECYCLE_ARRAY_OWNERS}
+    owner_peaks = {key: 0 for key in _NATIVE_DEMONS_LIFECYCLE_ARRAY_OWNERS}
+    sidecar_count = 0
+    sidecar_total_bytes = 0
+    sidecar_total_elapsed_ms = 0.0
+    memory_phase_ids: set[str] = set()
+    memory_sample_count = 0
+    memory_rss_values: list[int] = []
+
+    for round_entry in rounds:
+        if not _is_native_demons_lifecycle_round(round_entry):
+            continue
+        work_plan = cast(Mapping[str, Any], round_entry.get("work_plan"))
+        mode = str(work_plan.get("local_execution_mode", "unknown"))
+        execution_mode_counts[mode] = execution_mode_counts.get(mode, 0) + 1
+
+        final_qc = _final_qc_lifecycle_record(round_entry)
+        sidecar = _flow_sidecar_lifecycle_record(round_entry)
+        memory_records = _round_memory_records(round_entry)
+        round_memory_phase_ids = [str(record.get("phase_id")) for record in memory_records]
+        for phase_id in round_memory_phase_ids:
+            if phase_id.strip():
+                memory_phase_ids.add(phase_id)
+        memory_sample_count += len(memory_records)
+        round_rss_peak = _memory_rss_peak(memory_records)
+        if round_rss_peak is not None:
+            memory_rss_values.append(round_rss_peak)
+
+        moving_shifted = _validated_array_descriptor_or_none(
+            work_plan.get("moving_shifted_volume"),
+            field_name="native_demons_flow_lifecycle.moving_shifted_volume",
+        )
+        produced_flow = _validated_array_descriptor_or_none(
+            work_plan.get("produced_flow_3d"),
+            field_name="native_demons_flow_lifecycle.produced_flow_3d",
+        )
+        if produced_flow is None:
+            produced_flow = cast(dict[str, Any] | None, final_qc.get("flow_3d"))
+        owner_descriptors = {
+            "moving_shifted_volume": moving_shifted,
+            "produced_flow_3d": produced_flow,
+            "final_qc_coordinate_working_set": final_qc.get("coordinate_working_set"),
+            "final_qc_avoided_full_warp_volume": final_qc.get("avoided_full_warp_volume"),
+            "final_qc_output_mip": final_qc.get("output_mip"),
+        }
+        for owner_key, descriptor in owner_descriptors.items():
+            if isinstance(descriptor, Mapping):
+                nbytes = _descriptor_nbytes(descriptor)
+                owner_counts[owner_key] += 1
+                owner_totals[owner_key] += nbytes
+                owner_peaks[owner_key] = max(owner_peaks[owner_key], nbytes)
+
+        if sidecar["status"] == "present":
+            sidecar_count += 1
+            size_bytes = sidecar.get("size_bytes")
+            if isinstance(size_bytes, (int, np.integer)) and not isinstance(size_bytes, bool):
+                sidecar_total_bytes += int(size_bytes)
+            elapsed = sidecar.get("elapsed_wall_ms")
+            if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+                sidecar_total_elapsed_ms = round(sidecar_total_elapsed_ms + float(elapsed), 3)
+
+        rows.append(
+            {
+                "round_id": int(round_entry.get("round_id", -1)),
+                "local_execution_mode": mode,
+                "moving_shifted_volume": moving_shifted,
+                "produced_flow_3d": produced_flow,
+                "flow_sidecar_persistence": sidecar,
+                "final_qc_bounded_mip": final_qc,
+                "memory_telemetry": {
+                    "sample_count": int(len(memory_records)),
+                    "phase_ids": round_memory_phase_ids,
+                    "rss_peak_bytes": round_rss_peak,
+                },
+            }
+        )
+
+    return {
+        "schema_version": "1.0",
+        "status": "present" if rows else "absent",
+        "source": "registration work_plan + final_qc + flow_sidecar_persistence + memory_telemetry",
+        "round_count": int(len(rows)),
+        "execution_mode_counts": dict(sorted(execution_mode_counts.items())),
+        "array_owner_counts": owner_counts,
+        "array_owner_total_nbytes": owner_totals,
+        "array_owner_peak_nbytes": owner_peaks,
+        "sidecar_persistence": {
+            "count": int(sidecar_count),
+            "total_bytes": int(sidecar_total_bytes),
+            "total_elapsed_wall_ms": round(sidecar_total_elapsed_ms, 3),
+        },
+        "memory_telemetry": {
+            "sample_count": int(memory_sample_count),
+            "phase_ids": sorted(memory_phase_ids),
+            "rss_peak_bytes": max(memory_rss_values) if memory_rss_values else None,
+        },
+        "rounds": rows,
+    }
+
+
+def _validate_lifecycle_owner_mapping(value: Any, *, field_name: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping")
+    missing = [owner for owner in _NATIVE_DEMONS_LIFECYCLE_ARRAY_OWNERS if owner not in value]
+    if missing:
+        raise ValueError(f"{field_name} is missing owners: " + ", ".join(missing))
+    for owner, count in value.items():
+        if not isinstance(owner, str) or not owner.strip():
+            raise ValueError(f"{field_name} keys must be non-empty strings")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"{field_name}.{owner} must be a non-negative integer")
+
+
+def _validate_lifecycle_sidecar(value: Any, *, field_name: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping")
+    if value.get("status") not in {"present", "absent"}:
+        raise ValueError(f"{field_name}.status must be 'present' or 'absent'")
+    elapsed = value.get("elapsed_wall_ms")
+    if elapsed is not None:
+        _ = _validate_elapsed_ms(elapsed, field_name=f"{field_name}.elapsed_wall_ms")
+    path = value.get("path")
+    if path is not None and (not isinstance(path, str) or not path.strip()):
+        raise ValueError(f"{field_name}.path must be a non-empty string or null")
+    exists = value.get("exists")
+    if exists is not None and not isinstance(exists, bool):
+        raise ValueError(f"{field_name}.exists must be a boolean or null")
+    _validate_nullable_non_negative_int(value.get("size_bytes"), field_name=f"{field_name}.size_bytes")
+
+
+def _validate_lifecycle_final_qc(value: Any, *, field_name: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping")
+    if value.get("status") not in {"present", "absent"}:
+        raise ValueError(f"{field_name}.status must be 'present' or 'absent'")
+    elapsed = value.get("elapsed_wall_ms")
+    if elapsed is not None:
+        _ = _validate_elapsed_ms(elapsed, field_name=f"{field_name}.elapsed_wall_ms")
+    helper_mode = value.get("helper_mode")
+    if helper_mode is not None and (not isinstance(helper_mode, str) or not helper_mode.strip()):
+        raise ValueError(f"{field_name}.helper_mode must be a non-empty string or null")
+    for descriptor_key in (
+        "image",
+        "flow_3d",
+        "output_mip",
+        "coordinate_working_set",
+        "avoided_full_warp_volume",
+    ):
+        descriptor = value.get(descriptor_key)
+        if descriptor is not None:
+            _validate_array_descriptor(descriptor, field_name=f"{field_name}.{descriptor_key}")
+
+
+def _validate_lifecycle_memory(value: Any, *, field_name: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping")
+    sample_count = value.get("sample_count")
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count < 0:
+        raise ValueError(f"{field_name}.sample_count must be a non-negative integer")
+    phase_ids = value.get("phase_ids")
+    if not isinstance(phase_ids, list):
+        raise ValueError(f"{field_name}.phase_ids must be a list")
+    for index, phase_id in enumerate(phase_ids):
+        if not isinstance(phase_id, str) or not phase_id.strip():
+            raise ValueError(f"{field_name}.phase_ids[{index}] must be a non-empty string")
+    _validate_nullable_non_negative_int(value.get("rss_peak_bytes"), field_name=f"{field_name}.rss_peak_bytes")
+
+
+def _validate_native_demons_flow_lifecycle_profile(value: Any, *, field_name: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping")
+    if value.get("schema_version") != "1.0":
+        raise ValueError(f"{field_name}.schema_version must be '1.0'")
+    if value.get("status") not in {"present", "absent"}:
+        raise ValueError(f"{field_name}.status must be 'present' or 'absent'")
+    source = value.get("source")
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError(f"{field_name}.source must be a non-empty string")
+    round_count = _validate_int_field(value.get("round_count"), field_name=f"{field_name}.round_count", minimum=0)
+    execution_mode_counts = value.get("execution_mode_counts")
+    if not isinstance(execution_mode_counts, Mapping):
+        raise ValueError(f"{field_name}.execution_mode_counts must be a mapping")
+    for mode, count in execution_mode_counts.items():
+        if not isinstance(mode, str) or not mode.strip():
+            raise ValueError(f"{field_name}.execution_mode_counts keys must be non-empty strings")
+        _validate_int_field(count, field_name=f"{field_name}.execution_mode_counts.{mode}", minimum=0)
+    _validate_lifecycle_owner_mapping(value.get("array_owner_counts"), field_name=f"{field_name}.array_owner_counts")
+    _validate_lifecycle_owner_mapping(value.get("array_owner_total_nbytes"), field_name=f"{field_name}.array_owner_total_nbytes")
+    _validate_lifecycle_owner_mapping(value.get("array_owner_peak_nbytes"), field_name=f"{field_name}.array_owner_peak_nbytes")
+    sidecar = value.get("sidecar_persistence")
+    if not isinstance(sidecar, Mapping):
+        raise ValueError(f"{field_name}.sidecar_persistence must be a mapping")
+    _validate_int_field(sidecar.get("count"), field_name=f"{field_name}.sidecar_persistence.count", minimum=0)
+    _validate_int_field(sidecar.get("total_bytes"), field_name=f"{field_name}.sidecar_persistence.total_bytes", minimum=0)
+    _ = _validate_elapsed_ms(
+        sidecar.get("total_elapsed_wall_ms"),
+        field_name=f"{field_name}.sidecar_persistence.total_elapsed_wall_ms",
+    )
+    _validate_lifecycle_memory(value.get("memory_telemetry"), field_name=f"{field_name}.memory_telemetry")
+    rows = value.get("rounds")
+    if not isinstance(rows, list):
+        raise ValueError(f"{field_name}.rounds must be a list")
+    if len(rows) != round_count:
+        raise ValueError(f"{field_name}.round_count must equal len(rounds)")
+    for index, row in enumerate(rows):
+        row_field = f"{field_name}.rounds[{index}]"
+        if not isinstance(row, Mapping):
+            raise ValueError(f"{row_field} must be a mapping")
+        _validate_int_field(row.get("round_id"), field_name=f"{row_field}.round_id")
+        mode = row.get("local_execution_mode")
+        if not isinstance(mode, str) or not mode.strip():
+            raise ValueError(f"{row_field}.local_execution_mode must be a non-empty string")
+        for descriptor_key in ("moving_shifted_volume", "produced_flow_3d"):
+            descriptor = row.get(descriptor_key)
+            if descriptor is not None:
+                _validate_array_descriptor(descriptor, field_name=f"{row_field}.{descriptor_key}")
+        _validate_lifecycle_sidecar(
+            row.get("flow_sidecar_persistence"),
+            field_name=f"{row_field}.flow_sidecar_persistence",
+        )
+        _validate_lifecycle_final_qc(
+            row.get("final_qc_bounded_mip"),
+            field_name=f"{row_field}.final_qc_bounded_mip",
+        )
+        _validate_lifecycle_memory(row.get("memory_telemetry"), field_name=f"{row_field}.memory_telemetry")
+
+
 def _iter_matlab_internal_timing_blocks(
     rounds: Sequence[Mapping[str, Any]],
 ) -> list[tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any] | None]]:
@@ -2234,6 +2566,7 @@ def _build_summary(
     flow_summary = _flow_sidecar_summary(rounds)
     work_plan_summary = _work_plan_summary(rounds)
     memory_summary = _memory_telemetry_summary(rounds)
+    native_demons_lifecycle_profile = _native_demons_flow_lifecycle_profile(rounds)
     matlab_internal_summary = _matlab_internal_timing_summary(rounds)
     matlab_hot_path_profile = _matlab_local_hot_path_profile(rounds)
     worker_summary = _worker_lifecycle_summary(rounds)
@@ -2278,6 +2611,7 @@ def _build_summary(
         **worker_summary,
         **work_plan_summary,
         **memory_summary,
+        "native_demons_flow_lifecycle": native_demons_lifecycle_profile,
         "flow_sidecar_count": flow_summary["flow_sidecar_count"],
         "flow_sidecar_total_bytes": flow_summary["flow_sidecar_total_bytes"],
         "flow_sidecars": flow_summary["flow_sidecars"],
@@ -2720,6 +3054,12 @@ def validate_registration_performance_payload(
         _validate_matlab_local_hot_path_profile(
             hot_path_profile,
             field_name="summary.matlab_local_hot_path_profile",
+        )
+    native_demons_lifecycle = summary.get("native_demons_flow_lifecycle")
+    if native_demons_lifecycle is not None:
+        _validate_native_demons_flow_lifecycle_profile(
+            native_demons_lifecycle,
+            field_name="summary.native_demons_flow_lifecycle",
         )
     if not isinstance(summary.get("flow_sidecars"), list):
         raise ValueError("Registration diagnostics summary.flow_sidecars must be a list")
