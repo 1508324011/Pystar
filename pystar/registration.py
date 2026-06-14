@@ -131,6 +131,47 @@ _LOCAL_PROVIDER_DEFAULT_MODES: Dict[str, str] = {
 _FINAL_QC_WARP_Z_SLAB_DEPTH = 4
 
 
+def _mean_abs_displacement_bounded(
+    flow_3d: FloatArray,
+    *,
+    z_slab_depth: int = _FINAL_QC_WARP_Z_SLAB_DEPTH,
+) -> float:
+    flow = np.asarray(flow_3d)
+    if flow.ndim != 4 or flow.shape[0] != 3:
+        return float(np.abs(flow).mean())
+    if flow.size == 0:
+        return float("nan")
+    if isinstance(z_slab_depth, bool) or not isinstance(z_slab_depth, (int, np.integer)):
+        raise ValueError(f"mean displacement z_slab_depth must be a positive integer, got {z_slab_depth!r}")
+    slab_depth = int(z_slab_depth)
+    if slab_depth <= 0:
+        raise ValueError(f"mean displacement z_slab_depth must be positive, got {slab_depth}")
+
+    total = 0.0
+    z_dim = int(flow.shape[1])
+    for z_start in range(0, z_dim, slab_depth):
+        z_stop = min(z_start + slab_depth, z_dim)
+        total += float(np.abs(flow[:, z_start:z_stop, :, :]).sum(dtype=np.float64))
+    return total / float(flow.size)
+
+
+def _materialize_sitk_displacement_field_zyx(displacement_field_sitk: sitk.Image) -> FloatArray:
+    """Materialize a SimpleITK 3D displacement field as ``(dz, dy, dx)`` while preserving dtype."""
+
+    field_view = sitk.GetArrayViewFromImage(displacement_field_sitk)
+    if field_view.ndim != 4 or field_view.shape[-1] != 3:
+        raise ValueError(
+            "SimpleITK displacement field must have shape (Z, Y, X, 3), "
+            f"got {field_view.shape}"
+        )
+
+    flow_3d = np.empty((3, *field_view.shape[:3]), dtype=field_view.dtype)
+    flow_3d[0] = field_view[..., 2]
+    flow_3d[1] = field_view[..., 1]
+    flow_3d[2] = field_view[..., 0]
+    return cast(FloatArray, flow_3d)
+
+
 def _ensure_supported_matlab_local_method(local_method: str) -> None:
     if local_method != 'demons_3d':
         raise ValueError(
@@ -553,17 +594,11 @@ def register_local_demons_3d(
         displacement_field_sitk = demons.Execute(fixed_sitk, moving_sitk)
         
         # 6. 转换为 numpy 格式
-        # SimpleITK 返回的是 (Z, Y, X, 3) 的向量场
-        field_np = sitk.GetArrayFromImage(displacement_field_sitk)
+        # SimpleITK 返回的是 (Z, Y, X, 3) 的向量场；PyStar 保存为 (3, Z, Y, X) [dz, dy, dx]
+        flow_3d = _materialize_sitk_displacement_field_zyx(displacement_field_sitk)
         
-        # 重新排列为 (3, Z, Y, X)
-        dz = field_np[..., 2]  # SimpleITK 的 Z 分量
-        dy = field_np[..., 1]  # Y 分量
-        dx = field_np[..., 0]  # X 分量
-        
-        flow_3d = np.stack([dz, dy, dx], axis=0)
-        
-        print(f"  [Demons 3D] Finished. Mean displacement: {np.abs(flow_3d).mean():.2f} px")
+        mean_abs_displacement = _mean_abs_displacement_bounded(flow_3d)
+        print(f"  [Demons 3D] Finished. Mean displacement: {mean_abs_displacement:.2f} px")
         return flow_3d
         
     except Exception as e:
@@ -961,7 +996,7 @@ def _run_tiled_native_demons_registration(
                 "Native tiled demons_3d returned flow_3d with incompatible tile shape: "
                 f"expected {expected_shape}, got {flow_tile.shape} for tile {tile.tile_index}"
             )
-        mean_abs_displacement = float(np.abs(flow_tile).mean())
+        mean_abs_displacement = _mean_abs_displacement_bounded(flow_tile)
         flow_validation_ms = elapsed_ms_since(flow_validation_started)
 
         tile_outputs.append((tile, flow_tile))

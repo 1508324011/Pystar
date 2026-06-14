@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import numpy as np
 import pytest
+import SimpleITK as sitk
 import xarray as xr
 from numpy.typing import NDArray
 
@@ -26,6 +27,8 @@ from pystar.io import get_flow_3d_sidecar_filename, get_fov_output_structure, lo
 from pystar.registration import (
     RegistrationEngine,
     _compute_warped_mip_3d_bounded,
+    _materialize_sitk_displacement_field_zyx,
+    _mean_abs_displacement_bounded,
     _run_tiled_native_demons_registration,
     apply_warp_field_3d,
 )
@@ -177,6 +180,39 @@ def test_bounded_final_qc_warp_mip_rejects_invalid_slab_depth() -> None:
 
     with pytest.raises(ValueError, match="z_slab_depth"):
         _ = _compute_warped_mip_3d_bounded(image, flow, z_slab_depth=0)
+
+
+def test_bounded_mean_abs_displacement_matches_dense_mean_without_full_abs_owner() -> None:
+    flow = np.linspace(-5.0, 5.0, num=3 * 5 * 4 * 3, dtype=np.float32).reshape((3, 5, 4, 3))
+
+    expected = float(np.abs(flow).mean())
+    observed = _mean_abs_displacement_bounded(flow, z_slab_depth=2)
+
+    assert observed == pytest.approx(expected, rel=1e-6, abs=1e-6)
+
+
+def test_bounded_mean_abs_displacement_rejects_invalid_slab_depth() -> None:
+    flow = np.zeros((3, 2, 4, 4), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="z_slab_depth"):
+        _ = _mean_abs_displacement_bounded(flow, z_slab_depth=0)
+
+
+def test_materialize_sitk_displacement_field_zyx_preserves_dtype_and_owns_canonical_layout() -> None:
+    field = np.zeros((2, 3, 4, 3), dtype=np.float64)
+    field[..., 0] = np.arange(2 * 3 * 4, dtype=np.float64).reshape((2, 3, 4))
+    field[..., 1] = field[..., 0] + 100.0
+    field[..., 2] = field[..., 0] + 200.0
+    displacement_field = sitk.GetImageFromArray(field, isVector=True)
+
+    flow = _materialize_sitk_displacement_field_zyx(displacement_field)
+
+    assert flow.dtype == field.dtype
+    assert flow.shape == (3, 2, 3, 4)
+    assert flow.flags.owndata
+    np.testing.assert_array_equal(flow[0], field[..., 2])
+    np.testing.assert_array_equal(flow[1], field[..., 1])
+    np.testing.assert_array_equal(flow[2], field[..., 0])
 
 
 def test_native_style_registration_diagnostics_round_trip_and_manifest_timings(tmp_path: Path) -> None:
