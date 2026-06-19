@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
@@ -1195,3 +1196,89 @@ def test_signal_miner_native_bridge_uses_optimized_kernel_for_image_warp() -> No
     vals = cast(FloatArray, vals_obj)
     assert metadata is None
     np.testing.assert_array_equal(vals, expected)
+
+
+def test_signal_miner_image_warp_hot_path_profile_records_flow_and_cache_details(
+    tmp_path: Path,
+) -> None:
+    miner = _signal_miner(provider='native', transform_application_mode='image_warp')
+    field_semantics = miner.cfg.pipeline.field_semantics
+    miner.cfg = cast(
+        ExperimentConfig,
+        cast(
+            object,
+            SimpleNamespace(
+                dataset=SimpleNamespace(
+                    channel_roles={0: 'seq', 1: 'seq'},
+                    round_structure={1: [0, 1]},
+                ),
+                pipeline=SimpleNamespace(
+                    scope_mode='full_fov',
+                    output=SimpleNamespace(directory=str(tmp_path)),
+                    extraction=SimpleNamespace(
+                        provider='native',
+                        transform_application_mode='image_warp',
+                        integration_box=[1, 3, 3],
+                        profile_hot_path=True,
+                    ),
+                    field_semantics=field_semantics,
+                    qc_images_enabled=lambda: False,
+                ),
+            ),
+        ),
+    )
+    paths = get_fov_output_structure(tmp_path, 7)
+    spots_df = pd.DataFrame(
+        {
+            'z': [0.0, 1.0],
+            'y': [1.0, 2.0],
+            'x': [2.0, 3.0],
+            'intensity': [10.0, 20.0],
+        }
+    )
+    spots_df.to_csv(paths['spots'] / 'spots_fov_7.csv', index=False)
+
+    img_ch0 = np.arange(2 * 4 * 4, dtype=np.float32).reshape(2, 4, 4)
+    img_ch1 = img_ch0 + np.float32(100.0)
+    loaded_images = {(1, 0): img_ch0, (1, 1): img_ch1}
+    miner.loader = cast(
+        Any,
+        SimpleNamespace(load_clean_image=lambda fov_id, round_id, channel_id: loaded_images[(round_id, channel_id)].copy()),
+    )
+
+    flow_3d = np.zeros((3, 2, 4, 4), dtype=np.float32)
+    transform_data = _transform_data(flow_3d=flow_3d)
+    miner._load_transforms = lambda fov_id: {1: dict(transform_data)}  # type: ignore[method-assign]
+    miner._materialize_round_transform = (  # type: ignore[method-assign]
+        lambda fov_id, round_id, transform_data, *, hydrate_flow_3d=True: dict(transform_data)
+    )
+    miner._validate_scope_contract = (  # type: ignore[method-assign]
+        lambda fov_id, transforms: {'delivered_coverage': 'full_fov'}
+    )
+    miner._validate_image_warp_contract = lambda fov_id, transforms: None  # type: ignore[method-assign]
+
+    miner.mine_fov(7)
+
+    profile_path = paths['qc'] / 'extraction_hot_path_profile_fov_7.json'
+    assert profile_path.exists()
+    profile = json.loads(profile_path.read_text(encoding='utf-8'))
+    prep_events = [
+        event for event in profile['events']
+        if event['bucket'] == 'coordinate_or_warp_preparation'
+    ]
+    assert len(prep_events) >= 2
+    miss_event = next(event for event in prep_events if event['details'].get('cache_hit') is False)
+    hit_event = next(event for event in prep_events if event['details'].get('cache_hit') is True)
+    assert miss_event['details']['sampling_plan'] == 'image_warp'
+    assert miss_event['details']['transform_application_mode'] == 'image_warp'
+    assert miss_event['details']['flow_3d']['shape'] == [3, 2, 4, 4]
+    assert miss_event['details']['spot_count'] == 2
+    assert hit_event['details']['sampling_plan'] == 'image_warp'
+    assert hit_event['details']['cache_hit'] is True
+
+    got = np.load(paths['extraction'] / 'intensity_matrix_fov_7.npy', allow_pickle=False)
+    expected = np.zeros((2, 1, 2), dtype=np.float32)
+    ref_coords = cast(FloatArray, spots_df[['z', 'y', 'x']].to_numpy(dtype=np.float32))
+    expected[:, 0, 0] = extract_box_sum_integer(img_ch0, ref_coords, box_size=(1, 3, 3))
+    expected[:, 0, 1] = extract_box_sum_integer(img_ch1, ref_coords, box_size=(1, 3, 3))
+    np.testing.assert_array_equal(got, expected)

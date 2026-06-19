@@ -28,6 +28,7 @@ from ._artifact_schemas import (
     wrap_payload_read_error,
     wrap_table_read_error,
 )
+from ._registration_performance import array_diagnostics_descriptor
 from .infrastructure import ExperimentConfig
 from .extraction_utils import (
     RoundExtractionTransformPlan,
@@ -812,6 +813,13 @@ class SignalMiner:
                 image_warp_sampling_plans: dict[tuple[int, int, int], _ImageWarpSamplingPlan] = {}
 
                 current_round_channels = self.cfg.dataset.round_structure[r_id]
+                round_profile_details = {
+                    "provider": extraction_provider,
+                    "transform_application_mode": transform_application_mode,
+                    "native_sampling_plan": bool(extraction_route.uses_native_sampling_plan),
+                    "round_id": int(r_id),
+                    "spot_count": int(len(in_scope_coords)),
+                }
                 
                 for c_idx, c_id in enumerate(channels):
                     if c_id not in current_round_channels:
@@ -832,7 +840,14 @@ class SignalMiner:
                         if extraction_route.is_coordinate_mapping:
                             coordinate_mapping_sampling_plan = coordinate_mapping_sampling_plans.get(plan_key)
                             if coordinate_mapping_sampling_plan is None:
-                                with profiler.record("coordinate_or_warp_preparation", round_id=r_id, channel_id=c_id):
+                                with profiler.record(
+                                    "coordinate_or_warp_preparation",
+                                    **round_profile_details,
+                                    channel_id=int(c_id),
+                                    image_shape_zyx=[int(value) for value in plan_key],
+                                    sampling_plan="coordinate_mapping",
+                                    cache_hit=False,
+                                ):
                                     coordinate_mapping_sampling_plan = _build_coordinate_mapping_sampling_plan(
                                         img_shape=plan_key,
                                         ref_coords=in_scope_coords,
@@ -841,10 +856,36 @@ class SignalMiner:
                                         expected_field_semantics=self._expected_field_semantics(),
                                     )
                                 coordinate_mapping_sampling_plans[plan_key] = coordinate_mapping_sampling_plan
+                            elif profiler.enabled:
+                                with profiler.record(
+                                    "coordinate_or_warp_preparation",
+                                    **round_profile_details,
+                                    channel_id=int(c_id),
+                                    image_shape_zyx=[int(value) for value in plan_key],
+                                    sampling_plan="coordinate_mapping",
+                                    cache_hit=True,
+                                ):
+                                    pass
                         elif extraction_route.is_image_warp:
                             image_warp_sampling_plan = image_warp_sampling_plans.get(plan_key)
                             if image_warp_sampling_plan is None:
-                                with profiler.record("coordinate_or_warp_preparation", round_id=r_id, channel_id=c_id):
+                                flow_profile_descriptor = (
+                                    array_diagnostics_descriptor(
+                                        round_plan.legacy_transform_data().get("flow_3d"),
+                                        role="extraction_image_warp_flow_3d",
+                                    )
+                                    if profiler.enabled
+                                    else None
+                                )
+                                with profiler.record(
+                                    "coordinate_or_warp_preparation",
+                                    **round_profile_details,
+                                    channel_id=int(c_id),
+                                    image_shape_zyx=[int(value) for value in plan_key],
+                                    sampling_plan="image_warp",
+                                    cache_hit=False,
+                                    flow_3d=flow_profile_descriptor,
+                                ):
                                     image_warp_sampling_plan = _build_image_warp_sampling_plan(
                                         img_shape=plan_key,
                                         ref_coords=in_scope_coords,
@@ -853,6 +894,16 @@ class SignalMiner:
                                         expected_field_semantics=self._expected_field_semantics(),
                                     )
                                 image_warp_sampling_plans[plan_key] = image_warp_sampling_plan
+                            elif profiler.enabled:
+                                with profiler.record(
+                                    "coordinate_or_warp_preparation",
+                                    **round_profile_details,
+                                    channel_id=int(c_id),
+                                    image_shape_zyx=[int(value) for value in plan_key],
+                                    sampling_plan="image_warp",
+                                    cache_hit=True,
+                                ):
+                                    pass
 
                     vals, backend_metadata = self._extract_intensities_for_channel(
                         img_vol=img_vol,
@@ -1020,7 +1071,7 @@ class SignalMiner:
 
         plot_spot_traces = import_module('pystar.visualization').plot_spot_traces
             
-        print(f" [QC] Generating extraction QC plots...")
+        print(" [QC] Generating extraction QC plots...")
         base_dir = Path(self.cfg.pipeline.output.directory)
         paths = get_fov_output_structure(base_dir, fov_id)
         qc_dir = paths["qc"]
