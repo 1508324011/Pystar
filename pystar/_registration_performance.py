@@ -565,6 +565,49 @@ def _validate_memory_delta_record(value: Any, *, field_name: str) -> None:
         raise ValueError(f"{field_name}.details must be a mapping when present")
 
 
+def _validate_pre_peak_native_provider_profile(value: Any, *, field_name: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a pre-peak native provider profile mapping")
+    if value.get("schema_name") != "pystar_pre_peak_native_provider_profile":
+        raise ValueError(f"{field_name}.schema_name must be 'pystar_pre_peak_native_provider_profile'")
+    if value.get("schema_version") != 1:
+        raise ValueError(f"{field_name}.schema_version must be 1")
+    if value.get("enabled") is not True:
+        raise ValueError(f"{field_name}.enabled must be true for a persisted opt-in profile")
+    negative_evidence = value.get("negative_evidence")
+    if not isinstance(negative_evidence, Mapping):
+        raise ValueError(f"{field_name}.negative_evidence must be a mapping")
+    for stage_name in ("stage46", "stage47"):
+        stage = negative_evidence.get(stage_name)
+        if not isinstance(stage, Mapping):
+            raise ValueError(f"{field_name}.negative_evidence.{stage_name} must be a mapping")
+        summary = stage.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError(f"{field_name}.negative_evidence.{stage_name}.summary must be a non-empty string")
+    hypothesis = value.get("hypothesis")
+    if not isinstance(hypothesis, str) or not hypothesis.strip():
+        raise ValueError(f"{field_name}.hypothesis must be a non-empty string")
+
+    phase_timings = value.get("phase_timings_ms")
+    if not isinstance(phase_timings, Mapping):
+        raise ValueError(f"{field_name}.phase_timings_ms must be a mapping")
+    memory_telemetry = value.get("memory_telemetry")
+    if not isinstance(memory_telemetry, list):
+        raise ValueError(f"{field_name}.memory_telemetry must be a list")
+    timing_phase_ids = set()
+    for phase_id, elapsed_ms in phase_timings.items():
+        if not isinstance(phase_id, str) or not phase_id.strip():
+            raise ValueError(f"{field_name}.phase_timings_ms keys must be non-empty strings")
+        timing_phase_ids.add(phase_id)
+        _ = _validate_elapsed_ms(elapsed_ms, field_name=f"{field_name}.phase_timings_ms.{phase_id}")
+    telemetry_phase_ids = set()
+    for index, record in enumerate(memory_telemetry):
+        _validate_memory_delta_record(record, field_name=f"{field_name}.memory_telemetry[{index}]")
+        telemetry_phase_ids.add(str(cast(Mapping[str, Any], record)["phase_id"]))
+    if timing_phase_ids != telemetry_phase_ids:
+        raise ValueError(f"{field_name}.phase_timings_ms keys must match memory_telemetry phase_id values")
+
+
 def _validate_registration_work_plan(value: Any, *, field_name: str) -> None:
     if not isinstance(value, Mapping):
         raise ValueError(f"{field_name} must be a work-plan mapping")
@@ -1316,6 +1359,20 @@ class RegistrationPerformanceRecorder:
             local_internal = {}
             round_entry["local_internal_timings"] = local_internal
         local_internal[phase_id] = timing_record(phase_id, elapsed_wall_ms, status=status, details=details)
+
+    def record_pre_peak_native_provider_profile(
+        self,
+        round_id: int,
+        profile: Mapping[str, Any],
+    ) -> None:
+        """Attach opt-in native demons pre-peak profiling details to one round."""
+
+        round_entry = self._round(round_id)
+        local_registration = round_entry.setdefault("local_registration", timing_record("local_registration", 0.0))
+        if not isinstance(local_registration, dict):
+            local_registration = timing_record("local_registration", 0.0)
+            round_entry["local_registration"] = local_registration
+        local_registration["pre_peak_native_provider_profile"] = dict(profile)
 
     def record_tiled_local_summary(
         self,
@@ -2819,6 +2876,13 @@ def validate_registration_performance_payload(
                         internal,
                         field_name=f"rounds[{index}].{boundary_key}.matlab_internal_timing",
                     )
+                if boundary_key == "local_registration":
+                    pre_peak_profile = maybe_record.get("pre_peak_native_provider_profile")
+                    if pre_peak_profile is not None:
+                        _validate_pre_peak_native_provider_profile(
+                            pre_peak_profile,
+                            field_name=f"rounds[{index}].local_registration.pre_peak_native_provider_profile",
+                        )
         _validate_nested_timings(round_entry, field_name=f"rounds[{index}]")
 
     manifest = payload.get("manifest")

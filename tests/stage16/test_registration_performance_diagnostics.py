@@ -31,6 +31,7 @@ from pystar.registration import (
     _mean_abs_displacement_bounded,
     _run_tiled_native_demons_registration,
     apply_warp_field_3d,
+    register_local_demons_3d,
 )
 from pystar.tiling import build_yx_tile_layout, extract_tile, stitch_tiles
 
@@ -213,6 +214,153 @@ def test_materialize_sitk_displacement_field_zyx_preserves_dtype_and_owns_canoni
     np.testing.assert_array_equal(flow[0], field[..., 2])
     np.testing.assert_array_equal(flow[1], field[..., 1])
     np.testing.assert_array_equal(flow[2], field[..., 0])
+
+
+def _install_fake_simpleitk_demons(monkeypatch: pytest.MonkeyPatch) -> None:
+    import pystar.registration as registration_module
+
+    class FakeImage:
+        def __init__(self, array: NDArray[np.generic]) -> None:
+            self.array = np.asarray(array)
+            self.spacing: list[float] = []
+
+        def SetSpacing(self, spacing: list[float]) -> None:
+            self.spacing = list(spacing)
+
+    class FakeDemonsRegistrationFilter:
+        def __init__(self) -> None:
+            self.iterations = 0
+            self.smoothing_sigma = 0.0
+
+        def SetNumberOfIterations(self, value: int) -> None:
+            self.iterations = int(value)
+
+        def SetStandardDeviations(self, value: float) -> None:
+            self.smoothing_sigma = float(value)
+
+        def Execute(self, fixed: FakeImage, moving: FakeImage) -> FakeImage:
+            del moving
+            field = np.zeros((*fixed.array.shape, 3), dtype=np.float32)
+            field[..., 0] = np.float32(1.0)
+            field[..., 1] = np.float32(2.0)
+            field[..., 2] = np.float32(3.0)
+            return FakeImage(field)
+
+    monkeypatch.setattr(registration_module.sitk, "GetImageFromArray", lambda array, *args, **kwargs: FakeImage(array))
+    monkeypatch.setattr(registration_module.sitk, "GetArrayViewFromImage", lambda image: image.array)
+    monkeypatch.setattr(registration_module.sitk, "DemonsRegistrationFilter", FakeDemonsRegistrationFilter)
+
+
+def test_native_demons_pre_peak_profile_is_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    import pystar.registration as registration_module
+
+    monkeypatch.delenv("PYSTAR_PRE_PEAK_NATIVE_PROVIDER_PROFILE", raising=False)
+    _install_fake_simpleitk_demons(monkeypatch)
+    monkeypatch.setattr(
+        registration_module,
+        "sample_process_memory",
+        lambda: pytest.fail("default native demons path must not sample profiling memory"),
+    )
+    profile_sink: list[dict[str, Any]] = []
+
+    flow = register_local_demons_3d(
+        np.zeros((2, 3, 4), dtype=np.float32),
+        np.ones((2, 3, 4), dtype=np.float32),
+        SimpleNamespace(num_iter=2, smoothing_sigma=0.5),
+        profile_sink=profile_sink,
+    )
+
+    assert profile_sink == []
+    assert flow is not None
+    assert flow.shape == (3, 2, 3, 4)
+    np.testing.assert_array_equal(flow[0], np.full((2, 3, 4), 3.0, dtype=np.float32))
+
+
+def test_native_demons_pre_peak_profile_records_conversion_execute_and_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pystar.registration as registration_module
+
+    monkeypatch.delenv("PYSTAR_PRE_PEAK_NATIVE_PROVIDER_PROFILE", raising=False)
+    _install_fake_simpleitk_demons(monkeypatch)
+    memory_samples = iter(
+        [
+            {"source": "procfs", "rss_bytes": 1000, "available_memory_bytes": 9000},
+            {"source": "procfs", "rss_bytes": 1200, "available_memory_bytes": 8800},
+            {"source": "procfs", "rss_bytes": 1300, "available_memory_bytes": 8700},
+            {"source": "procfs", "rss_bytes": 1700, "available_memory_bytes": 8300},
+            {"source": "procfs", "rss_bytes": 1800, "available_memory_bytes": 8200},
+            {"source": "procfs", "rss_bytes": 2100, "available_memory_bytes": 7900},
+        ]
+    )
+    monkeypatch.setattr(registration_module, "sample_process_memory", lambda: next(memory_samples))
+    profile_sink: list[dict[str, Any]] = []
+
+    flow = register_local_demons_3d(
+        np.zeros((2, 3, 4), dtype=np.float32),
+        np.ones((2, 3, 4), dtype=np.float32),
+        SimpleNamespace(num_iter=7, smoothing_sigma=0.25, profile_pre_peak_native_provider=True),
+        profile_sink=profile_sink,
+    )
+
+    assert flow is not None
+    assert len(profile_sink) == 1
+    profile = profile_sink[0]
+    assert profile["schema_name"] == "pystar_pre_peak_native_provider_profile"
+    assert profile["enabled"] is True
+    assert set(profile["negative_evidence"]) == {"stage46", "stage47"}
+    assert set(profile["phase_timings_ms"]) == {
+        "simpleitk_input_conversion",
+        "simpleitk_demons_execute",
+        "sitk_displacement_field_to_numpy_flow_3d",
+    }
+    memory_records = profile["memory_telemetry"]
+    assert [record["phase_id"] for record in memory_records] == [
+        "simpleitk_input_conversion",
+        "simpleitk_demons_execute",
+        "sitk_displacement_field_to_numpy_flow_3d",
+    ]
+    assert [record["rss_delta_bytes"] for record in memory_records] == [200, 400, 300]
+    assert memory_records[0]["details"]["reference_volume"]["shape"] == [2, 3, 4]
+    assert memory_records[1]["details"]["iterations"] == 7
+    assert memory_records[2]["details"]["flow_3d"]["shape"] == [3, 2, 3, 4]
+
+
+def test_malformed_pre_peak_native_provider_profile_fails_payload_validation() -> None:
+    recorder = RegistrationPerformanceRecorder(fov_id=FOV_ID, providers=_providers())
+    recorder.start_round(2, is_reference_round=False)
+    recorder.record_pre_peak_native_provider_profile(
+        2,
+        {
+            "schema_name": "pystar_pre_peak_native_provider_profile",
+            "schema_version": 1,
+            "enabled": True,
+            "negative_evidence": {
+                "stage46": {"summary": "failed wall-time resource gate"},
+                "stage47": {"summary": "failed RSS and wall-time resource gates"},
+            },
+            "hypothesis": "pre-peak ownership overlap dominates RSS",
+            "phase_timings_ms": {"simpleitk_input_conversion": 1.0},
+            "memory_telemetry": [
+                memory_delta_diagnostics(
+                    "simpleitk_input_conversion",
+                    {"source": "procfs", "rss_bytes": 1000, "available_memory_bytes": 9000},
+                    {"source": "procfs", "rss_bytes": 1200, "available_memory_bytes": 8800},
+                )
+            ],
+        },
+    )
+    payload = recorder.build_payload()
+    malformed = cast(dict[str, Any], dict(payload))
+    malformed["rounds"] = [dict(round_entry) for round_entry in cast(list[dict[str, Any]], payload["rounds"])]
+    local_registration = dict(cast(dict[str, Any], malformed["rounds"][0]["local_registration"]))
+    profile = dict(cast(dict[str, Any], local_registration["pre_peak_native_provider_profile"]))
+    profile["phase_timings_ms"] = {"different_phase": 1.0}
+    local_registration["pre_peak_native_provider_profile"] = profile
+    malformed["rounds"][0]["local_registration"] = local_registration
+
+    with pytest.raises(ValueError, match="pre_peak_native_provider_profile.*phase_timings_ms"):
+        validate_registration_performance_payload(malformed, expected_fov_id=FOV_ID)
 
 
 def test_native_style_registration_diagnostics_round_trip_and_manifest_timings(tmp_path: Path) -> None:
