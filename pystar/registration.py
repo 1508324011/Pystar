@@ -90,6 +90,55 @@ class _LocalRegistrationOutcome:
     backend_metadata: Optional[Dict[str, Any]]
 
 
+@dataclass(slots=True)
+class _NativeDemonsProfile:
+    enabled: bool
+    phase_timings_ms: Dict[str, float]
+    memory_telemetry: list[Dict[str, Any]]
+
+    def record_phase(
+        self,
+        phase_id: str,
+        elapsed_wall_ms: float,
+        before: Mapping[str, Any],
+        after: Mapping[str, Any],
+        **details: Any,
+    ) -> None:
+        self.phase_timings_ms[phase_id] = round(float(elapsed_wall_ms), 3)
+        self.memory_telemetry.append(
+            memory_delta_diagnostics(
+                phase_id,
+                before,
+                after,
+                details={key: value for key, value in details.items() if value is not None},
+            )
+        )
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_name": "pystar_pre_peak_native_provider_profile",
+            "schema_version": 1,
+            "enabled": bool(self.enabled),
+            "negative_evidence": {
+                "stage46": {
+                    "summary": "direct-to-sidecar/tiled-flow preserved outputs but regressed wall time and did not reduce peak RSS enough",
+                    "wall_time_seconds": 13931,
+                    "baseline_stage45_wall_time_seconds": 3888,
+                },
+                "stage47": {
+                    "summary": "lifecycle-shortening preserved outputs but failed peak RSS and wall-time gates",
+                    "max_rss_kb": 30753044,
+                    "baseline_stage45_max_rss_kb": 28956484,
+                    "wall_time_seconds": 3943,
+                    "baseline_stage45_wall_time_seconds": 3888,
+                },
+            },
+            "hypothesis": "pre-peak full-volume native provider ownership overlap dominates peak RSS before sidecar spill or manifest cleanup",
+            "phase_timings_ms": dict(self.phase_timings_ms),
+            "memory_telemetry": [dict(record) for record in self.memory_telemetry],
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class _BoundedWarpMIPResult:
     mip: FloatArray
@@ -554,7 +603,9 @@ def register_local_bspline(
 def register_local_demons_3d(
     ref_3d: FloatArray,
     mov_3d: FloatArray,
-    config_obj: Any
+    config_obj: Any,
+    *,
+    profile_sink: Optional[list[Dict[str, Any]]] = None,
 ) -> Optional[FloatArray]:
     """
     3D Demons 非刚性配准
@@ -565,10 +616,22 @@ def register_local_demons_3d(
     """
 
     pyramid_levels = _validate_native_demons_pyramid_levels(config_obj)
+    profile = _new_native_demons_profile(config_obj)
     
     # 1. 转换为 SimpleITK 格式
+    conversion_started = diagnostics_timer_start()
+    conversion_memory_before = sample_process_memory() if profile is not None else None
     fixed_sitk = sitk.GetImageFromArray(ref_3d.astype(np.float32))
     moving_sitk = sitk.GetImageFromArray(mov_3d.astype(np.float32))
+    conversion_memory_after = sample_process_memory() if conversion_memory_before is not None else None
+    if profile is not None and conversion_memory_before is not None and conversion_memory_after is not None:
+        profile.record_phase(
+            "simpleitk_input_conversion",
+            elapsed_ms_since(conversion_started),
+            conversion_memory_before,
+            conversion_memory_after,
+            **_native_demons_array_details(ref_3d, mov_3d),
+        )
     
     # 2. 设置物理空间（保持一致）
     fixed_sitk.SetSpacing([1.0, 1.0, 1.0])
@@ -591,11 +654,37 @@ def register_local_demons_3d(
         # 4. 执行配准。Do not configure ImageRegistrationMethod pyramid here:
         # those settings do not affect this direct DemonsRegistrationFilter.Execute call.
         print(f"  [Demons 3D] Starting registration ({pyramid_status})...")
+        execute_started = diagnostics_timer_start()
+        execute_memory_before = sample_process_memory() if profile is not None else None
         displacement_field_sitk = demons.Execute(fixed_sitk, moving_sitk)
+        execute_memory_after = sample_process_memory() if execute_memory_before is not None else None
+        if profile is not None and execute_memory_before is not None and execute_memory_after is not None:
+            profile.record_phase(
+                "simpleitk_demons_execute",
+                elapsed_ms_since(execute_started),
+                execute_memory_before,
+                execute_memory_after,
+                pyramid_status=pyramid_status,
+                iterations=int(getattr(config_obj, 'num_iter', 50)),
+                smoothing_sigma=float(getattr(config_obj, 'smoothing_sigma', 1.0)),
+            )
         
         # 6. 转换为 numpy 格式
         # SimpleITK 返回的是 (Z, Y, X, 3) 的向量场；PyStar 保存为 (3, Z, Y, X) [dz, dy, dx]
+        materialize_started = diagnostics_timer_start()
+        materialize_memory_before = sample_process_memory() if profile is not None else None
         flow_3d = _materialize_sitk_displacement_field_zyx(displacement_field_sitk)
+        materialize_memory_after = sample_process_memory() if materialize_memory_before is not None else None
+        if profile is not None and materialize_memory_before is not None and materialize_memory_after is not None:
+            profile.record_phase(
+                "sitk_displacement_field_to_numpy_flow_3d",
+                elapsed_ms_since(materialize_started),
+                materialize_memory_before,
+                materialize_memory_after,
+                flow_3d=array_diagnostics_descriptor(flow_3d, role="materialized_numpy_flow_3d"),
+            )
+        if profile is not None and profile_sink is not None:
+            profile_sink.append(profile.as_dict())
         
         mean_abs_displacement = _mean_abs_displacement_bounded(flow_3d)
         print(f"  [Demons 3D] Finished. Mean displacement: {mean_abs_displacement:.2f} px")
@@ -644,6 +733,38 @@ def _validate_native_demons_pyramid_levels(config_obj: Any) -> Optional[int]:
             "MATLAB PyramidLevels semantics."
         )
     return levels
+
+
+def _truthy_runtime_flag(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _pre_peak_native_provider_profile_enabled(config_obj: Any) -> bool:
+    config_flag = any(
+        _truthy_runtime_flag(getattr(config_obj, attr, False))
+        for attr in (
+            "profile_pre_peak_native_provider",
+            "pre_peak_native_provider_profile",
+            "enable_pre_peak_native_provider_profiling",
+        )
+    )
+    env_flag = os.environ.get("PYSTAR_PRE_PEAK_NATIVE_PROVIDER_PROFILE", "").strip().lower() in {"1", "true", "yes", "on"}
+    return bool(config_flag or env_flag)
+
+
+def _native_demons_array_details(ref_3d: FloatArray, mov_3d: FloatArray) -> Dict[str, Any]:
+    return {
+        "reference_volume": array_diagnostics_descriptor(ref_3d, role="native_demons_reference_input"),
+        "moving_shifted_volume": array_diagnostics_descriptor(mov_3d, role="native_demons_moving_shifted_input"),
+    }
+
+
+def _new_native_demons_profile(config_obj: Any) -> Optional[_NativeDemonsProfile]:
+    if not _pre_peak_native_provider_profile_enabled(config_obj):
+        return None
+    return _NativeDemonsProfile(enabled=True, phase_timings_ms={}, memory_telemetry=[])
 
 
 def apply_warp_field_2d(img_2d: FloatArray, flow: FloatArray) -> FloatArray:
@@ -2105,11 +2226,23 @@ class RegistrationEngine:
             else None
         )
         if tiling_layout is None:
-            flow_3d = register_local_demons_3d(
-                context.ref_scope_3d,
-                mov_shifted_3d,
-                self.cfg.pipeline.registration.demons_3d,
+            native_pre_peak_profiles: Optional[list[Dict[str, Any]]] = (
+                [] if _pre_peak_native_provider_profile_enabled(self.cfg.pipeline.registration.demons_3d) else None
             )
+            if native_pre_peak_profiles is None:
+                flow_3d = register_local_demons_3d(
+                    context.ref_scope_3d,
+                    mov_shifted_3d,
+                    self.cfg.pipeline.registration.demons_3d,
+                )
+            else:
+                flow_3d = register_local_demons_3d(
+                    context.ref_scope_3d,
+                    mov_shifted_3d,
+                    self.cfg.pipeline.registration.demons_3d,
+                    profile_sink=native_pre_peak_profiles,
+                )
+            native_pre_peak_profile = native_pre_peak_profiles[0] if native_pre_peak_profiles else None
         else:
             flow_3d, tiling_summary = _run_tiled_native_demons_registration(
                 context.ref_scope_3d,
@@ -2119,6 +2252,7 @@ class RegistrationEngine:
                 round_id=int(context.round_id),
                 diagnostics=self._registration_diagnostics,
             )
+            native_pre_peak_profile = None
         native_memory_after = sample_process_memory() if native_memory_before is not None else None
         if self._registration_diagnostics is not None and context.round_id >= 0:
             if native_memory_before is not None and native_memory_after is not None:
@@ -2151,6 +2285,11 @@ class RegistrationEngine:
                     "produced_flow_3d": array_diagnostics_descriptor(flow_3d, role="produced_flow_3d"),
                 },
             )
+            if isinstance(native_pre_peak_profile, Mapping):
+                self._registration_diagnostics.record_pre_peak_native_provider_profile(
+                    context.round_id,
+                    native_pre_peak_profile,
+                )
 
         if flow_3d is None:
             backend_metadata = _attach_local_flow_metadata(

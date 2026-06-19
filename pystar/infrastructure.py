@@ -482,6 +482,7 @@ class Demons3DConfig(BaseModel):
     sqrt_pieces: Optional[int] = 4
     tile_grid_shape_yx: Optional[Tuple[int, int]] = None
     tiling_layout_policy: Literal["matlab_subtile", "even_split"] = "matlab_subtile"
+    profile_pre_peak_native_provider: bool = False
 
     @model_validator(mode='before')
     @classmethod
