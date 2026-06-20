@@ -465,9 +465,12 @@ class Demons3DConfig(BaseModel):
     num_iter: int = 50  # 对应 MATLAB 的 Iterations 参数
     smoothing_sigma: float = 1.0  # 对应 MATLAB 的 AccumulatedFieldSmoothing
     
-    # 多分辨率金字塔参数
-    # MATLAB 自动计算: pyd_level = floor(log2(obj.dimZ))
-    # 这里允许手动覆盖，None 表示自动计算
+    # 多分辨率金字塔参数。
+    # MATLAB provider forwards positive integers to MATLAB PyramidLevels;
+    # None preserves MATLAB runtime auto-computation. Native SimpleITK
+    # DemonsRegistrationFilter has no multi-level pyramid API here, so
+    # registration.py accepts only None/1 for native execution and fails loudly
+    # for values greater than one.
     pyramid_levels: Optional[int] = None
     
     # 是否使用分块处理（针对大图像）
@@ -479,6 +482,20 @@ class Demons3DConfig(BaseModel):
     sqrt_pieces: Optional[int] = 4
     tile_grid_shape_yx: Optional[Tuple[int, int]] = None
     tiling_layout_policy: Literal["matlab_subtile", "even_split"] = "matlab_subtile"
+    profile_pre_peak_native_provider: bool = False
+
+    @model_validator(mode='before')
+    @classmethod
+    def reject_invalid_pyramid_levels(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            raw_levels = data.get("pyramid_levels", None)
+            if raw_levels is not None and (
+                isinstance(raw_levels, bool) or not isinstance(raw_levels, Integral)
+            ):
+                raise ValueError(
+                    "registration.local.params.demons_3d.pyramid_levels must be a positive integer when provided"
+                )
+        return data
 
     @model_validator(mode='after')
     def validate_tiling(self) -> 'Demons3DConfig':

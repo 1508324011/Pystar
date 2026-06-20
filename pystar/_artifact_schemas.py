@@ -260,9 +260,13 @@ class IntensityMatrixSpec:
     def expected_shape(self) -> tuple[int, int, int]:
         return (self.n_spots, self.n_rounds, self.n_channels)
 
+    @property
+    def expected_dtype(self) -> np.dtype[np.float32]:
+        return np.dtype(np.float32)
+
     def expected_description(self) -> str:
         return (
-            f"numeric rank-3 array with shape {self.expected_shape} == "
+            f"float32 numeric rank-3 array with shape {self.expected_shape} == "
             f"(N_spots, N_rounds, N_seq_channels), rounds={list(self.rounds)}, channels={list(self.channels)}"
         )
 
@@ -1071,7 +1075,7 @@ def validate_intensity_matrix(
 ) -> npt.NDArray[np.generic]:
     """Validate the canonical intensity-matrix contract."""
 
-    arr = np.asarray(matrix)
+    arr = matrix if isinstance(matrix, np.ndarray) else np.asarray(matrix)
     expected = spec.expected_description()
     if arr.ndim != 3:
         raise _schema_error(
@@ -1089,6 +1093,15 @@ def validate_intensity_matrix(
             path=path,
             context=context,
             detail=f"dtype {arr.dtype!s} is not numeric",
+            expected=expected,
+        )
+    if arr.dtype != spec.expected_dtype:
+        raise _schema_error(
+            "intensity matrix",
+            fov_id=spec.fov_id,
+            path=path,
+            context=context,
+            detail=f"dtype {arr.dtype!s} is not float32",
             expected=expected,
         )
     actual_shape = tuple(int(value) for value in arr.shape)

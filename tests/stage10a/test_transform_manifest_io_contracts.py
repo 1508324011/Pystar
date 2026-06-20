@@ -4,10 +4,11 @@ import copy
 from pathlib import Path
 from types import SimpleNamespace
 from collections.abc import Callable
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 import numpy as np
 import pytest
+import xarray as xr
 from numpy.typing import NDArray
 
 from pystar.infrastructure import ExperimentConfig
@@ -22,6 +23,7 @@ from pystar.io import (
     save_transform_manifest,
 )
 from pystar.mining import SignalMiner
+from pystar.registration import RegistrationEngine
 
 
 FOV_ID = 7
@@ -98,6 +100,11 @@ def _build_minimal_config(
         representation="residual",
         composition="sequential_global_then_local",
         status="settled",
+        as_dict=lambda: {
+            "representation": "residual",
+            "composition": "sequential_global_then_local",
+            "status": "settled",
+        },
     )
     registration = SimpleNamespace(
         reference_round=1,
@@ -423,8 +430,10 @@ def test_transform_manifest_public_io_preserves_legacy_shape_and_eager_lazy_flow
     assert _provenance_payload(persisted)["release_contract"] == provenance["release_contract"]
 
     lazy_loaded = load_transform_manifest(base_dir, FOV_ID, load_provenance=True, hydrate_flow_3d=False)
+    default_loaded = load_transform_manifest(base_dir, FOV_ID)
     eager_loaded = load_transform_manifest(base_dir, FOV_ID, load_provenance=True, hydrate_flow_3d=True)
     lazy_round_two = _round_entry(cast(ManifestPayload, lazy_loaded), 2)
+    default_round_two = _round_entry(cast(ManifestPayload, default_loaded), 2)
     eager_round_two = _round_entry(cast(ManifestPayload, eager_loaded), 2)
     materialized = materialize_round_transform_entry(
         base_dir,
@@ -438,11 +447,89 @@ def test_transform_manifest_public_io_preserves_legacy_shape_and_eager_lazy_flow
     assert lazy_round_two["_scope"] == _full_fov_scope()
     assert lazy_round_two["_semantics"] == _settled_semantics()
     assert lazy_round_two["user_metadata"] == {"round_label": "round-2"}
+    default_flow_3d = default_round_two["flow_3d"]
+    eager_flow_3d = eager_round_two["flow_3d"]
+    materialized_flow_3d = cast(object, materialized["flow_3d"])
+    assert isinstance(default_flow_3d, np.memmap)
+    assert default_flow_3d.mode == "r"
+    assert default_flow_3d.flags.writeable is False
+    assert isinstance(eager_flow_3d, np.memmap)
+    assert eager_flow_3d.mode == "r"
+    assert eager_flow_3d.flags.writeable is False
+    assert isinstance(materialized_flow_3d, np.memmap)
+    assert materialized_flow_3d.mode == "r"
+    assert materialized_flow_3d.flags.writeable is False
+    np.testing.assert_array_equal(cast(FloatArray, default_round_two["flow_3d"]), flow_3d)
     np.testing.assert_array_equal(cast(FloatArray, eager_round_two["flow_3d"]), flow_3d)
     np.testing.assert_array_equal(cast(FloatArray, materialized["flow_3d"]), flow_3d)
     assert materialized["round_note"] == "keep-round-2"
     assert eager_loaded["_contract"] == provenance["release_contract"]
     assert _provenance_payload(cast(ManifestPayload, eager_loaded))["release_contract"] == provenance["release_contract"]
+
+
+def test_registration_engine_register_fov_returns_lazy_sidecar_descriptor_after_save(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flow_3d = np.arange(3 * 2 * 4 * 4, dtype=np.float32).reshape(3, 2, 4, 4)
+    cfg = _build_minimal_config(output_dir=tmp_path)
+    setattr(cast(Any, cfg), "dataset", SimpleNamespace(round_structure={1: [0], 2: [0]}, channel_roles={0: "seq"}))
+    setattr(cast(Any, cfg.pipeline), "qc_images_enabled", lambda: False)
+    engine = RegistrationEngine(cfg)
+    clean_volumes = {
+        1: np.zeros((2, 4, 4), dtype=np.float32),
+        2: np.ones((2, 4, 4), dtype=np.float32),
+    }
+
+    def fake_load_combined_clean_volume(fov_id: int, round_id: int) -> FloatArray:
+        assert fov_id == FOV_ID
+        return clean_volumes[int(round_id)].copy()
+
+    def fake_register_round(**kwargs: object) -> tuple[dict[str, object], FloatArray, None]:
+        round_id = int(cast(int, kwargs["round_id"]))
+        return (
+            _build_round_transform(round_id, flow_3d=flow_3d.copy(), is_reference_round=False),
+            np.zeros((4, 4), dtype=np.float32),
+            None,
+        )
+
+    def fake_build_provenance(
+        transforms: dict[object, object],
+        round_summary: dict[int, dict[str, str]],
+        started_at: str,
+        ended_at: str,
+        backend_round_metadata: object = None,
+        registration_backend_details: object = None,
+    ) -> dict[str, object]:
+        del round_summary, started_at, ended_at, backend_round_metadata, registration_backend_details
+        return _build_valid_provenance(tmp_path, cast(ManifestPayload, transforms))
+
+    monkeypatch.setattr(engine, "_load_combined_clean_volume", fake_load_combined_clean_volume)
+    monkeypatch.setattr(engine, "_register_round", fake_register_round)
+    monkeypatch.setattr(engine, "_build_provenance", fake_build_provenance)
+
+    data = xr.DataArray(np.zeros((2,), dtype=np.float32), coords={"round": [1, 2]}, dims=("round",))
+
+    returned_manifest = cast(ManifestPayload, engine.register_fov(data, FOV_ID))
+    returned_round_two = _round_entry(returned_manifest, 2)
+    returned_flow_3d = returned_round_two["flow_3d"]
+
+    assert isinstance(returned_flow_3d, dict)
+    assert _descriptor(returned_round_two) == {
+        "storage": "round_level_sidecar_npy",
+        "path": get_flow_3d_sidecar_filename(FOV_ID, 2),
+        "shape": [3, 2, 4, 4],
+        "dtype": "float32",
+    }
+    assert not isinstance(returned_flow_3d, np.memmap)
+
+    default_loaded = cast(ManifestPayload, load_transform_manifest(tmp_path, FOV_ID))
+    default_round_two = _round_entry(default_loaded, 2)
+    default_flow_3d = default_round_two["flow_3d"]
+    assert isinstance(default_flow_3d, np.memmap)
+    assert default_flow_3d.mode == "r"
+    assert default_flow_3d.flags.writeable is False
+    np.testing.assert_array_equal(cast(FloatArray, default_flow_3d), flow_3d)
 
 
 def test_transform_manifest_hides_provenance_metadata_by_default(tmp_path: Path) -> None:
@@ -472,6 +559,9 @@ def test_transform_manifest_materialization_and_eager_load_fail_loudly_when_side
     lazy_round_two = _round_entry(cast(ManifestPayload, lazy_loaded), 2)
     sidecar_path = get_fov_output_structure(base_dir, FOV_ID)["transforms"] / get_flow_3d_sidecar_filename(FOV_ID, 2)
     sidecar_path.unlink()
+
+    with pytest.raises(FileNotFoundError, match="flow_3d sidecar referenced by transform manifest is missing"):
+        _ = load_transform_manifest(base_dir, FOV_ID, hydrate_flow_3d=False)
 
     with pytest.raises(FileNotFoundError, match="flow_3d sidecar referenced by transform manifest is missing"):
         _ = materialize_round_transform_entry(base_dir, FOV_ID, 2, lazy_round_two, hydrate_flow_3d=True)

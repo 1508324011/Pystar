@@ -182,6 +182,8 @@ def test_decoder_matrix_loader_accepts_matching_spot_row_lineage(tmp_path: Path)
         spots_path=spots_path,
     )
 
+    assert isinstance(loaded, np.memmap)
+    assert loaded.mode == "r"
     np.testing.assert_array_equal(loaded, matrix)
 
 
@@ -244,6 +246,8 @@ def test_decoder_matrix_loader_uses_explicit_legacy_compatibility_when_lineage_a
         spots_path=spots_path,
     )
 
+    assert isinstance(loaded, np.memmap)
+    assert loaded.mode == "r"
     np.testing.assert_array_equal(loaded, matrix)
 
 

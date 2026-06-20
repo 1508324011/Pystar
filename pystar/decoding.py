@@ -239,7 +239,7 @@ class Decoder:
     ) -> NDArrayAny:
         expected = matrix_spec.expected_description()
         try:
-            raw_matrix = np.load(matrix_path, allow_pickle=False)
+            raw_matrix = np.load(matrix_path, allow_pickle=False, mmap_mode="r")
         except Exception as exc:
             raise wrap_array_read_error(
                 exc,

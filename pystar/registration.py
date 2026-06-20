@@ -27,9 +27,13 @@ from .matlab_engine_bootstrap import MatlabSharedSessionOwner
 from .matlab_registration import MATLABGlobalRegistrationBackend
 from ._registration_performance import (
     RegistrationPerformanceRecorder,
+    array_diagnostics_descriptor,
+    array_shape_diagnostics_descriptor,
     build_registration_provider_summary,
     diagnostics_timer_start,
     elapsed_ms_since,
+    memory_delta_diagnostics,
+    sample_process_memory,
 )
 from ._registration_tile_executor import (
     ExecutorCallable,
@@ -86,6 +90,61 @@ class _LocalRegistrationOutcome:
     backend_metadata: Optional[Dict[str, Any]]
 
 
+@dataclass(slots=True)
+class _NativeDemonsProfile:
+    enabled: bool
+    phase_timings_ms: Dict[str, float]
+    memory_telemetry: list[Dict[str, Any]]
+
+    def record_phase(
+        self,
+        phase_id: str,
+        elapsed_wall_ms: float,
+        before: Mapping[str, Any],
+        after: Mapping[str, Any],
+        **details: Any,
+    ) -> None:
+        self.phase_timings_ms[phase_id] = round(float(elapsed_wall_ms), 3)
+        self.memory_telemetry.append(
+            memory_delta_diagnostics(
+                phase_id,
+                before,
+                after,
+                details={key: value for key, value in details.items() if value is not None},
+            )
+        )
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_name": "pystar_pre_peak_native_provider_profile",
+            "schema_version": 1,
+            "enabled": bool(self.enabled),
+            "negative_evidence": {
+                "stage46": {
+                    "summary": "direct-to-sidecar/tiled-flow preserved outputs but regressed wall time and did not reduce peak RSS enough",
+                    "wall_time_seconds": 13931,
+                    "baseline_stage45_wall_time_seconds": 3888,
+                },
+                "stage47": {
+                    "summary": "lifecycle-shortening preserved outputs but failed peak RSS and wall-time gates",
+                    "max_rss_kb": 30753044,
+                    "baseline_stage45_max_rss_kb": 28956484,
+                    "wall_time_seconds": 3943,
+                    "baseline_stage45_wall_time_seconds": 3888,
+                },
+            },
+            "hypothesis": "pre-peak full-volume native provider ownership overlap dominates peak RSS before sidecar spill or manifest cleanup",
+            "phase_timings_ms": dict(self.phase_timings_ms),
+            "memory_telemetry": [dict(record) for record in self.memory_telemetry],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundedWarpMIPResult:
+    mip: FloatArray
+    diagnostics: Dict[str, Any]
+
+
 @dataclass(frozen=True, slots=True)
 class _RoundRegistrationStrategy:
     global_provider: str
@@ -116,6 +175,50 @@ _LOCAL_PROVIDER_DEFAULT_MODES: Dict[str, str] = {
     'native': 'native_local_registration',
     'matlab': 'experimental_local_kernel_swap',
 }
+
+
+_FINAL_QC_WARP_Z_SLAB_DEPTH = 4
+
+
+def _mean_abs_displacement_bounded(
+    flow_3d: FloatArray,
+    *,
+    z_slab_depth: int = _FINAL_QC_WARP_Z_SLAB_DEPTH,
+) -> float:
+    flow = np.asarray(flow_3d)
+    if flow.ndim != 4 or flow.shape[0] != 3:
+        return float(np.abs(flow).mean())
+    if flow.size == 0:
+        return float("nan")
+    if isinstance(z_slab_depth, bool) or not isinstance(z_slab_depth, (int, np.integer)):
+        raise ValueError(f"mean displacement z_slab_depth must be a positive integer, got {z_slab_depth!r}")
+    slab_depth = int(z_slab_depth)
+    if slab_depth <= 0:
+        raise ValueError(f"mean displacement z_slab_depth must be positive, got {slab_depth}")
+
+    total = 0.0
+    z_dim = int(flow.shape[1])
+    for z_start in range(0, z_dim, slab_depth):
+        z_stop = min(z_start + slab_depth, z_dim)
+        total += float(np.abs(flow[:, z_start:z_stop, :, :]).sum(dtype=np.float64))
+    return total / float(flow.size)
+
+
+def _materialize_sitk_displacement_field_zyx(displacement_field_sitk: sitk.Image) -> FloatArray:
+    """Materialize a SimpleITK 3D displacement field as ``(dz, dy, dx)`` while preserving dtype."""
+
+    field_view = sitk.GetArrayViewFromImage(displacement_field_sitk)
+    if field_view.ndim != 4 or field_view.shape[-1] != 3:
+        raise ValueError(
+            "SimpleITK displacement field must have shape (Z, Y, X, 3), "
+            f"got {field_view.shape}"
+        )
+
+    flow_3d = np.empty((3, *field_view.shape[:3]), dtype=field_view.dtype)
+    flow_3d[0] = field_view[..., 2]
+    flow_3d[1] = field_view[..., 1]
+    flow_3d[2] = field_view[..., 0]
+    return cast(FloatArray, flow_3d)
 
 
 def _ensure_supported_matlab_local_method(local_method: str) -> None:
@@ -500,7 +603,9 @@ def register_local_bspline(
 def register_local_demons_3d(
     ref_3d: FloatArray,
     mov_3d: FloatArray,
-    config_obj: Any
+    config_obj: Any,
+    *,
+    profile_sink: Optional[list[Dict[str, Any]]] = None,
 ) -> Optional[FloatArray]:
     """
     3D Demons 非刚性配准
@@ -509,10 +614,24 @@ def register_local_demons_3d(
     -------
     displacement_field : np.ndarray (3, Z, Y, X) -> [dz, dy, dx]
     """
+
+    pyramid_levels = _validate_native_demons_pyramid_levels(config_obj)
+    profile = _new_native_demons_profile(config_obj)
     
     # 1. 转换为 SimpleITK 格式
+    conversion_started = diagnostics_timer_start()
+    conversion_memory_before = sample_process_memory() if profile is not None else None
     fixed_sitk = sitk.GetImageFromArray(ref_3d.astype(np.float32))
     moving_sitk = sitk.GetImageFromArray(mov_3d.astype(np.float32))
+    conversion_memory_after = sample_process_memory() if conversion_memory_before is not None else None
+    if profile is not None and conversion_memory_before is not None and conversion_memory_after is not None:
+        profile.record_phase(
+            "simpleitk_input_conversion",
+            elapsed_ms_since(conversion_started),
+            conversion_memory_before,
+            conversion_memory_after,
+            **_native_demons_array_details(ref_3d, mov_3d),
+        )
     
     # 2. 设置物理空间（保持一致）
     fixed_sitk.SetSpacing([1.0, 1.0, 1.0])
@@ -524,40 +643,129 @@ def register_local_demons_3d(
     # 参数对应 MATLAB 的设置
     demons.SetNumberOfIterations(getattr(config_obj, 'num_iter', 50))
     demons.SetStandardDeviations(getattr(config_obj, 'smoothing_sigma', 1.0))
-    
-    # 4. 多分辨率策略（对应 MATLAB 的 PyramidLevels）
-    # MATLAB: pyd_level = floor(log2(obj.dimZ))
-    pyd_level = int(np.floor(np.log2(ref_3d.shape[0])))
-    if pyd_level == 0:
-        pyd_level = 1
-    
-    # 使用 MultiResolution 包装器
-    registration_method = sitk.ImageRegistrationMethod()
-    registration_method.SetShrinkFactorsPerLevel([2**i for i in range(pyd_level, 0, -1)])
-    registration_method.SetSmoothingSigmasPerLevel([2.0*i for i in range(pyd_level, 0, -1)])
+
+    pyramid_status = (
+        "pyramid_levels=1 (single native level; no SimpleITK pyramid)"
+        if pyramid_levels == 1
+        else "pyramid_levels unset (native SimpleITK DemonsRegistrationFilter has no pyramid)"
+    )
     
     try:
-        # 5. 执行配准
-        print(f"  [Demons 3D] Starting registration (pyramid levels: {pyd_level})...")
+        # 4. 执行配准。Do not configure ImageRegistrationMethod pyramid here:
+        # those settings do not affect this direct DemonsRegistrationFilter.Execute call.
+        print(f"  [Demons 3D] Starting registration ({pyramid_status})...")
+        execute_started = diagnostics_timer_start()
+        execute_memory_before = sample_process_memory() if profile is not None else None
         displacement_field_sitk = demons.Execute(fixed_sitk, moving_sitk)
+        execute_memory_after = sample_process_memory() if execute_memory_before is not None else None
+        if profile is not None and execute_memory_before is not None and execute_memory_after is not None:
+            profile.record_phase(
+                "simpleitk_demons_execute",
+                elapsed_ms_since(execute_started),
+                execute_memory_before,
+                execute_memory_after,
+                pyramid_status=pyramid_status,
+                iterations=int(getattr(config_obj, 'num_iter', 50)),
+                smoothing_sigma=float(getattr(config_obj, 'smoothing_sigma', 1.0)),
+            )
         
         # 6. 转换为 numpy 格式
-        # SimpleITK 返回的是 (Z, Y, X, 3) 的向量场
-        field_np = sitk.GetArrayFromImage(displacement_field_sitk)
+        # SimpleITK 返回的是 (Z, Y, X, 3) 的向量场；PyStar 保存为 (3, Z, Y, X) [dz, dy, dx]
+        materialize_started = diagnostics_timer_start()
+        materialize_memory_before = sample_process_memory() if profile is not None else None
+        flow_3d = _materialize_sitk_displacement_field_zyx(displacement_field_sitk)
+        materialize_memory_after = sample_process_memory() if materialize_memory_before is not None else None
+        if profile is not None and materialize_memory_before is not None and materialize_memory_after is not None:
+            profile.record_phase(
+                "sitk_displacement_field_to_numpy_flow_3d",
+                elapsed_ms_since(materialize_started),
+                materialize_memory_before,
+                materialize_memory_after,
+                flow_3d=array_diagnostics_descriptor(flow_3d, role="materialized_numpy_flow_3d"),
+            )
+        if profile is not None and profile_sink is not None:
+            profile_sink.append(profile.as_dict())
         
-        # 重新排列为 (3, Z, Y, X)
-        dz = field_np[..., 2]  # SimpleITK 的 Z 分量
-        dy = field_np[..., 1]  # Y 分量
-        dx = field_np[..., 0]  # X 分量
-        
-        flow_3d = np.stack([dz, dy, dx], axis=0)
-        
-        print(f"  [Demons 3D] Finished. Mean displacement: {np.abs(flow_3d).mean():.2f} px")
+        mean_abs_displacement = _mean_abs_displacement_bounded(flow_3d)
+        print(f"  [Demons 3D] Finished. Mean displacement: {mean_abs_displacement:.2f} px")
         return flow_3d
         
     except Exception as e:
         warnings.warn(f"Demons 3D registration failed: {e}")
         return None
+
+
+def _validate_native_demons_pyramid_levels(config_obj: Any) -> Optional[int]:
+    """Validate native SimpleITK demons pyramid semantics.
+
+    PyStar's native 3D demons implementation calls ``DemonsRegistrationFilter``
+    directly.  SimpleITK ``ImageRegistrationMethod`` multi-resolution settings
+    are not consumed by that direct filter call, so accepting a multi-level
+    native ``pyramid_levels`` value would be a placebo knob.  MATLAB provider
+    plan construction remains separate and still forwards ``pyramid_levels``.
+    """
+
+    raw_levels = getattr(config_obj, 'pyramid_levels', None)
+    if raw_levels is None:
+        return None
+    if isinstance(raw_levels, bool):
+        raise ValueError(
+            "registration.local.params.demons_3d.pyramid_levels must be a positive integer "
+            "when provided; booleans are not valid pyramid levels"
+        )
+    if not isinstance(raw_levels, (int, np.integer)):
+        raise ValueError(
+            "registration.local.params.demons_3d.pyramid_levels must be a positive integer "
+            f"when provided, got {raw_levels!r}"
+        )
+    levels = int(raw_levels)
+    if levels <= 0:
+        raise ValueError(
+            "registration.local.params.demons_3d.pyramid_levels must be positive when provided"
+        )
+    if levels > 1:
+        raise ValueError(
+            "registration.local.params.demons_3d.pyramid_levels is not supported for native "
+            "demons_3d when greater than 1: PyStar's native path calls SimpleITK "
+            "DemonsRegistrationFilter.Execute(...) directly, and ImageRegistrationMethod "
+            "pyramid settings do not affect that filter. Set pyramid_levels to None/1 "
+            "for native demons_3d, or use registration.local.provider='matlab' for "
+            "MATLAB PyramidLevels semantics."
+        )
+    return levels
+
+
+def _truthy_runtime_flag(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _pre_peak_native_provider_profile_enabled(config_obj: Any) -> bool:
+    config_flag = any(
+        _truthy_runtime_flag(getattr(config_obj, attr, False))
+        for attr in (
+            "profile_pre_peak_native_provider",
+            "pre_peak_native_provider_profile",
+            "enable_pre_peak_native_provider_profiling",
+        )
+    )
+    env_flag = os.environ.get("PYSTAR_PRE_PEAK_NATIVE_PROVIDER_PROFILE", "").strip().lower() in {"1", "true", "yes", "on"}
+    return bool(config_flag or env_flag)
+
+
+def _native_demons_array_details(ref_3d: FloatArray, mov_3d: FloatArray) -> Dict[str, Any]:
+    return {
+        "reference_volume": array_diagnostics_descriptor(ref_3d, role="native_demons_reference_input"),
+        "moving_shifted_volume": array_diagnostics_descriptor(mov_3d, role="native_demons_moving_shifted_input"),
+    }
+
+
+def _new_native_demons_profile(config_obj: Any) -> Optional[_NativeDemonsProfile]:
+    if not _pre_peak_native_provider_profile_enabled(config_obj):
+        return None
+    return _NativeDemonsProfile(enabled=True, phase_timings_ms={}, memory_telemetry=[])
+
 
 def apply_warp_field_2d(img_2d: FloatArray, flow: FloatArray) -> FloatArray:
     """
@@ -664,6 +872,102 @@ def apply_warp_field_3d(img_3d: FloatArray, flow_3d: FloatArray) -> FloatArray:
     )
     
     return warped.astype(img_3d.dtype)
+
+
+def _compute_warped_mip_3d_bounded(
+    img_3d: FloatArray,
+    flow_3d: FloatArray,
+    *,
+    z_slab_depth: int = _FINAL_QC_WARP_Z_SLAB_DEPTH,
+) -> _BoundedWarpMIPResult:
+    """Compute ``apply_warp_field_3d(...).max(axis=0)`` with bounded slabs."""
+
+    image = np.asarray(img_3d)
+    flow = np.asarray(flow_3d)
+    if image.ndim != 3:
+        raise ValueError(f"final QC bounded warp MIP expected 3D image (Z, Y, X), got shape {image.shape}")
+    if flow.ndim != 4:
+        raise ValueError(f"final QC bounded warp MIP expected flow_3d shape (3, Z, Y, X), got {flow.shape}")
+    if flow.shape[0] != 3:
+        raise ValueError(
+            "final QC bounded warp MIP expected flow_3d first dimension to contain "
+            f"(dz, dy, dx), got shape {flow.shape}"
+        )
+    if tuple(int(value) for value in flow.shape[1:]) != tuple(int(value) for value in image.shape):
+        raise ValueError(
+            "final QC bounded warp MIP flow_3d/image shape mismatch: "
+            f"flow_3d spatial shape {flow.shape[1:]}, image shape {image.shape}"
+        )
+    if not np.issubdtype(image.dtype, np.number):
+        raise ValueError(f"final QC bounded warp MIP image dtype must be numeric, got {image.dtype}")
+    if not np.issubdtype(flow.dtype, np.number):
+        raise ValueError(f"final QC bounded warp MIP flow_3d dtype must be numeric, got {flow.dtype}")
+    if isinstance(z_slab_depth, bool) or not isinstance(z_slab_depth, (int, np.integer)):
+        raise ValueError(f"final QC bounded warp MIP z_slab_depth must be a positive integer, got {z_slab_depth!r}")
+    slab_depth = int(z_slab_depth)
+    if slab_depth <= 0:
+        raise ValueError(f"final QC bounded warp MIP z_slab_depth must be positive, got {slab_depth}")
+
+    z_dim, y_dim, x_dim = (int(value) for value in image.shape)
+    if z_dim <= 0 or y_dim <= 0 or x_dim <= 0:
+        raise ValueError(f"final QC bounded warp MIP image dimensions must be positive, got {image.shape}")
+
+    output_mip: FloatArray | None = None
+    slab_count = 0
+    max_slab_depth = min(slab_depth, z_dim)
+    for z_start in range(0, z_dim, slab_depth):
+        z_stop = min(z_start + slab_depth, z_dim)
+        z_coords, y_coords, x_coords = np.meshgrid(
+            np.arange(z_start, z_stop, dtype=np.float32),
+            np.arange(y_dim, dtype=np.float32),
+            np.arange(x_dim, dtype=np.float32),
+            indexing='ij',
+        )
+        coordinates = np.array(
+            [
+                z_coords + flow[0, z_start:z_stop, :, :],
+                y_coords + flow[1, z_start:z_stop, :, :],
+                x_coords + flow[2, z_start:z_stop, :, :],
+            ],
+            dtype=np.float32,
+        )
+        warped_slab = map_coordinates(
+            image,
+            coordinates,
+            order=1,
+            mode='constant',
+            cval=0,
+            prefilter=False,
+        )
+        slab_mip = np.asarray(warped_slab, dtype=image.dtype).max(axis=0)
+        if output_mip is None:
+            output_mip = np.array(slab_mip, dtype=image.dtype, copy=True)
+        else:
+            np.maximum(output_mip, slab_mip, out=output_mip)
+        slab_count += 1
+
+    if output_mip is None:
+        raise ValueError("final QC bounded warp MIP did not process any z slabs")
+    diagnostics: Dict[str, Any] = {
+        "helper_mode": "bounded_z_slab_mip",
+        "z_slab_depth": slab_depth,
+        "slab_count": int(slab_count),
+        "max_slab_shape_zyx": [int(max_slab_depth), int(y_dim), int(x_dim)],
+        "image": array_diagnostics_descriptor(image, role="final_qc_moving_shifted_3d"),
+        "flow_3d": array_diagnostics_descriptor(flow, role="final_qc_flow_3d"),
+        "output_mip": array_diagnostics_descriptor(output_mip, role="final_qc_warped_mip"),
+        "coordinate_working_set": array_shape_diagnostics_descriptor(
+            (3, max_slab_depth, y_dim, x_dim),
+            dtype=np.float32,
+            role="final_qc_coordinate_slab",
+        ),
+        "avoided_full_warp_volume": array_shape_diagnostics_descriptor(
+            image.shape,
+            dtype=image.dtype,
+            role="avoided_full_warp_volume",
+        ),
+    }
+    return _BoundedWarpMIPResult(mip=cast(FloatArray, output_mip), diagnostics=diagnostics)
 
 # ==============================================================================
 # SECTION D: Quality Metrics
@@ -775,6 +1079,9 @@ def _run_tiled_native_demons_registration(
     mov_volume_zyx: FloatArray,
     config_obj: Any,
     layout: TileLayout,
+    *,
+    round_id: Optional[int] = None,
+    diagnostics: Optional[RegistrationPerformanceRecorder] = None,
 ) -> Tuple[Optional[FloatArray], Dict[str, Any]]:
     print(
         "     [Tiling] Native demons_3d on "
@@ -784,34 +1091,79 @@ def _run_tiled_native_demons_registration(
     tile_outputs: list[tuple[TileSpec, FloatArray]] = []
     tile_summaries: list[Dict[str, Any]] = []
     for tile in layout.tiles:
+        tile_total_started = diagnostics_timer_start()
         tile_label = f"tile {tile.tile_index}/{layout.tile_count}"
         print(
             f"       [Tiling] {tile_label} | origin={tile.region_origin_zyx} shape={tile.region_shape_zyx}"
         )
+        tile_extract_started = diagnostics_timer_start()
         ref_tile = np.asarray(extract_tile(ref_volume_zyx, tile), dtype=np.float32)
         mov_tile = np.asarray(extract_tile(mov_volume_zyx, tile), dtype=np.float32)
+        tile_extract_ms = elapsed_ms_since(tile_extract_started)
+        native_call_started = diagnostics_timer_start()
         flow_tile = register_local_demons_3d(ref_tile, mov_tile, config_obj)
+        native_call_ms = elapsed_ms_since(native_call_started)
         if flow_tile is None:
             raise RuntimeError(
                 "Tiled native demons_3d returned no flow for "
                 f"{tile_label}; refusing to silently degrade local registration."
             )
 
-        tile_outputs.append((tile, np.asarray(flow_tile, dtype=np.float32)))
+        flow_validation_started = diagnostics_timer_start()
+        flow_tile = np.asarray(flow_tile, dtype=np.float32)
+        expected_shape = (3, *tile.region_shape_zyx)
+        if flow_tile.shape != expected_shape:
+            raise ValueError(
+                "Native tiled demons_3d returned flow_3d with incompatible tile shape: "
+                f"expected {expected_shape}, got {flow_tile.shape} for tile {tile.tile_index}"
+            )
+        mean_abs_displacement = _mean_abs_displacement_bounded(flow_tile)
+        flow_validation_ms = elapsed_ms_since(flow_validation_started)
+
+        tile_outputs.append((tile, flow_tile))
         tile_summaries.append(
             {
                 **tile.as_dict(),
                 "provider": "native",
                 "status": "completed",
-                "mean_abs_displacement": float(np.abs(flow_tile).mean()),
+                "mean_abs_displacement": mean_abs_displacement,
             }
         )
 
+        if diagnostics is not None and round_id is not None and int(round_id) >= 0:
+            flow_descriptor = array_diagnostics_descriptor(flow_tile, role="native_tiled_flow_3d")
+            diagnostics.record_tiled_local_tile(
+                int(round_id),
+                tile_identity=tile.as_dict(),
+                total_elapsed_wall_ms=elapsed_ms_since(tile_total_started),
+                extraction_elapsed_wall_ms=tile_extract_ms,
+                backend_call_elapsed_wall_ms=native_call_ms,
+                flow_validation_elapsed_wall_ms=flow_validation_ms,
+                normalized_result={
+                    "provider": "native",
+                    "method": "demons_3d",
+                    "flow_3d_shape": [int(value) for value in flow_tile.shape],
+                    "flow_3d_dtype": str(flow_tile.dtype),
+                    "flow_3d_nbytes": int(flow_tile.nbytes),
+                    "flow_3d_descriptor": flow_descriptor,
+                    "mean_abs_displacement": mean_abs_displacement,
+                },
+            )
+
+    stitch_started = diagnostics_timer_start()
     stitched = np.asarray(
         stitch_tiles(tile_outputs, full_shape_zyx=layout.full_volume_shape_zyx),
         dtype=np.float32,
     )
-    return stitched, _build_tiling_summary(layout, tile_summaries)
+    stitch_ms = elapsed_ms_since(stitch_started)
+    tiling_summary = _build_tiling_summary(layout, tile_summaries)
+    if diagnostics is not None and round_id is not None and int(round_id) >= 0:
+        diagnostics.record_tiled_local_summary(
+            int(round_id),
+            layout_summary=tiling_summary,
+            stitch_elapsed_wall_ms=stitch_ms,
+        )
+    return stitched, tiling_summary
 
 
 def _run_tiled_matlab_demons_registration(
@@ -1137,6 +1489,71 @@ def _attach_local_flow_metadata(
     metadata['local_flow'] = local_flow_metadata
     return metadata
 
+
+def _local_execution_mode_for_strategy(
+    *,
+    strategy: _RoundRegistrationStrategy,
+    tiling_enabled: Optional[bool] = None,
+    skipped: bool = False,
+) -> str:
+    if not strategy.enable_local or skipped:
+        return "skipped_local_registration"
+    if strategy.local_provider == "native" and strategy.local_method == "demons_3d":
+        if tiling_enabled is True:
+            return "tiled_native_demons_3d"
+        if tiling_enabled is False:
+            return "full_volume_native_demons_3d"
+        return "native_demons_3d"
+    if strategy.local_provider == "matlab" and strategy.local_method == "demons_3d":
+        if tiling_enabled is True:
+            return "tiled_matlab_demons_3d"
+        if tiling_enabled is False:
+            return "full_volume_matlab_demons_3d"
+        return "matlab_demons_3d"
+    if strategy.local_provider == "native" and strategy.local_method == "optical_flow":
+        return "native_optical_flow"
+    if strategy.local_provider == "native" and strategy.local_method == "bspline":
+        return "native_bspline"
+    return f"{strategy.local_provider}_{strategy.local_method}"
+
+
+def _build_scope_diagnostics(scope_descriptor: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "coverage_mode": scope_descriptor.get("coverage_mode"),
+        "region_origin_zyx": list(scope_descriptor.get("region_origin_zyx", [])),
+        "region_shape_zyx": list(scope_descriptor.get("region_shape_zyx", [])),
+        "full_volume_shape_zyx": list(scope_descriptor.get("full_volume_shape_zyx", [])),
+        **(
+            {"tile_grid_shape_yx": list(scope_descriptor["tile_grid_shape_yx"])}
+            if "tile_grid_shape_yx" in scope_descriptor
+            else {}
+        ),
+        **({"tile_index": int(scope_descriptor["tile_index"])} if "tile_index" in scope_descriptor else {}),
+    }
+
+
+def _expected_local_flow_descriptor(
+    *,
+    strategy: _RoundRegistrationStrategy,
+    volume_shape_zyx: Sequence[int],
+    mip_shape_yx: Sequence[int],
+) -> Dict[str, Any] | None:
+    if not strategy.enable_local:
+        return None
+    if strategy.local_method == "demons_3d":
+        return array_shape_diagnostics_descriptor(
+            (3, *tuple(int(value) for value in volume_shape_zyx)),
+            dtype=np.float32,
+            role="expected_flow_3d",
+        )
+    if strategy.local_method in {"optical_flow", "bspline"}:
+        return array_shape_diagnostics_descriptor(
+            (2, *tuple(int(value) for value in mip_shape_yx)),
+            dtype=np.float32,
+            role=f"expected_{strategy.local_method}_flow_2d",
+        )
+    return None
+
 # ==============================================================================
 # SECTION E: Registration Engine (Orchestration)
 # ==============================================================================
@@ -1339,24 +1756,45 @@ class RegistrationEngine:
                     elapsed_wall_ms=0.0,
                     descriptor=None,
                     sidecar_path=None,
+                    in_memory_flow=None,
                 )
             return
 
         base_dir = Path(self.cfg.pipeline.output.directory)
+        diagnostics = self._registration_diagnostics
+        persist_memory_before = sample_process_memory() if diagnostics is not None else None
         persist_started = diagnostics_timer_start()
         descriptor = persist_flow_3d_sidecar(base_dir, fov_id, int(round_id), np.asarray(flow_3d))
         elapsed_ms = elapsed_ms_since(persist_started)
+        persist_memory_after = sample_process_memory() if persist_memory_before is not None else None
         round_transform['flow_3d'] = descriptor
-        if self._registration_diagnostics is not None:
+        if diagnostics is not None:
             paths = get_fov_output_structure(base_dir, fov_id)
             descriptor_path = descriptor.get("path") if isinstance(descriptor, dict) else None
             sidecar_path = paths["transforms"] / str(descriptor_path) if isinstance(descriptor_path, str) else None
-            self._registration_diagnostics.record_flow_sidecar_persistence(
+            diagnostics.record_flow_sidecar_persistence(
                 round_id,
                 elapsed_wall_ms=elapsed_ms,
                 descriptor=descriptor,
                 sidecar_path=sidecar_path,
+                in_memory_flow=flow_3d,
             )
+            if persist_memory_before is not None and persist_memory_after is not None:
+                diagnostics.record_memory_telemetry(
+                    round_id,
+                    memory_delta_diagnostics(
+                        "flow_sidecar_persistence",
+                        persist_memory_before,
+                        persist_memory_after,
+                        details={
+                            "flow_3d": array_diagnostics_descriptor(
+                                flow_3d,
+                                role="flow_3d_in_memory_before_sidecar",
+                            ),
+                            "sidecar_path": None if sidecar_path is None else str(sidecar_path),
+                        },
+                    ),
+                )
 
     def _annotate_transform_semantics(self, transforms: Dict[int, Dict[str, Any]]) -> None:
         """Attach declared field-composition metadata to every round transform."""
@@ -1566,6 +2004,7 @@ class RegistrationEngine:
     ) -> Tuple[FloatArray, float, Optional[Dict[str, Any]]]:
         handler = cast(Any, getattr(self, handler_name))
         global_started = diagnostics_timer_start()
+        memory_before = sample_process_memory() if self._registration_diagnostics is not None and round_id >= 0 else None
         result = handler(
             fov_id=fov_id,
             round_id=round_id,
@@ -1574,9 +2013,20 @@ class RegistrationEngine:
             mov_scope_3d=mov_scope_3d,
             scope_descriptor=scope_descriptor,
         )
+        memory_after = sample_process_memory() if memory_before is not None else None
         elapsed_ms = elapsed_ms_since(global_started)
         global_shift_3d, global_corr, backend_metadata = result
         if self._registration_diagnostics is not None and round_id >= 0:
+            if memory_before is not None and memory_after is not None:
+                self._registration_diagnostics.record_memory_telemetry(
+                    round_id,
+                    memory_delta_diagnostics(
+                        "global_registration",
+                        memory_before,
+                        memory_after,
+                        details={"provider": provider, "method": method, "handler_name": handler_name},
+                    ),
+                )
             self._registration_diagnostics.record_global_registration(
                 round_id,
                 elapsed_wall_ms=elapsed_ms,
@@ -1681,14 +2131,47 @@ class RegistrationEngine:
         return handler(context)
 
     def _run_local_native_demons_3d(self, context: _LocalRegistrationContext) -> _LocalRegistrationOutcome:
+        rigid_memory_before = (
+            sample_process_memory()
+            if self._registration_diagnostics is not None and context.round_id >= 0
+            else None
+        )
         rigid_started = diagnostics_timer_start()
         mov_shifted_3d = apply_rigid_shift_3d(context.mov_scope_3d, context.global_shift_3d)
+        rigid_elapsed_ms = elapsed_ms_since(rigid_started)
+        rigid_memory_after = sample_process_memory() if rigid_memory_before is not None else None
         if self._registration_diagnostics is not None and context.round_id >= 0:
             self._registration_diagnostics.record_local_internal_phase(
                 context.round_id,
                 "local_rigid_shift_preparation",
-                elapsed_ms_since(rigid_started),
+                rigid_elapsed_ms,
             )
+            if rigid_memory_before is not None and rigid_memory_after is not None:
+                self._registration_diagnostics.record_memory_telemetry(
+                    context.round_id,
+                    memory_delta_diagnostics(
+                        "local_rigid_shift_preparation",
+                        rigid_memory_before,
+                        rigid_memory_after,
+                        details={
+                            "moving_volume": array_diagnostics_descriptor(
+                                context.mov_scope_3d,
+                                role="moving_scope_3d",
+                            ),
+                            "moving_shifted_volume": array_diagnostics_descriptor(
+                                mov_shifted_3d,
+                                role="moving_shifted_scope_3d",
+                            ),
+                            "global_shift_3d": [
+                                float(value)
+                                for value in np.asarray(
+                                    context.global_shift_3d,
+                                    dtype=np.float32,
+                                ).reshape(-1)
+                            ],
+                        },
+                    ),
+                )
         tiling_started = diagnostics_timer_start()
         tiling_layout = _resolve_demons_tiling_layout(
             cast(Tuple[int, int, int], tuple(int(value) for value in mov_shifted_3d.shape)),
@@ -1699,29 +2182,114 @@ class RegistrationEngine:
                 context.round_id,
                 "local_tiling_layout_resolution",
                 elapsed_ms_since(tiling_started),
-                details={"tiling_enabled": tiling_layout is not None},
+                details={
+                    "tiling_enabled": tiling_layout is not None,
+                    "layout_summary": None
+                    if tiling_layout is None
+                    else {
+                        "grid_shape_yx": [int(value) for value in tiling_layout.grid_shape_yx],
+                        "overlap_yx": [int(value) for value in tiling_layout.overlap_yx],
+                        "grid_source": tiling_layout.grid_source,
+                        "tile_count": int(tiling_layout.tile_count),
+                    },
+                },
+            )
+            self._registration_diagnostics.update_registration_work_plan(
+                context.round_id,
+                {
+                    "local_execution_mode": "full_volume_native_demons_3d"
+                    if tiling_layout is None
+                    else "tiled_native_demons_3d",
+                    "selection_reason": "registration.local.params.demons_3d.use_tiling=false"
+                    if tiling_layout is None
+                    else "registration.local.params.demons_3d.use_tiling=true",
+                    "moving_shifted_volume": array_diagnostics_descriptor(
+                        mov_shifted_3d,
+                        role="moving_shifted_scope_3d",
+                    ),
+                    "tiling_enabled": tiling_layout is not None,
+                    "tiling_layout": None
+                    if tiling_layout is None
+                    else {
+                        "grid_shape_yx": [int(value) for value in tiling_layout.grid_shape_yx],
+                        "overlap_yx": [int(value) for value in tiling_layout.overlap_yx],
+                        "grid_source": tiling_layout.grid_source,
+                        "tile_count": int(tiling_layout.tile_count),
+                    },
+                },
             )
         tiling_summary: Optional[Dict[str, Any]] = None
         native_demons_started = diagnostics_timer_start()
+        native_memory_before = (
+            sample_process_memory()
+            if self._registration_diagnostics is not None and context.round_id >= 0
+            else None
+        )
         if tiling_layout is None:
-            flow_3d = register_local_demons_3d(
-                context.ref_scope_3d,
-                mov_shifted_3d,
-                self.cfg.pipeline.registration.demons_3d,
+            native_pre_peak_profiles: Optional[list[Dict[str, Any]]] = (
+                [] if _pre_peak_native_provider_profile_enabled(self.cfg.pipeline.registration.demons_3d) else None
             )
+            if native_pre_peak_profiles is None:
+                flow_3d = register_local_demons_3d(
+                    context.ref_scope_3d,
+                    mov_shifted_3d,
+                    self.cfg.pipeline.registration.demons_3d,
+                )
+            else:
+                flow_3d = register_local_demons_3d(
+                    context.ref_scope_3d,
+                    mov_shifted_3d,
+                    self.cfg.pipeline.registration.demons_3d,
+                    profile_sink=native_pre_peak_profiles,
+                )
+            native_pre_peak_profile = native_pre_peak_profiles[0] if native_pre_peak_profiles else None
         else:
             flow_3d, tiling_summary = _run_tiled_native_demons_registration(
                 context.ref_scope_3d,
                 mov_shifted_3d,
                 self.cfg.pipeline.registration.demons_3d,
                 tiling_layout,
+                round_id=int(context.round_id),
+                diagnostics=self._registration_diagnostics,
             )
+            native_pre_peak_profile = None
+        native_memory_after = sample_process_memory() if native_memory_before is not None else None
         if self._registration_diagnostics is not None and context.round_id >= 0:
+            if native_memory_before is not None and native_memory_after is not None:
+                self._registration_diagnostics.record_memory_telemetry(
+                    context.round_id,
+                    memory_delta_diagnostics(
+                        "native_demons_registration_compute",
+                        native_memory_before,
+                        native_memory_after,
+                        details={
+                            "local_execution_mode": "full_volume_native_demons_3d"
+                            if tiling_layout is None
+                            else "tiled_native_demons_3d",
+                        },
+                    ),
+                )
             self._registration_diagnostics.record_local_internal_phase(
                 context.round_id,
                 "native_demons_registration_compute",
                 elapsed_ms_since(native_demons_started),
+                details={
+                    "local_execution_mode": "full_volume_native_demons_3d"
+                    if tiling_layout is None
+                    else "tiled_native_demons_3d",
+                    "expected_flow_3d": array_shape_diagnostics_descriptor(
+                        (3, *tuple(int(value) for value in mov_shifted_3d.shape)),
+                        dtype=np.float32,
+                        role="expected_flow_3d",
+                    ),
+                    "produced_flow_3d": array_diagnostics_descriptor(flow_3d, role="produced_flow_3d"),
+                },
             )
+            if isinstance(native_pre_peak_profile, Mapping):
+                self._registration_diagnostics.record_pre_peak_native_provider_profile(
+                    context.round_id,
+                    native_pre_peak_profile,
+                )
 
         if flow_3d is None:
             backend_metadata = _attach_local_flow_metadata(
@@ -1744,13 +2312,31 @@ class RegistrationEngine:
             )
 
         final_qc_started = diagnostics_timer_start()
-        final_img_qc_clean = apply_warp_field_3d(mov_shifted_3d, flow_3d).max(axis=0)
+        final_qc_memory_before = (
+            sample_process_memory()
+            if self._registration_diagnostics is not None and context.round_id >= 0
+            else None
+        )
+        bounded_qc = _compute_warped_mip_3d_bounded(mov_shifted_3d, flow_3d)
+        final_img_qc_clean = bounded_qc.mip
+        final_qc_memory_after = sample_process_memory() if final_qc_memory_before is not None else None
         rec_corr = simple_correlation(context.ref_mip_clean, final_img_qc_clean)
         if self._registration_diagnostics is not None and context.round_id >= 0:
+            if final_qc_memory_before is not None and final_qc_memory_after is not None:
+                self._registration_diagnostics.record_memory_telemetry(
+                    context.round_id,
+                    memory_delta_diagnostics(
+                        "final_qc_bounded_warp_mip",
+                        final_qc_memory_before,
+                        final_qc_memory_after,
+                        details=bounded_qc.diagnostics,
+                    ),
+                )
             self._registration_diagnostics.record_final_qc(
                 context.round_id,
                 elapsed_wall_ms=elapsed_ms_since(final_qc_started),
                 final_corr=float(rec_corr),
+                details=bounded_qc.diagnostics,
             )
         status = 'accepted'
         if rec_corr < context.corr_after_global:
@@ -1954,6 +2540,30 @@ class RegistrationEngine:
                 elapsed_ms_since(tiling_started),
                 details={"tiling_enabled": tiling_layout is not None},
             )
+            self._registration_diagnostics.update_registration_work_plan(
+                context.round_id,
+                {
+                    "local_execution_mode": "full_volume_matlab_demons_3d"
+                    if tiling_layout is None
+                    else "tiled_matlab_demons_3d",
+                    "selection_reason": "registration.local.params.demons_3d.use_tiling=false"
+                    if tiling_layout is None
+                    else "registration.local.params.demons_3d.use_tiling=true",
+                    "moving_shifted_volume": array_diagnostics_descriptor(
+                        mov_shifted_3d,
+                        role="moving_shifted_scope_3d",
+                    ),
+                    "tiling_enabled": tiling_layout is not None,
+                    "tiling_layout": None
+                    if tiling_layout is None
+                    else {
+                        "grid_shape_yx": [int(value) for value in tiling_layout.grid_shape_yx],
+                        "overlap_yx": [int(value) for value in tiling_layout.overlap_yx],
+                        "grid_source": tiling_layout.grid_source,
+                        "tile_count": int(tiling_layout.tile_count),
+                    },
+                },
+            )
         tiling_summary: Optional[Dict[str, Any]] = None
         local_result: Optional[Dict[str, Any]] = None
         local_backend_details: Dict[str, Any]
@@ -2030,13 +2640,31 @@ class RegistrationEngine:
             )
 
         final_qc_started = diagnostics_timer_start()
-        final_img_qc_clean = apply_warp_field_3d(mov_shifted_3d, flow_3d).max(axis=0)
+        final_qc_memory_before = (
+            sample_process_memory()
+            if self._registration_diagnostics is not None and context.round_id >= 0
+            else None
+        )
+        bounded_qc = _compute_warped_mip_3d_bounded(mov_shifted_3d, flow_3d)
+        final_img_qc_clean = bounded_qc.mip
+        final_qc_memory_after = sample_process_memory() if final_qc_memory_before is not None else None
         rec_corr = simple_correlation(context.ref_mip_clean, final_img_qc_clean)
         if self._registration_diagnostics is not None and context.round_id >= 0:
+            if final_qc_memory_before is not None and final_qc_memory_after is not None:
+                self._registration_diagnostics.record_memory_telemetry(
+                    context.round_id,
+                    memory_delta_diagnostics(
+                        "final_qc_bounded_warp_mip",
+                        final_qc_memory_before,
+                        final_qc_memory_after,
+                        details=bounded_qc.diagnostics,
+                    ),
+                )
             self._registration_diagnostics.record_final_qc(
                 context.round_id,
                 elapsed_wall_ms=elapsed_ms_since(final_qc_started),
                 final_corr=float(rec_corr),
+                details=bounded_qc.diagnostics,
             )
         local_backend_metadata = (
             dict(cast(Dict[str, Any], local_result['backend_metadata']))
@@ -2125,6 +2753,48 @@ class RegistrationEngine:
                 elapsed_wall_ms=elapsed_ms_since(post_global_started),
                 corr_after_global=float(corr_after_global),
             )
+            tiling_flag: Optional[bool] = None
+            if resolved_strategy.local_method == "demons_3d" and resolved_strategy.enable_local:
+                tiling_flag = bool(self.cfg.pipeline.registration.demons_3d.use_tiling)
+            expected_flow_descriptor = _expected_local_flow_descriptor(
+                strategy=resolved_strategy,
+                volume_shape_zyx=tuple(int(value) for value in ref_scope_3d.shape),
+                mip_shape_yx=tuple(int(value) for value in ref_mip_clean.shape),
+            )
+            self._registration_diagnostics.record_registration_work_plan(
+                round_id,
+                {
+                    "round_id": int(round_id),
+                    "reference_round": int(ref_round),
+                    "global_provider": resolved_strategy.global_provider,
+                    "global_method": getattr(getattr(self.reg_cfg, 'global_stage', None), 'method', None),
+                    "global_handler_name": resolved_strategy.global_handler_name,
+                    "local_provider": resolved_strategy.local_provider,
+                    "local_method": resolved_strategy.local_method,
+                    "local_handler_name": resolved_strategy.local_handler_name,
+                    "local_enabled": bool(resolved_strategy.enable_local),
+                    "local_skip_if_global_corr_below": float(resolved_strategy.local_skip_if_global_corr_below),
+                    "local_execution_mode": _local_execution_mode_for_strategy(
+                        strategy=resolved_strategy,
+                        tiling_enabled=tiling_flag,
+                    ),
+                    "selection_reason": "configured registration strategy before correlation guard",
+                    "scope_descriptor": _build_scope_diagnostics(scope_descriptor),
+                    "scope_coverage_mode": scope_descriptor.get("coverage_mode"),
+                    "scope_region_origin_zyx": list(scope_descriptor.get("region_origin_zyx", [])),
+                    "scope_region_shape_zyx": list(scope_descriptor.get("region_shape_zyx", [])),
+                    "reference_volume": array_diagnostics_descriptor(ref_scope_3d, role="reference_scope_3d"),
+                    "moving_volume": array_diagnostics_descriptor(mov_scope_3d, role="moving_scope_3d"),
+                    "reference_mip": array_diagnostics_descriptor(ref_mip_clean, role="reference_mip_clean"),
+                    "moving_mip": array_diagnostics_descriptor(mov_mip_clean, role="moving_mip_clean"),
+                    "moving_mip_shifted": array_diagnostics_descriptor(mov_mip_shifted, role="moving_mip_shifted"),
+                    "expected_local_flow": expected_flow_descriptor,
+                    **({"expected_flow_3d": expected_flow_descriptor} if resolved_strategy.local_method == "demons_3d" else {}),
+                    "flow_3d_persisted": False,
+                    "flow_3d_sidecar_path": None,
+                    "flow_3d_sidecar_size_bytes": None,
+                },
+            )
 
         flow_2d = None
         flow_3d = None
@@ -2164,6 +2834,14 @@ class RegistrationEngine:
                     default_mode=cast(str, resolved_strategy.local_default_mode),
                 )
                 if self._registration_diagnostics is not None and round_id >= 0:
+                    self._registration_diagnostics.update_registration_work_plan(
+                        round_id,
+                        {
+                            "local_execution_mode": "skipped_local_registration",
+                            "selection_reason": "corr_after_global below local_skip_if_global_corr_below",
+                            "skip_reason": "skipped_low_global_corr",
+                        },
+                    )
                     self._registration_diagnostics.record_local_registration(
                         round_id,
                         elapsed_wall_ms=elapsed_ms_since(local_skip_started),
@@ -2181,7 +2859,13 @@ class RegistrationEngine:
                         "Round registration strategy enabled local registration without a local handler name"
                     )
                 local_started = diagnostics_timer_start()
+                local_memory_before = (
+                    sample_process_memory()
+                    if self._registration_diagnostics is not None and round_id >= 0
+                    else None
+                )
                 local_result = self._dispatch_local_registration(context)
+                local_memory_after = sample_process_memory() if local_memory_before is not None else None
                 local_elapsed_ms = elapsed_ms_since(local_started)
                 flow_2d = local_result.flow_2d
                 flow_3d = local_result.flow_3d
@@ -2189,6 +2873,45 @@ class RegistrationEngine:
                 final_img_qc = local_result.final_img_qc
                 backend_metadata = local_result.backend_metadata
                 if self._registration_diagnostics is not None and round_id >= 0:
+                    if local_memory_before is not None and local_memory_after is not None:
+                        self._registration_diagnostics.record_memory_telemetry(
+                            round_id,
+                            memory_delta_diagnostics(
+                                "local_registration_dispatch",
+                                local_memory_before,
+                                local_memory_after,
+                                details={
+                                    "local_provider": resolved_strategy.local_provider,
+                                    "local_method": resolved_strategy.local_method,
+                                    "local_handler_name": local_handler_name,
+                                },
+                            ),
+                        )
+                    execution_mode = _local_execution_mode_for_strategy(
+                        strategy=resolved_strategy,
+                        tiling_enabled=(
+                            bool(self.cfg.pipeline.registration.demons_3d.use_tiling)
+                            if resolved_strategy.local_method == "demons_3d"
+                            else None
+                        ),
+                    )
+                    local_flow = backend_metadata.get('local_flow') if isinstance(backend_metadata, Mapping) else None
+                    if isinstance(local_flow, Mapping):
+                        tiling = local_flow.get('tiling')
+                        if isinstance(tiling, Mapping) and tiling.get('enabled') is True:
+                            execution_mode = _local_execution_mode_for_strategy(strategy=resolved_strategy, tiling_enabled=True)
+                        elif resolved_strategy.local_method == "demons_3d":
+                            execution_mode = _local_execution_mode_for_strategy(strategy=resolved_strategy, tiling_enabled=False)
+                    self._registration_diagnostics.update_registration_work_plan(
+                        round_id,
+                        {
+                            "local_execution_mode": execution_mode,
+                            "selection_reason": "local registration executed",
+                            "produced_flow_2d": array_diagnostics_descriptor(flow_2d, role="produced_flow_2d"),
+                            "produced_flow_3d": array_diagnostics_descriptor(flow_3d, role="produced_flow_3d"),
+                            "flow_3d_persisted": False,
+                        },
+                    )
                     local_status = 'completed'
                     local_flow = backend_metadata.get('local_flow') if isinstance(backend_metadata, Mapping) else None
                     if isinstance(local_flow, Mapping):
@@ -2203,6 +2926,14 @@ class RegistrationEngine:
                         backend_metadata=backend_metadata,
                     )
         elif self._registration_diagnostics is not None and round_id >= 0:
+            self._registration_diagnostics.update_registration_work_plan(
+                round_id,
+                {
+                    "local_execution_mode": "skipped_local_registration",
+                    "selection_reason": "registration.local.enabled=false",
+                    "skip_reason": "local_registration_disabled",
+                },
+            )
             self._registration_diagnostics.record_local_registration(
                 round_id,
                 elapsed_wall_ms=0.0,
@@ -2492,11 +3223,16 @@ class RegistrationEngine:
             )
 
             load_started = diagnostics_timer_start()
-            materialized_manifest = load_transform_manifest(base_dir, fov_id, load_provenance=False)
+            materialized_manifest = load_transform_manifest(
+                base_dir,
+                fov_id,
+                load_provenance=False,
+                hydrate_flow_3d=False,
+            )
             diagnostics.record_manifest_timing(
                 "load_transform_manifest",
                 elapsed_ms_since(load_started),
-                details={"load_provenance": False, "hydrate_flow_3d": True},
+                details={"load_provenance": False, "hydrate_flow_3d": False},
             )
 
             source_stage_elapsed_wall_ms = elapsed_ms_since(registration_started)

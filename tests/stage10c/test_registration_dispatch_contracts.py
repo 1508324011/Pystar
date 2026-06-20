@@ -7,7 +7,8 @@ import numpy as np
 import pytest
 from numpy.typing import NDArray
 
-from pystar.registration import RegistrationEngine, _RoundRegistrationStrategy
+from pystar.infrastructure import Demons3DConfig
+from pystar.registration import RegistrationEngine, _RoundRegistrationStrategy, register_local_demons_3d
 
 
 FloatArray = NDArray[np.float32]
@@ -119,6 +120,34 @@ def test_round_strategy_rejects_unsupported_global_provider_loudly() -> None:
 
     with pytest.raises(ValueError, match="Unsupported registration.global.provider: 'custom'"):
         _ = engine._build_round_registration_strategy(global_provider="custom")
+
+
+def test_native_demons_rejects_multi_level_pyramid_loudly_before_execution() -> None:
+    ref = np.zeros((2, 4, 4), dtype=np.float32)
+    mov = np.zeros((2, 4, 4), dtype=np.float32)
+    config = SimpleNamespace(num_iter=1, smoothing_sigma=0.0, pyramid_levels=2)
+
+    with pytest.raises(
+        ValueError,
+        match=r"pyramid_levels.*not supported for native demons_3d.*DemonsRegistrationFilter\.Execute",
+    ):
+        _ = register_local_demons_3d(ref, mov, config)
+
+
+@pytest.mark.parametrize("raw_level", [True, False, "1", "2", 1.0, 2.0])
+def test_demons3d_config_rejects_non_integer_pyramid_levels_before_coercion(raw_level: object) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"pyramid_levels must be a positive integer when provided",
+    ):
+        _ = Demons3DConfig(pyramid_levels=cast(Any, raw_level))
+
+
+@pytest.mark.parametrize("raw_level", [None, 1, 2])
+def test_demons3d_config_accepts_none_and_positive_integer_pyramid_levels(raw_level: int | None) -> None:
+    config = Demons3DConfig(pyramid_levels=raw_level)
+
+    assert config.pyramid_levels == raw_level
 
 
 def test_register_round_delegates_to_canonical_orchestrated_path_with_explicit_strategy() -> None:

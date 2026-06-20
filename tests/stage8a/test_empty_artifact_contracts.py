@@ -172,6 +172,7 @@ def test_empty_intensity_matrix_and_sidecar_contract_round_trip(tmp_path: Path) 
         (lambda: np.zeros((1, 3, 2), dtype=np.float32), "axis 0 mismatch"),
         (lambda: np.zeros((0, 2, 2), dtype=np.float32), "axis 1 mismatch"),
         (lambda: np.zeros((0, 3, 1), dtype=np.float32), "axis 2 mismatch"),
+        (lambda: np.zeros((0, 3, 2), dtype=np.float64), "dtype float64 is not float32"),
         (lambda: np.asarray([[[]]], dtype=object), "dtype object is not numeric"),
     ],
 )
