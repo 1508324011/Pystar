@@ -143,6 +143,9 @@ echo "Config matlab_local_parallel.workers=$CONFIG_MATLAB_LOCAL_WORKERS"
 echo "Max concurrent MATLAB local workers if enabled: $MAX_MATLAB_LOCAL_WORKERS"
 mkdir -p logs/pystar
 
+echo "Preflighting shared codebook debug CSV..."
+"${PIXIRUN[@]}" python scripts/preflight_codebook.py --config "$CONFIG_FILE"
+
 JOB_ID=$(sbatch << EOF | awk '{print $4}'
 #!/bin/bash
 #SBATCH -J pystar_batch

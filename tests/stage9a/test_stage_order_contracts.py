@@ -209,3 +209,10 @@ def test_batch_runner_uses_canonical_stage_labels_without_control_flow_rewrite()
 
     fragment_positions = [source.index(fragment) for fragment in expected_fragments]
     assert fragment_positions == sorted(fragment_positions)
+
+
+def test_launcher_preflights_codebook_before_submitting_the_fov_array() -> None:
+    launcher = Path(__file__).resolve().parents[2] / "scripts" / "run_pystar.sh"
+    source = launcher.read_text(encoding="utf-8")
+
+    assert source.index('python scripts/preflight_codebook.py --config "$CONFIG_FILE"') < source.index("sbatch << EOF")
