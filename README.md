@@ -136,6 +136,16 @@ dataset:
 
 确认单个 FOV 输出正常后，再扩大 `fov_list` 范围。
 
+在直接启动 worker 前，先生成一次共享 codebook debug CSV：
+
+```bash
+pixi run --manifest-path env/pixi.toml -e pystar \
+  python scripts/preflight_codebook.py \
+  --config my_config.yaml
+```
+
+该命令只会写入 `<pipeline.output.directory>/compiled_codebook_debug.csv`；FOV worker 不会在根目录或 `Position*/output_pystar/` 下生成副本。
+
 ### 3. Python API 方式运行完整单个 FOV 流程
 
 ```python
