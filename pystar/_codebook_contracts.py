@@ -1,10 +1,11 @@
 """Private codebook compilation contracts for decoder runtime.
 
 This module owns the fail-loud gene-list, topology, and encoding-table
-validation used to compile PyStar codebooks. It preserves existing userspace
-behavior: the compiled debug CSV path remains unchanged, compiled gene maps
-still use legacy ``dict(zip(...))`` last-write-wins semantics for duplicate
-barcodes, and decoder runtime behavior is unchanged for valid inputs.
+validation used to compile PyStar codebooks. Compilation returns an in-memory
+contract; debug CSV persistence is explicitly owned by the launch preflight.
+Compiled gene maps still use legacy ``dict(zip(...))`` last-write-wins
+semantics for duplicate barcodes, and decoder runtime behavior is unchanged
+for valid inputs.
 """
 
 from __future__ import annotations
@@ -295,7 +296,7 @@ def _assemble_barcode(
     return full_barcode
 
 
-def compile_codebook_contract(codebook_cfg: Any, *, output_dir: Path | None = None) -> CompiledCodebook:
+def compile_codebook_contract(codebook_cfg: Any) -> CompiledCodebook:
     """Compile a validated private codebook contract from config-like input."""
 
     gene_list_path = Path(codebook_cfg.gene_list)
@@ -344,6 +345,4 @@ def compile_codebook_contract(codebook_cfg: Any, *, output_dir: Path | None = No
         reverse_lookups=reverse_lookups,
         barcode_length=len(next(iter(gene_map.keys()))),
     )
-    if output_dir is not None:
-        compiled.write_debug_csv(output_dir)
     return compiled

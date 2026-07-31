@@ -27,7 +27,6 @@ from ._artifact_schemas import (
     wrap_table_read_error,
 )
 from ._codebook_contracts import (
-    CompiledCodebook,
     build_reverse_lookups,
     build_single_reverse_lookup,
     compile_codebook_contract,
@@ -166,10 +165,7 @@ class Decoder:
         self.output_dir = Path(self.cfg.pipeline.output.directory)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load and validate the codebook once. Keep the legacy debug CSV at the
-        # configured output root; decode_fov also writes it into the concrete
-        # Position<fov>/output_pystar root used by runtime artifacts.
-        self.compiled_codebook = compile_codebook_contract(self.cfg.codebook, output_dir=self.output_dir)
+        self.compiled_codebook = compile_codebook_contract(self.cfg.codebook)
         self.gene_map = self.compiled_codebook.gene_map
         self.barcode_map = self.compiled_codebook.dataframe
         self.reverse_lookups = self.compiled_codebook.reverse_lookups
@@ -331,7 +327,7 @@ class Decoder:
     def _compile_codebook(self) -> tuple[dict[str, str], pd.DataFrame]:
         """Compatibility wrapper returning the legacy tuple surface."""
 
-        compiled = compile_codebook_contract(self.cfg.codebook, output_dir=self.output_dir)
+        compiled = compile_codebook_contract(self.cfg.codebook)
         return compiled.gene_map, compiled.dataframe
 
     def _create_encoder(self, mapping: Dict[str, int], base_idx: int) -> Callable[[str], str]:
@@ -501,9 +497,6 @@ class Decoder:
         
         base_dir = Path(self.cfg.pipeline.output.directory)
         paths = get_fov_output_structure(base_dir, fov_id)
-        compiled_codebook = getattr(self, "compiled_codebook", None)
-        if isinstance(compiled_codebook, CompiledCodebook):
-            _ = compiled_codebook.write_debug_csv(paths["root"])
         
         # 1. 加载数据
         raw_path = paths["extraction"] / f"intensity_matrix_fov_{fov_id}.npy"

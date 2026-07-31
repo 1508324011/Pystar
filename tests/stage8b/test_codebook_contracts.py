@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -5,6 +7,7 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 import pytest
+import yaml
 
 from pystar._artifact_schemas import (
     build_intensity_matrix_metadata_payload,
@@ -76,21 +79,17 @@ def build_minimal_decoder(*, output_dir: Path, gene_list: Path, encoding_tables:
     return decoder
 
 
-def test_compile_codebook_contract_accepts_headerless_gene_list_and_writes_debug_csv(tmp_path: Path) -> None:
+def test_compile_codebook_contract_accepts_headerless_gene_list_without_writing_debug_csv(tmp_path: Path) -> None:
     gene_list = tmp_path / "genes.csv"
     gene_list.write_text("GeneA,AA\nGeneB,AA\n", encoding="utf-8")
     cfg = build_minimal_decoder_config(gene_list=gene_list, output_dir=tmp_path)
 
-    compiled = compile_codebook_contract(cfg.codebook, output_dir=tmp_path)
+    compiled = compile_codebook_contract(cfg.codebook)
 
     assert list(compiled.dataframe["gene"]) == ["GeneA", "GeneB"]
     assert compiled.gene_map == {"0": "GeneB"}
     assert compiled.barcode_length == 1
-    debug_path = tmp_path / "compiled_codebook_debug.csv"
-    assert debug_path.exists()
-    debug_df = pd.read_csv(debug_path)
-    assert list(debug_df["gene"]) == ["GeneA", "GeneB"]
-    assert list(debug_df["barcode"]) == [0, 0]
+    assert not (tmp_path / "compiled_codebook_debug.csv").exists()
 
 
 def test_compile_codebook_contract_accepts_headered_gene_list(tmp_path: Path) -> None:
@@ -216,7 +215,7 @@ def test_decoder_init_consumes_compiled_codebook_and_preserves_compatibility_att
     assert decoder.gene_map == decoder.compiled_codebook.gene_map
     assert decoder.barcode_map.equals(decoder.compiled_codebook.dataframe)
     assert decoder.reverse_lookups == decoder.compiled_codebook.reverse_lookups
-    assert (tmp_path / "compiled_codebook_debug.csv").exists()
+    assert not (tmp_path / "compiled_codebook_debug.csv").exists()
 
 
 def test_decoder_compile_codebook_wrapper_preserves_legacy_tuple_surface(tmp_path: Path) -> None:
@@ -228,16 +227,13 @@ def test_decoder_compile_codebook_wrapper_preserves_legacy_tuple_surface(tmp_pat
 
     assert gene_map == {"0": "GeneA"}
     assert list(compiled_df["gene"]) == ["GeneA"]
-    assert (tmp_path / "compiled_codebook_debug.csv").exists()
+    assert not (tmp_path / "compiled_codebook_debug.csv").exists()
 
 
-def test_decode_fov_writes_canonical_debug_csv_while_preserving_legacy_root_copy(tmp_path: Path) -> None:
+def test_decode_fov_does_not_write_debug_csv(tmp_path: Path) -> None:
     gene_list = tmp_path / "genes.csv"
     gene_list.write_text("GeneA,AA\n", encoding="utf-8")
     decoder = Decoder(build_minimal_decoder_config(gene_list=gene_list, output_dir=tmp_path))
-    legacy_debug_path = tmp_path / "compiled_codebook_debug.csv"
-    assert legacy_debug_path.exists()
-
     paths = get_fov_output_structure(tmp_path, FOV_ID)
     spots_path = paths["spots"] / f"spots_fov_{FOV_ID}.csv"
     matrix_path = paths["extraction"] / f"intensity_matrix_fov_{FOV_ID}.npy"
@@ -252,13 +248,56 @@ def test_decode_fov_writes_canonical_debug_csv_while_preserving_legacy_root_copy
 
     decoded = decoder.decode_fov(FOV_ID)
 
-    canonical_debug_path = paths["root"] / "compiled_codebook_debug.csv"
     assert len(decoded) == 0
-    assert canonical_debug_path.exists()
-    pd.testing.assert_frame_equal(
-        pd.read_csv(legacy_debug_path),
-        pd.read_csv(canonical_debug_path),
+    assert not (tmp_path / "compiled_codebook_debug.csv").exists()
+    assert not (paths["root"] / "compiled_codebook_debug.csv").exists()
+
+
+def test_preflight_codebook_cli_writes_root_debug_csv_once_without_position_copy(tmp_path: Path) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    gene_list = tmp_path / "genes.csv"
+    gene_list.write_text("GeneA,AA\n", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    config_path = tmp_path / "config.yaml"
+    config_data = yaml.safe_load((project_root / "config" / "experiment_config.yaml").read_text(encoding="utf-8"))
+    config_data["dataset"]["raw_data_path"] = str(tmp_path / "raw")
+    config_data["dataset"]["fov_list"] = [FOV_ID]
+    config_data["dataset"]["round_structure"] = {1: [0], 2: [0]}
+    config_data["dataset"]["channel_roles"] = {0: "seq"}
+    config_data["codebook"] = {
+        "gene_list": str(gene_list),
+        "channel_base_index": 1,
+        "encoding_tables": {"dinucleotide": {"AA": 1}},
+        "topology": {
+            "func": "none",
+            "structure": [
+                {
+                    "id": "seq",
+                    "rounds": [1, 2],
+                    "csv_slice": [1, 2],
+                    "anchor_base": None,
+                    "encoding_table": "dinucleotide",
+                }
+            ],
+            "physical_order": ["seq"],
+        },
+    }
+    config_data["pipeline"]["output"]["directory"] = str(output_dir)
+    config_path.write_text(yaml.safe_dump(config_data), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(project_root / "scripts" / "preflight_codebook.py"), "--config", str(config_path)],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
     )
+
+    assert result.returncode == 0, result.stderr
+    debug_path = output_dir / "compiled_codebook_debug.csv"
+    assert debug_path.exists()
+    assert list(pd.read_csv(debug_path)["gene"]) == ["GeneA"]
+    assert not (output_dir / f"Position{FOV_ID}" / "output_pystar" / "compiled_codebook_debug.csv").exists()
 
 
 def test_duplicate_barcode_behavior_remains_last_write_wins(tmp_path: Path) -> None:
